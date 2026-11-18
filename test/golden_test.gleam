@@ -6,7 +6,6 @@
 //// Regenerate the fixture with `npm install && npm run record` in `test/golden/typescript`.
 
 import gleam/bit_array
-import gleam/option.{None}
 import temporal/activity
 import temporal/client
 import temporal/codec
@@ -38,7 +37,7 @@ fn options() {
 }
 
 fn golden_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
-  workflow.sleep(ctx, 10)
+  let assert Ok(Nil) = workflow.sleep(ctx, 10)
   use a <- try(workflow.execute_activity(ctx, double(), n, options()))
   let assert [Ok(b), Ok(c)] =
     workflow.await_all([
@@ -47,9 +46,8 @@ fn golden_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
     ])
   let signalled = workflow.receive_signal(ctx, added())
   let child =
-    workflow.ChildOptions(
+    workflow.child_options(
       workflow_id: workflow.info(ctx).workflow_id <> "-child",
-      task_queue: None,
     )
   use doubled <- try(workflow.execute_child(ctx, double_child(), c, child))
   Ok(b + c + signalled + doubled)
@@ -58,7 +56,7 @@ fn golden_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
 /// The same workflow with its first two steps swapped.
 fn diverging_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
   use a <- try(workflow.execute_activity(ctx, double(), n, options()))
-  workflow.sleep(ctx, 10)
+  let assert Ok(Nil) = workflow.sleep(ctx, 10)
   Ok(a)
 }
 

@@ -19,7 +19,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use temporalio_client::{Connection, ConnectionOptions};
+use temporalio_client::{ClientTlsOptions, Connection, ConnectionOptions, TlsOptions};
 use temporalio_common::{
     protos::{
         coresdk::{ActivityHeartbeat, ActivityTaskCompletion},
@@ -103,13 +103,19 @@ fn connect<'a>(
     namespace: String,
     identity: String,
     api_key: Term<'a>,
-) -> Atom {
+    tls: Term<'a>,
+) -> Term<'a> {
     let api_key: Option<String> = opt(api_key).and_then(|t| t.decode().ok());
+    let tls = match opt(tls).map(decode_tls).transpose() {
+        Ok(tls) => tls,
+        Err(e) => return err(env, format!("invalid TLS options: {e}")),
+    };
     let fut = async move {
         let url = Url::from_str(&target).map_err(|e| format!("invalid target url: {e}"))?;
         let options = ConnectionOptions::new(url)
             .identity(identity.clone())
             .maybe_api_key(api_key)
+            .maybe_tls_options(tls)
             .build();
         let connection = Connection::connect(options)
             .await
@@ -124,24 +130,88 @@ fn connect<'a>(
         Ok(res) => ok(env, ResourceArc::new(res).encode(env)),
         Err(e) => err(env, e),
     });
-    atoms::ok()
+    atoms::ok().encode(env)
+}
+
+/// `bridge.Tls`: an optional root CA, an optional server name and an optional client
+/// certificate and key, all PEM.
+fn decode_tls(term: Term) -> DecodeResult<TlsOptions> {
+    let (_, f) = untag(term)?;
+    let bytes = |t: Term| -> DecodeResult<Vec<u8>> {
+        let b: Binary = t.decode().map_err(|_| "expected a BitArray".to_string())?;
+        Ok(b.as_slice().to_vec())
+    };
+    let root = opt(field(&f, 0)?).map(bytes).transpose()?;
+    let domain: Option<String> = opt(field(&f, 1)?)
+        .map(|t| t.decode().map_err(|_| "domain must be a String".to_string()))
+        .transpose()?;
+    let client = opt(field(&f, 2)?)
+        .map(|t| {
+            let (cert, key): (Term, Term) =
+                t.decode().map_err(|_| "bad client certificate".to_string())?;
+            Ok::<_, String>(
+                ClientTlsOptions::builder()
+                    .client_cert(bytes(cert)?)
+                    .client_private_key(bytes(key)?)
+                    .build(),
+            )
+        })
+        .transpose()?;
+    Ok(TlsOptions::builder()
+        .maybe_server_root_ca_cert(root)
+        .maybe_domain(domain)
+        .maybe_client_tls_options(client)
+        .build())
+}
+
+/// Mirrors `bridge.WorkerOptions`.
+struct WorkerOptions {
+    max_cached_workflows: usize,
+    max_workflow_tasks: usize,
+    max_activities: usize,
+    task_queue_activities_per_second: Option<f64>,
+    worker_activities_per_second: Option<f64>,
+    task_types: WorkerTaskTypes,
+}
+
+fn decode_worker_options(term: Term) -> DecodeResult<WorkerOptions> {
+    let (_, f) = untag(term)?;
+    let rate = |i: usize| -> DecodeResult<Option<f64>> {
+        opt(field(&f, i)?)
+            .map(|t| t.decode().map_err(|_| "rate must be a Float".to_string()))
+            .transpose()
+    };
+    Ok(WorkerOptions {
+        max_cached_workflows: get(&f, 0)?,
+        max_workflow_tasks: get(&f, 1)?,
+        max_activities: get(&f, 2)?,
+        task_queue_activities_per_second: rate(3)?,
+        worker_activities_per_second: rate(4)?,
+        task_types: WorkerTaskTypes {
+            enable_workflows: get(&f, 5)?,
+            enable_local_activities: false,
+            enable_remote_activities: get(&f, 6)?,
+            enable_nexus: false,
+        },
+    })
 }
 
 fn worker_config(
     namespace: String,
     task_queue: String,
-    max_cached_workflows: usize,
-    task_types: WorkerTaskTypes,
+    options: WorkerOptions,
 ) -> Result<WorkerConfig, String> {
     WorkerConfig::builder()
         .namespace(namespace)
         .task_queue(task_queue)
-        .max_cached_workflows(max_cached_workflows)
-        .task_types(task_types)
+        .max_cached_workflows(options.max_cached_workflows)
+        .task_types(options.task_types)
         .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
         .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
-        .max_outstanding_workflow_tasks(100usize)
-        .max_outstanding_activities(100usize)
+        .max_outstanding_workflow_tasks(options.max_workflow_tasks)
+        .max_outstanding_activities(options.max_activities)
+        .maybe_max_task_queue_activities_per_second(options.task_queue_activities_per_second)
+        .maybe_max_worker_activities_per_second(options.worker_activities_per_second)
         .max_outstanding_local_activities(100usize)
         .max_outstanding_nexus_tasks(1usize)
         .versioning_strategy(WorkerVersioningStrategy::None {
@@ -157,21 +227,14 @@ fn worker_new<'a>(
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
     task_queue: String,
-    max_cached_workflows: usize,
-) -> Atom {
+    options: Term<'a>,
+) -> Term<'a> {
+    let options = match decode_worker_options(options) {
+        Ok(o) => o,
+        Err(e) => return err(env, format!("invalid worker options: {e}")),
+    };
     let fut = async move {
-        let task_types = WorkerTaskTypes {
-            enable_workflows: true,
-            enable_local_activities: false,
-            enable_remote_activities: true,
-            enable_nexus: false,
-        };
-        let config = worker_config(
-            conn.namespace.clone(),
-            task_queue,
-            max_cached_workflows,
-            task_types,
-        )?;
+        let config = worker_config(conn.namespace.clone(), task_queue, options)?;
         let worker = temporalio_sdk_core::init_worker(runtime(), config, conn.connection.clone())
             .map_err(|e| format!("worker init failed: {e}"))?;
         worker
@@ -186,7 +249,7 @@ fn worker_new<'a>(
         Ok(res) => ok(env, ResourceArc::new(res).encode(env)),
         Err(e) => err(env, e),
     });
-    atoms::ok()
+    atoms::ok().encode(env)
 }
 
 /// A worker that replays the given `(workflow_id, encoded History)` pairs and then shuts down.
@@ -203,12 +266,15 @@ fn replay_worker_new<'a>(
             Err(e) => return err(env, format!("invalid history: {e}")),
         }
     }
-    let config = match worker_config(
-        "replay".to_string(),
-        task_queue,
-        1,
-        WorkerTaskTypes::workflow_only(),
-    ) {
+    let options = WorkerOptions {
+        max_cached_workflows: 1,
+        max_workflow_tasks: 100,
+        max_activities: 100,
+        task_queue_activities_per_second: None,
+        worker_activities_per_second: None,
+        task_types: WorkerTaskTypes::workflow_only(),
+    };
+    let config = match worker_config("replay".to_string(), task_queue, options) {
         Ok(c) => c,
         Err(e) => return err(env, e),
     };

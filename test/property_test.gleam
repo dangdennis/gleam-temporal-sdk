@@ -10,7 +10,6 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None}
 import temporal/activity
 import temporal/client
 import temporal/codec
@@ -103,7 +102,7 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
   list.try_map(program(seed), fn(step) {
     case step {
       Sleep(ms) -> {
-        workflow.sleep(ctx, ms)
+        let assert Ok(Nil) = workflow.sleep(ctx, ms)
         Ok([0])
       }
       Double(n) -> {
@@ -129,20 +128,20 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
         let timer = workflow.timer(ctx, ms) |> workflow.map(fn(_) { False })
         case workflow.await(workflow.race([activity, timer])) {
           True -> Nil
-          False -> workflow.sleep(ctx, 1)
+          False -> {
+            let assert Ok(Nil) = workflow.sleep(ctx, 1)
+            Nil
+          }
         }
         Ok([])
       }
       RandomSleep -> {
-        workflow.sleep(ctx, 1 + workflow.random_int(ctx, 10))
+        let assert Ok(Nil) =
+          workflow.sleep(ctx, 1 + workflow.random_int(ctx, 10))
         Ok([])
       }
       Child(n) -> {
-        let child =
-          workflow.ChildOptions(
-            workflow_id: workflow.uuid4(ctx),
-            task_queue: None,
-          )
+        let child = workflow.child_options(workflow_id: workflow.uuid4(ctx))
         use doubled <- try(workflow.execute_child(ctx, double_child(), n, child))
         Ok([doubled])
       }
@@ -193,7 +192,7 @@ fn check_seeds(seeds: List(Int), max_cached: Int) -> Nil {
           client,
           interpreter(),
           seed,
-          client.StartOptions(workflow_id:, task_queue:),
+          client.start_options(workflow_id:, task_queue:),
         )
       #(seed, handle)
     })

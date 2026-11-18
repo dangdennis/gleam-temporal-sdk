@@ -5,11 +5,13 @@
 import gleam/dict
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/option.{None, Some}
+import gleam/result
 import temporal/activity
 import temporal/codec
 import temporal/failure
 import temporal/internal/bridge.{type Completion, Activation}
 import temporal/internal/runtime
+import temporal/middleware
 import temporal/workflow
 
 fn double() {
@@ -39,6 +41,7 @@ fn start(handler: workflow.Handler) -> #(Pid, Subject(Completion)) {
         runtime.run(
           dict.from_list([#(handler.name, handler.run)]),
           "queue",
+          middleware.none(),
           fn(completion) { process.send(completions, completion) },
         )
       })
@@ -50,7 +53,7 @@ fn activate(
   run: #(Pid, Subject(Completion)),
   jobs: List(bridge.Job),
 ) -> List(bridge.Command) {
-  bridge.send_activation(run.0, Activation("run", 1000, False, 3, jobs))
+  bridge.send_activation(run.0, Activation("run", 1000, False, 3, jobs, False))
   let assert Ok(bridge.Success("run", commands)) = process.receive(run.1, 1000)
   commands
 }
@@ -62,6 +65,9 @@ fn init(workflow_type: String, input: Int) -> bridge.Job {
     [codec.int().encode(input)],
     42,
     1,
+    "run",
+    "",
+    dict.new(),
   )
 }
 
@@ -73,7 +79,7 @@ pub fn timer_then_complete_test() {
   let run =
     start(
       int_workflow("sleeper", fn(ctx, n) {
-        workflow.sleep(ctx, 500)
+        let assert Ok(Nil) = workflow.sleep(ctx, 500)
         Ok(n + 1)
       }),
     )
@@ -181,20 +187,399 @@ pub fn race_prefers_the_earlier_future_test() {
     == [bridge.CompleteWorkflow(int_payload(1))]
 }
 
-pub fn cancellation_test() {
+pub fn workflow_cancellation_cancels_a_pending_timer_test() {
   let run =
     start(
       int_workflow("cancellable", fn(ctx, _) {
-        let work = workflow.timer(ctx, 60_000) |> workflow.map(fn(_) { Ok(1) })
-        let cancelled =
-          workflow.cancellation(ctx)
-          |> workflow.map(fn(_) { Error(failure.cancelled()) })
-        workflow.await(workflow.race([work, cancelled]))
+        use _ <- result.map(workflow.sleep(ctx, 60_000))
+        1
       }),
     )
   let _ = activate(run, [init("cancellable", 0)])
   assert activate(run, [bridge.CancelWorkflow("stop")])
+    == [bridge.CancelTimer(1), bridge.CancelWorkflowExecution]
+}
+
+fn cancelled_activity() -> bridge.Resolution {
+  bridge.Cancelled(
+    failure.Failure(
+      ..failure.new("activity cancelled"),
+      kind: failure.Activity,
+      cause: Some(failure.cancelled()),
+    ),
+  )
+}
+
+pub fn workflow_cancellation_cancels_a_pending_activity_test() {
+  let run =
+    start(
+      int_workflow("cancellable", fn(ctx, n) {
+        workflow.execute_activity(ctx, double(), n, options())
+      }),
+    )
+  let _ = activate(run, [init("cancellable", 0)])
+  // The activity is asked to cancel; the workflow keeps waiting for its outcome.
+  assert activate(run, [bridge.CancelWorkflow("stop")])
+    == [bridge.RequestCancelActivity(1)]
+  // A wrapped cancellation ends the workflow as cancelled, because it was asked to cancel.
+  assert activate(run, [bridge.ResolveActivity(1, cancelled_activity())])
     == [bridge.CancelWorkflowExecution]
+}
+
+pub fn cancelled_activity_fails_a_workflow_that_was_not_cancelled_test() {
+  let run =
+    start(
+      int_workflow("scoped", fn(ctx, n) {
+        workflow.with_scope(ctx, fn(scope) {
+          let pending = workflow.start_activity(scope, double(), n, options())
+          workflow.cancel(scope)
+          workflow.await(pending)
+        })
+      }),
+    )
+  let assert [
+    bridge.ScheduleActivity(seq: 1, ..),
+    bridge.RequestCancelActivity(1),
+  ] = activate(run, [init("scoped", 0)])
+  let assert [bridge.FailWorkflow(failure)] =
+    activate(run, [bridge.ResolveActivity(1, cancelled_activity())])
+  assert failure.is_cancellation(failure)
+}
+
+pub fn non_cancellable_cleanup_runs_after_cancellation_test() {
+  let run =
+    start(
+      int_workflow("cleanup", fn(ctx, n) {
+        case workflow.sleep(ctx, 60_000) {
+          Ok(Nil) -> Ok(n)
+          Error(cancelled) -> {
+            let assert Ok(_) =
+              workflow.non_cancellable(ctx, fn(shielded) {
+                workflow.execute_activity(shielded, double(), n, options())
+              })
+            Error(cancelled)
+          }
+        }
+      }),
+    )
+  let _ = activate(run, [init("cleanup", 3)])
+  let assert [bridge.CancelTimer(1), bridge.ScheduleActivity(seq: 1, ..)] =
+    activate(run, [bridge.CancelWorkflow("stop")])
+  assert activate(run, [
+      bridge.ResolveActivity(1, bridge.Completed(int_payload(6))),
+    ])
+    == [bridge.CancelWorkflowExecution]
+}
+
+pub fn nothing_is_scheduled_in_a_cancelled_scope_test() {
+  let run =
+    start(
+      int_workflow("late", fn(ctx, n) {
+        let assert Error(_) =
+          workflow.with_scope(ctx, fn(scope) {
+            workflow.cancel(scope)
+            assert workflow.is_cancelled(scope)
+            let assert Error(_) = workflow.sleep(scope, 10)
+            workflow.execute_activity(scope, double(), n, options())
+          })
+        // The skipped timer and activity still used sequence number 1.
+        let assert Ok(Nil) = workflow.sleep(ctx, 10)
+        workflow.execute_activity(ctx, double(), n, options())
+      }),
+    )
+  assert activate(run, [init("late", 1)]) == [bridge.StartTimer(2, 10)]
+  let assert [bridge.ScheduleActivity(seq: 2, activity_id: "2", ..)] =
+    activate(run, [bridge.FireTimer(2)])
+}
+
+pub fn with_timeout_cancels_the_body_when_the_deadline_passes_test() {
+  let run =
+    start(
+      int_workflow("deadline", fn(ctx, n) {
+        workflow.with_timeout(ctx, 5000, fn(scope) {
+          workflow.execute_activity(scope, double(), n, options())
+        })
+      }),
+    )
+  let assert [bridge.StartTimer(1, 5000), bridge.ScheduleActivity(seq: 1, ..)] =
+    activate(run, [init("deadline", 1)])
+  assert activate(run, [bridge.FireTimer(1)])
+    == [bridge.RequestCancelActivity(1)]
+  let assert [
+    bridge.FailWorkflow(failure.Failure(
+      kind: failure.Timeout,
+      cause: Some(_),
+      ..,
+    )),
+  ] = activate(run, [bridge.ResolveActivity(1, cancelled_activity())])
+}
+
+pub fn with_timeout_cancels_its_timer_when_the_body_finishes_test() {
+  let run =
+    start(
+      int_workflow("deadline", fn(ctx, n) {
+        workflow.with_timeout(ctx, 5000, fn(scope) {
+          workflow.execute_activity(scope, double(), n, options())
+        })
+      }),
+    )
+  let _ = activate(run, [init("deadline", 1)])
+  assert activate(run, [
+      bridge.ResolveActivity(1, bridge.Completed(int_payload(2))),
+    ])
+    == [bridge.CancelTimer(1), bridge.CompleteWorkflow(int_payload(2))]
+}
+
+pub fn await_timeout_returns_the_signal_or_times_out_test() {
+  let waiter = fn() {
+    start(
+      int_workflow("waiter", fn(ctx, _) {
+        case workflow.await_timeout(ctx, workflow.signal(ctx, added()), 5000) {
+          Ok(value) -> Ok(value)
+          Error(failure.Failure(kind: failure.Timeout, ..)) -> Ok(-1)
+          Error(other) -> Error(other)
+        }
+      }),
+    )
+  }
+  let run = waiter()
+  assert activate(run, [init("waiter", 0)]) == [bridge.StartTimer(1, 5000)]
+  assert activate(run, [
+      bridge.SignalWorkflow("added", [codec.int().encode(7)]),
+    ])
+    == [bridge.CancelTimer(1), bridge.CompleteWorkflow(int_payload(7))]
+
+  let run = waiter()
+  let _ = activate(run, [init("waiter", 0)])
+  assert activate(run, [bridge.FireTimer(1)])
+    == [bridge.CompleteWorkflow(int_payload(-1))]
+
+  let run = waiter()
+  let _ = activate(run, [init("waiter", 0)])
+  assert activate(run, [bridge.CancelWorkflow("stop")])
+    == [bridge.CancelTimer(1), bridge.CancelWorkflowExecution]
+}
+
+pub fn cancelling_a_scope_reaches_nested_scopes_but_not_shielded_ones_test() {
+  let run =
+    start(
+      int_workflow("nested", fn(ctx, _) {
+        workflow.with_scope(ctx, fn(outer) {
+          let a = workflow.timer(outer, 100)
+          workflow.with_scope(outer, fn(inner) {
+            let b = workflow.timer(inner, 200)
+            workflow.non_cancellable(inner, fn(shielded) {
+              let c = workflow.timer(shielded, 300)
+              workflow.cancel(outer)
+              let assert Error(_) = workflow.await(a)
+              let assert Error(_) = workflow.await(b)
+              let assert Ok(Nil) = workflow.await(c)
+              Ok(1)
+            })
+          })
+        })
+      }),
+    )
+  assert activate(run, [init("nested", 0)])
+    == [
+      bridge.StartTimer(1, 100),
+      bridge.StartTimer(2, 200),
+      bridge.StartTimer(3, 300),
+      bridge.CancelTimer(1),
+      bridge.CancelTimer(2),
+    ]
+  assert activate(run, [bridge.FireTimer(3)])
+    == [bridge.CompleteWorkflow(int_payload(1))]
+}
+
+pub fn child_is_started_before_its_result_is_awaited_test() {
+  let child = workflow.Definition("child", codec.int(), codec.int())
+  let run =
+    start(
+      int_workflow("parent", fn(ctx, n) {
+        let options =
+          workflow.ChildOptions(
+            ..workflow.child_options(workflow_id: "kid"),
+            parent_close_policy: workflow.AbandonChild,
+            id_reuse_policy: workflow.RejectDuplicate,
+            run_timeout_ms: Some(9000),
+          )
+        use started <- result.try(workflow.start_child(ctx, child, n, options))
+        assert workflow.child_run_id(started) == "child-run"
+        assert workflow.child_workflow_id(started) == "kid"
+        workflow.await(workflow.child_result(started))
+      }),
+    )
+  let assert [
+    bridge.StartChildWorkflow(
+      seq: 1,
+      workflow_id: "kid",
+      workflow_type: "child",
+      options: bridge.ChildStartOptions(
+        parent_close_policy: 2,
+        id_reuse_policy: 3,
+        run_timeout_ms: Some(9000),
+        cancellation_type: 2,
+        ..,
+      ),
+      ..,
+    ),
+  ] = activate(run, [init("parent", 4)])
+  assert activate(run, [
+      bridge.ResolveChildWorkflowStart(1, bridge.ChildStarted("child-run")),
+    ])
+    == []
+  assert activate(run, [
+      bridge.ResolveChildWorkflow(1, bridge.Completed(int_payload(5))),
+    ])
+    == [bridge.CompleteWorkflow(int_payload(5))]
+}
+
+pub fn child_that_already_exists_is_a_typed_failure_test() {
+  let child = workflow.Definition("child", codec.int(), codec.int())
+  let run =
+    start(
+      int_workflow("parent", fn(ctx, n) {
+        workflow.execute_child(
+          ctx,
+          child,
+          n,
+          workflow.child_options(workflow_id: "kid"),
+        )
+      }),
+    )
+  let _ = activate(run, [init("parent", 4)])
+  let assert [
+    bridge.FailWorkflow(failure.Failure(
+      error_type: "WorkflowExecutionAlreadyStarted",
+      ..,
+    )),
+  ] =
+    activate(run, [
+      bridge.ResolveChildWorkflowStart(1, bridge.ChildStartFailed("kid", 1)),
+    ])
+}
+
+pub fn cancelling_the_workflow_cancels_a_running_child_test() {
+  let child = workflow.Definition("child", codec.int(), codec.int())
+  let run =
+    start(
+      int_workflow("parent", fn(ctx, n) {
+        workflow.execute_child(
+          ctx,
+          child,
+          n,
+          workflow.child_options(workflow_id: "kid"),
+        )
+      }),
+    )
+  let _ = activate(run, [init("parent", 4)])
+  let _ =
+    activate(run, [
+      bridge.ResolveChildWorkflowStart(1, bridge.ChildStarted("child-run")),
+    ])
+  assert activate(run, [bridge.CancelWorkflow("stop")])
+    == [bridge.CancelChildWorkflow(1)]
+}
+
+pub fn info_and_memo_come_from_the_start_event_test() {
+  let run =
+    start(
+      int_workflow("informed", fn(ctx, _) {
+        let info = workflow.info(ctx)
+        assert info.first_execution_run_id == "first-run"
+        assert info.continued_from_run_id == Some("previous-run")
+        assert info.continue_as_new_suggested
+        assert workflow.memo(ctx, "trace", codec.string()) == Some("abc")
+        assert workflow.memo(ctx, "missing", codec.string()) == None
+        Ok(info.history_length)
+      }),
+    )
+  bridge.send_activation(
+    run.0,
+    Activation(
+      "run",
+      1000,
+      False,
+      3,
+      [
+        bridge.InitializeWorkflow(
+          "informed",
+          "wf",
+          [codec.int().encode(0)],
+          42,
+          1,
+          "first-run",
+          "previous-run",
+          dict.from_list([#("trace", codec.string().encode("abc"))]),
+        ),
+      ],
+      True,
+    ),
+  )
+  let assert Ok(bridge.Success("run", [bridge.CompleteWorkflow(result)])) =
+    process.receive(run.1, 1000)
+  assert result == int_payload(3)
+}
+
+pub fn deprecated_patch_records_a_deprecated_marker_once_test() {
+  let run =
+    start(
+      int_workflow("patched", fn(ctx, n) {
+        workflow.deprecate_patch(ctx, "v2")
+        workflow.deprecate_patch(ctx, "v2")
+        Ok(n)
+      }),
+    )
+  assert activate(run, [init("patched", 1)])
+    == [
+      bridge.SetPatchMarker("v2", True),
+      bridge.CompleteWorkflow(int_payload(1)),
+    ]
+}
+
+pub fn outbound_middleware_rewrites_scheduled_activities_test() {
+  let handler =
+    int_workflow("renamer", fn(ctx, n) {
+      workflow.execute_activity(ctx, double(), n, options())
+    })
+  let completions = process.new_subject()
+  let pid =
+    process.spawn_unlinked(fn() {
+      bridge.rescue(fn() {
+        runtime.run(
+          dict.from_list([#(handler.name, handler.run)]),
+          "queue",
+          middleware.Outbound(..middleware.none(), activity: fn(call) {
+            middleware.ActivityCall(
+              ..call,
+              activity_type: "legacy_" <> call.activity_type,
+            )
+          }),
+          fn(completion) { process.send(completions, completion) },
+        )
+      })
+    })
+  let assert [bridge.ScheduleActivity(activity_type: "legacy_double", ..)] =
+    activate(#(pid, completions), [init("renamer", 1)])
+}
+
+pub fn workflow_middleware_wraps_the_workflow_test() {
+  let handler =
+    int_workflow("wrapped", fn(_, n) { Ok(n) })
+    |> workflow.wrap(fn(_ctx, next) {
+      case next() {
+        Ok(_) -> Error(failure.new("replaced by middleware"))
+        Error(failure) -> Error(failure)
+      }
+    })
+  let assert [
+    bridge.FailWorkflow(failure.Failure(message: "replaced by middleware", ..)),
+  ] = activate(start(handler), [init("wrapped", 1)])
+}
+
+fn options() {
+  workflow.activity_options(start_to_close_ms: 5000)
 }
 
 pub fn continue_as_new_test() {
@@ -234,7 +619,9 @@ pub fn uuid4_is_well_formed_test() {
       ),
     )
   let assert [bridge.CompleteWorkflow(Some(payload))] =
-    activate(run, [bridge.InitializeWorkflow("uuid", "wf", [], 7, 1)])
+    activate(run, [
+      bridge.InitializeWorkflow("uuid", "wf", [], 7, 1, "run", "", dict.new()),
+    ])
   let assert Ok(<<
     _:bytes-size(14),
     "4",
@@ -278,7 +665,7 @@ pub fn replay_without_the_patch_marker_takes_the_old_path_test() {
     })
   let replay = fn(jobs) {
     let run = start(handler)
-    bridge.send_activation(run.0, Activation("run", 1000, True, 3, jobs))
+    bridge.send_activation(run.0, Activation("run", 1000, True, 3, jobs, False))
     let assert Ok(bridge.Success("run", commands)) =
       process.receive(run.1, 1000)
     commands
@@ -296,7 +683,7 @@ pub fn a_crash_fails_the_task_not_the_workflow_test() {
   let run = start(int_workflow("crasher", fn(_, _) { panic as "bug" }))
   bridge.send_activation(
     run.0,
-    Activation("run", 1000, False, 3, [init("crasher", 0)]),
+    Activation("run", 1000, False, 3, [init("crasher", 0)], False),
   )
   let assert Ok(bridge.TaskFailure("run", _)) = process.receive(run.1, 1000)
   // Core evicts the run after a task failure; the process acknowledges and exits.
@@ -309,7 +696,7 @@ pub fn an_unregistered_workflow_type_fails_the_task_test() {
   let run = start(accumulator())
   bridge.send_activation(
     run.0,
-    Activation("run", 1000, False, 3, [init("other", 0)]),
+    Activation("run", 1000, False, 3, [init("other", 0)], False),
   )
   let assert Ok(bridge.TaskFailure("run", _)) = process.receive(run.1, 1000)
 }
@@ -332,5 +719,16 @@ pub fn invalid_input_fails_the_workflow_test() {
       ..,
     )),
   ] =
-    activate(run, [bridge.InitializeWorkflow("accumulator", "wf", [bad], 1, 1)])
+    activate(run, [
+      bridge.InitializeWorkflow(
+        "accumulator",
+        "wf",
+        [bad],
+        1,
+        1,
+        "run",
+        "",
+        dict.new(),
+      ),
+    ])
 }

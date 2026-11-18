@@ -9,6 +9,7 @@ import gleam/list
 import temporal/client.{type History}
 import temporal/internal/bridge
 import temporal/internal/poller
+import temporal/middleware.{type Outbound}
 import temporal/workflow
 
 pub type ReplayError {
@@ -27,6 +28,15 @@ pub fn replay(
   workflows: List(workflow.Handler),
   history: History,
 ) -> Result(Nil, ReplayError) {
+  replay_with(workflows, history, middleware.none())
+}
+
+/// Replay with the outbound middleware the worker that recorded the history ran with.
+pub fn replay_with(
+  workflows: List(workflow.Handler),
+  history: History,
+  outbound: Outbound,
+) -> Result(Nil, ReplayError) {
   let registry = dict.from_list(list.map(workflows, fn(w) { #(w.name, w.run) }))
   case
     bridge.replay_worker_new("replay", [
@@ -35,7 +45,7 @@ pub fn replay(
   {
     Error(message) -> Error(ReplayFailed(message))
     Ok(worker) ->
-      case poller.workflow_loop(worker, registry, "replay", True) {
+      case poller.workflow_loop(worker, registry, "replay", outbound, True) {
         Error(message) -> Error(ReplayFailed(message))
         Ok(evictions) ->
           list.try_each(list.reverse(evictions), fn(eviction) {

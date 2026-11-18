@@ -4,10 +4,12 @@ import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid}
 import gleam/io
 import gleam/list
+import gleam/option
 import temporal/activity
 import temporal/failure
 import temporal/internal/bridge.{type NifWorker}
 import temporal/internal/runtime
+import temporal/middleware.{type Outbound}
 
 /// A run that core removed from the cache, with core's `EvictionReason` value.
 pub type Eviction {
@@ -21,12 +23,14 @@ pub fn workflow_loop(
   worker: NifWorker,
   workflows: Dict(String, runtime.WorkflowFn),
   task_queue: String,
+  outbound: Outbound,
   record_evictions: Bool,
 ) -> Result(List(Eviction), String) {
   do_workflow_loop(
     worker,
     workflows,
     task_queue,
+    outbound,
     record_evictions,
     dict.new(),
     [],
@@ -37,6 +41,7 @@ fn do_workflow_loop(
   worker: NifWorker,
   workflows: Dict(String, runtime.WorkflowFn),
   task_queue: String,
+  outbound: Outbound,
   record_evictions: Bool,
   runs: Dict(String, Pid),
   evictions: List(Eviction),
@@ -87,7 +92,7 @@ fn do_workflow_loop(
         Error(Nil), Error(Nil) -> {
           let pid =
             process.spawn_unlinked(fn() {
-              runtime.run(workflows, task_queue, complete)
+              runtime.run(workflows, task_queue, outbound, complete)
             })
           bridge.send_activation(pid, activation)
           dict.insert(runs, activation.run_id, pid)
@@ -101,6 +106,7 @@ fn do_workflow_loop(
         worker,
         workflows,
         task_queue,
+        outbound,
         record_evictions,
         runs,
         evictions,
@@ -113,13 +119,15 @@ fn do_workflow_loop(
 pub fn activity_loop(
   worker: NifWorker,
   activities: Dict(String, activity.Handler),
+  task_queue: String,
 ) -> Nil {
-  do_activity_loop(worker, activities, dict.new())
+  do_activity_loop(worker, activities, task_queue, dict.new())
 }
 
 fn do_activity_loop(
   worker: NifWorker,
   activities: Dict(String, activity.Handler),
+  task_queue: String,
   running: Dict(BitArray, Pid),
 ) -> Nil {
   let running = dict.filter(running, fn(_, pid) { process.is_alive(pid) })
@@ -135,7 +143,11 @@ fn do_activity_loop(
       run_id:,
       input:,
       attempt:,
-      ..,
+      heartbeat_details:,
+      workflow_type:,
+      start_to_close_ms:,
+      heartbeat_timeout_ms:,
+      scheduled_time_ms:,
     )) -> {
       let ctx =
         activity.Context(
@@ -144,9 +156,20 @@ fn do_activity_loop(
             activity_type:,
             workflow_id:,
             run_id:,
+            workflow_type:,
+            task_queue:,
             attempt:,
+            heartbeat_details:,
+            start_to_close_ms:,
+            heartbeat_timeout_ms:,
+            scheduled_time_ms:,
           ),
-          heartbeat: fn() { bridge.heartbeat(worker, task_token) },
+          heartbeat: fn(details) {
+            bridge.heartbeat(worker, task_token, details)
+          },
+          cancel_reason: fn() {
+            option.map(bridge.activity_cancel_reason(), cancel_reason)
+          },
         )
       let pid =
         process.spawn_unlinked(fn() {
@@ -160,9 +183,14 @@ fn do_activity_loop(
                 )
                 |> failure.with_type("NotFound"),
               )
+            // Exits are caught too: this process must always report an outcome, or the
+            // activity would hang until its timeout.
             Ok(handler) ->
-              case bridge.rescue(fn() { handler.run(ctx, input) }) {
+              case bridge.rescue_all(fn() { handler.run(ctx, input) }) {
                 Ok(Ok(payload)) -> bridge.ActivityCompleted(payload)
+                Ok(Error(
+                  failure.Failure(kind: failure.Cancelled, ..) as failure,
+                )) -> bridge.ActivityCancelled(failure)
                 Ok(Error(failure)) -> bridge.ActivityFailed(failure)
                 Error(crash) ->
                   bridge.ActivityFailed(failure.new(
@@ -176,23 +204,31 @@ fn do_activity_loop(
       do_activity_loop(
         worker,
         activities,
+        task_queue,
         dict.insert(running, task_token, pid),
       )
     }
-    Ok(bridge.ActivityCancel(task_token:, ..)) -> {
-      // Core expects a completion for a cancelled activity that is still running. If the
-      // activity finished in the meantime the extra completion is rejected harmlessly.
+    Ok(bridge.ActivityCancel(task_token:, reason:)) -> {
+      // The activity decides how to stop: it sees the request through
+      // `activity.is_cancelled` and reports its own outcome. An activity that has already
+      // finished needs nothing.
       case dict.get(running, task_token) {
-        Ok(pid) -> bridge.kill(pid)
+        Ok(pid) -> bridge.send_activity_cancel(pid, reason)
         Error(Nil) -> Nil
       }
-      let _ =
-        bridge.complete_activity(
-          worker,
-          task_token,
-          bridge.ActivityCancelled(failure.cancelled()),
-        )
-      do_activity_loop(worker, activities, dict.delete(running, task_token))
+      do_activity_loop(worker, activities, task_queue, running)
     }
+  }
+}
+
+/// Core's `ActivityCancelReason` values.
+fn cancel_reason(reason: Int) -> activity.CancelReason {
+  case reason {
+    0 -> activity.NotFound
+    2 -> activity.TimedOut
+    3 -> activity.WorkerShutdown
+    4 -> activity.Paused
+    5 -> activity.Reset
+    _ -> activity.CancelRequested
   }
 }

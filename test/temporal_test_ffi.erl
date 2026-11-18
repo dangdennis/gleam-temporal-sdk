@@ -1,5 +1,5 @@
 -module(temporal_test_ffi).
--export([unique/0, cmd/1, read_file/1]).
+-export([unique/0, cmd/1, read_file/1, record/2, recorded/1]).
 
 unique() ->
     integer_to_binary(erlang:system_time(microsecond)).
@@ -12,3 +12,11 @@ read_file(Path) ->
         {ok, Bytes} -> {ok, Bytes};
         {error, Reason} -> {error, atom_to_binary(Reason)}
     end.
+
+%% A scratch store shared by activities and the test that started them.
+record(Key, Value) ->
+    persistent_term:put({temporal_test, Key}, Value),
+    nil.
+
+recorded(Key) ->
+    persistent_term:get({temporal_test, Key}, <<>>).

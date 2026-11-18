@@ -2,9 +2,9 @@
 %% runtime needs that Gleam cannot express.
 -module(temporal_ffi).
 
--export([connect/4, worker_new/3, replay_worker_new/2, poll_workflow/1, complete_workflow/2,
-         poll_activity/1, complete_activity/3, heartbeat/2, worker_shutdown/1,
-         start_workflow/5, signal_workflow/5, query_workflow/5, cancel_workflow/3,
+-export([connect/5, worker_new/3, replay_worker_new/2, poll_workflow/1, complete_workflow/2,
+         poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/3, worker_shutdown/1,
+         start_workflow/3, describe_workflow/3, list_workflows/3, count_workflows/2, signal_workflow/5, query_workflow/5, cancel_workflow/3,
          terminate_workflow/4, workflow_result/3, fetch_history/3,
          send_activation/2, receive_activation/0, get_state/0, put_state/1, rescue/1,
          exit_normal/0, kill/1]).
@@ -18,11 +18,11 @@ call(Start) ->
         Error -> Error
     end.
 
-connect(Target, Namespace, Identity, ApiKey) ->
-    call(fun(P, R) -> temporal_nif:connect(P, R, Target, Namespace, Identity, ApiKey) end).
+connect(Target, Namespace, Identity, ApiKey, Tls) ->
+    call(fun(P, R) -> temporal_nif:connect(P, R, Target, Namespace, Identity, ApiKey, Tls) end).
 
-worker_new(Conn, TaskQueue, MaxCached) ->
-    call(fun(P, R) -> temporal_nif:worker_new(P, R, Conn, TaskQueue, MaxCached) end).
+worker_new(Conn, TaskQueue, Options) ->
+    call(fun(P, R) -> temporal_nif:worker_new(P, R, Conn, TaskQueue, Options) end).
 
 replay_worker_new(TaskQueue, Histories) ->
     temporal_nif:replay_worker_new(TaskQueue, Histories).
@@ -42,14 +42,52 @@ poll_activity(Worker) ->
 complete_activity(Worker, Token, Result) ->
     call(fun(P, R) -> temporal_nif:worker_complete_activity(P, R, Worker, Token, Result) end).
 
-heartbeat(Worker, Token) ->
-    temporal_nif:worker_heartbeat(Worker, Token, []).
+heartbeat(Worker, Token, Details) ->
+    temporal_nif:worker_heartbeat(Worker, Token, Details).
+
+send_activity_cancel(Pid, Reason) ->
+    Pid ! {temporal_activity_cancel, Reason},
+    nil.
+
+%% The cancellation delivered to this activity process, remembered once seen.
+activity_cancel_reason() ->
+    case erlang:get(temporal_activity_cancel) of
+        undefined ->
+            receive
+                {temporal_activity_cancel, Reason} ->
+                    erlang:put(temporal_activity_cancel, Reason),
+                    {some, Reason}
+            after 0 -> none
+            end;
+        Reason -> {some, Reason}
+    end.
+
+log(Level, Message, Metadata) ->
+    logger:log(Level, "~ts", [Message], Metadata#{domain => [temporal]}),
+    nil.
+
+rescue_all(Fun) ->
+    try {ok, Fun()}
+    catch
+        Class:Reason:Stack ->
+            {error, unicode:characters_to_binary(
+                      io_lib:format("~p: ~0tp~n~0tp", [Class, Reason, Stack]))}
+    end.
 
 worker_shutdown(Worker) ->
     call(fun(P, R) -> temporal_nif:worker_shutdown(P, R, Worker) end).
 
-start_workflow(Conn, Id, Type, TaskQueue, Input) ->
-    call(fun(P, R) -> temporal_nif:start_workflow(P, R, Conn, Id, Type, TaskQueue, Input) end).
+start_workflow(Conn, Request, Signal) ->
+    call(fun(P, R) -> temporal_nif:start_workflow(P, R, Conn, Request, Signal) end).
+
+describe_workflow(Conn, Id, RunId) ->
+    call(fun(P, R) -> temporal_nif:describe_workflow(P, R, Conn, Id, RunId) end).
+
+list_workflows(Conn, Query, Limit) ->
+    call(fun(P, R) -> temporal_nif:list_workflows(P, R, Conn, Query, Limit) end).
+
+count_workflows(Conn, Query) ->
+    call(fun(P, R) -> temporal_nif:count_workflows(P, R, Conn, Query) end).
 
 signal_workflow(Conn, Id, RunId, Name, Input) ->
     call(fun(P, R) -> temporal_nif:signal_workflow(P, R, Conn, Id, RunId, Name, Input) end).

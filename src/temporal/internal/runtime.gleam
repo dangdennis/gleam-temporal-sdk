@@ -17,6 +17,7 @@ import gleam/set.{type Set}
 import temporal/codec.{type Payload}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge.{type Activation, type Command, type Completion}
+import temporal/middleware.{type Outbound}
 
 /// A workflow implementation with its argument and result types erased.
 pub type WorkflowFn =
@@ -25,6 +26,29 @@ pub type WorkflowFn =
 pub type QueryHandler =
   fn(List(Payload)) -> Result(Payload, String)
 
+/// Something a scope cancels: a timer, activity or child workflow, by sequence number.
+pub type Op {
+  TimerOp(seq: Int)
+  ActivityOp(seq: Int)
+  ChildOp(seq: Int)
+}
+
+/// A cancellation scope. Cancelling one cancels its pending operations and every scope
+/// beneath it that is not shielded.
+pub type Scope {
+  Scope(
+    parent: Int,
+    shielded: Bool,
+    /// The reason, once cancelled.
+    cancelled: Option(String),
+    /// Newest first.
+    ops: List(Op),
+  )
+}
+
+/// The scope that workflow cancellation cancels.
+pub const root_scope = 0
+
 pub type State {
   State(
     run_id: String,
@@ -32,6 +56,11 @@ pub type State {
     workflow_type: String,
     task_queue: String,
     attempt: Int,
+    first_execution_run_id: String,
+    continued_from_run_id: String,
+    memo: Dict(String, Payload),
+    history_length: Int,
+    continue_as_new_suggested: Bool,
     arguments: List(Payload),
     now_ms: Int,
     is_replaying: Bool,
@@ -43,6 +72,12 @@ pub type State {
     next_activity: Int,
     next_child: Int,
     fired_timers: Set(Int),
+    cancelled_timers: Set(Int),
+    scopes: Dict(Int, Scope),
+    next_scope: Int,
+    /// Timers that cancel a scope when they fire, by timer sequence number.
+    deadlines: Dict(Int, Int),
+    outbound: Outbound,
     activities: Dict(Int, bridge.Resolution),
     children: Dict(Int, bridge.Resolution),
     child_starts: Dict(Int, bridge.ChildStart),
@@ -54,7 +89,6 @@ pub type State {
     pending_queries: List(#(String, String, List(Payload))),
     /// Newest first.
     commands: List(Command),
-    cancel_reason: Option(String),
     notified_patches: Set(String),
     patch_decisions: Dict(String, Bool),
     complete: fn(Completion) -> Nil,
@@ -76,6 +110,7 @@ pub fn update(change: fn(State) -> State) -> Nil {
 pub fn run(
   workflows: Dict(String, WorkflowFn),
   task_queue: String,
+  outbound: Outbound,
   complete: fn(Completion) -> Nil,
 ) -> Nil {
   let activation = bridge.receive_activation()
@@ -85,6 +120,11 @@ pub fn run(
     workflow_type: "",
     task_queue:,
     attempt: 1,
+    first_execution_run_id: "",
+    continued_from_run_id: "",
+    memo: dict.new(),
+    history_length: 0,
+    continue_as_new_suggested: False,
     arguments: [],
     now_ms: activation.timestamp_ms,
     is_replaying: activation.is_replaying,
@@ -93,6 +133,11 @@ pub fn run(
     next_activity: 1,
     next_child: 1,
     fired_timers: set.new(),
+    cancelled_timers: set.new(),
+    scopes: dict.from_list([#(root_scope, Scope(root_scope, False, None, []))]),
+    next_scope: 1,
+    deadlines: dict.new(),
+    outbound:,
     activities: dict.new(),
     children: dict.new(),
     child_starts: dict.new(),
@@ -100,7 +145,6 @@ pub fn run(
     query_handlers: dict.new(),
     pending_queries: [],
     commands: [],
-    cancel_reason: None,
     notified_patches: set.new(),
     patch_decisions: dict.new(),
     complete:,
@@ -130,7 +174,13 @@ fn terminal_command(result: Result(Option(Payload), Failure)) -> Command {
     Ok(payload) -> bridge.CompleteWorkflow(payload)
     Error(failure.Failure(kind: failure.Cancelled, ..)) ->
       bridge.CancelWorkflowExecution
-    Error(failure) -> bridge.FailWorkflow(failure)
+    // A cancelled activity or child surfaces as a wrapped cancellation. It ends the
+    // workflow as cancelled only if the workflow itself was asked to cancel.
+    Error(failure) ->
+      case failure.is_cancellation(failure), scope_cancelled(root_scope) {
+        True, Some(_) -> bridge.CancelWorkflowExecution
+        _, _ -> bridge.FailWorkflow(failure)
+      }
   }
 }
 
@@ -188,6 +238,8 @@ fn apply(activation: Activation) -> Nil {
     State(
       ..state,
       is_replaying: activation.is_replaying,
+      history_length: activation.history_length,
+      continue_as_new_suggested: activation.continue_as_new_suggested,
       // Activations that only carry queries or an eviction have no timestamp.
       now_ms: case activation.timestamp_ms {
         0 -> state.now_ms
@@ -207,6 +259,9 @@ fn apply_job(job: bridge.Job) -> Nil {
       arguments:,
       randomness_seed:,
       attempt:,
+      first_execution_run_id:,
+      continued_from_run_id:,
+      memo:,
     ) ->
       put(
         State(
@@ -216,10 +271,18 @@ fn apply_job(job: bridge.Job) -> Nil {
           arguments:,
           random: randomness_seed,
           attempt:,
+          first_execution_run_id:,
+          continued_from_run_id:,
+          memo:,
         ),
       )
-    bridge.FireTimer(seq) ->
+    bridge.FireTimer(seq) -> {
       put(State(..state, fired_timers: set.insert(state.fired_timers, seq)))
+      case dict.get(state.deadlines, seq) {
+        Ok(scope) -> cancel_scope(scope, "timed out")
+        Error(Nil) -> Nil
+      }
+    }
     bridge.ResolveActivity(seq, result) ->
       put(
         State(..state, activities: dict.insert(state.activities, seq, result)),
@@ -241,8 +304,7 @@ fn apply_job(job: bridge.Job) -> Nil {
           ..state.pending_queries
         ]),
       )
-    bridge.CancelWorkflow(reason) ->
-      put(State(..state, cancel_reason: Some(reason)))
+    bridge.CancelWorkflow(reason) -> cancel_scope(root_scope, reason)
     bridge.SignalWorkflow(name, input) -> {
       let queue = case dict.get(state.signals, name) {
         Ok(queue) -> queue
@@ -273,6 +335,173 @@ fn apply_job(job: bridge.Job) -> Nil {
 
 pub fn push(command: Command) -> Nil {
   update(fn(state) { State(..state, commands: [command, ..state.commands]) })
+}
+
+// ---- cancellation scopes ----
+
+/// Open a scope beneath `parent`. A scope opened under a cancelled parent starts cancelled,
+/// unless it is shielded.
+pub fn open_scope(parent: Int, shielded: Bool) -> Int {
+  let state = get()
+  let cancelled = case shielded {
+    True -> None
+    False -> scope_cancelled(parent)
+  }
+  put(
+    State(
+      ..state,
+      next_scope: state.next_scope + 1,
+      scopes: dict.insert(
+        state.scopes,
+        state.next_scope,
+        Scope(parent:, shielded:, cancelled:, ops: []),
+      ),
+    ),
+  )
+  state.next_scope
+}
+
+/// Close a scope. Whatever is still pending in it now belongs to its parent, so that
+/// cancelling the parent still reaches it.
+pub fn close_scope(id: Int) -> Nil {
+  let state = get()
+  case dict.get(state.scopes, id) {
+    Error(Nil) -> Nil
+    Ok(scope) -> {
+      let scopes =
+        dict.delete(state.scopes, id)
+        |> dict.map_values(fn(_, other) {
+          case other.parent == id {
+            True -> Scope(..other, parent: scope.parent)
+            False -> other
+          }
+        })
+      let scopes = case scope.shielded, dict.get(scopes, scope.parent) {
+        False, Ok(parent) ->
+          dict.insert(
+            scopes,
+            scope.parent,
+            Scope(
+              ..parent,
+              ops: list.append(list.filter(scope.ops, is_pending), parent.ops),
+            ),
+          )
+        _, _ -> scopes
+      }
+      put(State(..state, scopes:))
+    }
+  }
+}
+
+/// The reason the scope was cancelled, if it was.
+pub fn scope_cancelled(id: Int) -> Option(String) {
+  case dict.get(get().scopes, id) {
+    Ok(scope) -> scope.cancelled
+    Error(Nil) -> None
+  }
+}
+
+/// Make `op` cancellable through `scope`.
+pub fn register(scope_id: Int, op: Op) -> Nil {
+  update(fn(state) {
+    case dict.get(state.scopes, scope_id) {
+      Ok(scope) ->
+        State(
+          ..state,
+          scopes: dict.insert(
+            state.scopes,
+            scope_id,
+            Scope(..scope, ops: [op, ..scope.ops]),
+          ),
+        )
+      Error(Nil) -> state
+    }
+  })
+}
+
+/// Cancel a scope: request cancellation of its pending operations, oldest first, then cancel
+/// the scopes beneath it in the order they were opened. The order is fixed because the
+/// commands this emits are checked against history on replay.
+pub fn cancel_scope(id: Int, reason: String) -> Nil {
+  let state = get()
+  case dict.get(state.scopes, id) {
+    Ok(Scope(cancelled: None, ..) as scope) -> {
+      put(
+        State(
+          ..state,
+          scopes: dict.insert(
+            state.scopes,
+            id,
+            Scope(..scope, cancelled: Some(reason), ops: []),
+          ),
+        ),
+      )
+      list.each(list.reverse(scope.ops), cancel_op)
+      dict.to_list(get().scopes)
+      |> list.filter(fn(entry) { entry.1.parent == id && !entry.1.shielded })
+      |> list.filter(fn(entry) { entry.0 != id })
+      |> list.sort(fn(a, b) { int.compare(a.0, b.0) })
+      |> list.each(fn(entry) { cancel_scope(entry.0, reason) })
+    }
+    _ -> Nil
+  }
+}
+
+fn is_pending(op: Op) -> Bool {
+  let state = get()
+  case op {
+    TimerOp(seq) ->
+      !set.contains(state.fired_timers, seq)
+      && !set.contains(state.cancelled_timers, seq)
+    ActivityOp(seq) -> !dict.has_key(state.activities, seq)
+    ChildOp(seq) ->
+      case
+        dict.has_key(state.children, seq),
+        dict.get(state.child_starts, seq)
+      {
+        True, _ -> False
+        False, Ok(bridge.ChildStarted(_)) | False, Error(Nil) -> True
+        False, Ok(_) -> False
+      }
+  }
+}
+
+fn cancel_op(op: Op) -> Nil {
+  case is_pending(op), op {
+    False, _ -> Nil
+    True, TimerOp(seq) -> cancel_timer(seq)
+    True, ActivityOp(seq) -> push(bridge.RequestCancelActivity(seq))
+    True, ChildOp(seq) -> push(bridge.CancelChildWorkflow(seq))
+  }
+}
+
+/// Cancel a timer that has not fired. Core sends no job for a cancelled timer, so the
+/// cancellation is recorded here for the timer's future to see.
+pub fn cancel_timer(seq: Int) -> Nil {
+  let state = get()
+  case
+    set.contains(state.fired_timers, seq)
+    || set.contains(state.cancelled_timers, seq)
+  {
+    True -> Nil
+    False -> {
+      put(
+        State(
+          ..state,
+          cancelled_timers: set.insert(state.cancelled_timers, seq),
+          deadlines: dict.delete(state.deadlines, seq),
+        ),
+      )
+      push(bridge.CancelTimer(seq))
+    }
+  }
+}
+
+/// Cancel `scope` when the timer `seq` fires.
+pub fn set_deadline(seq: Int, scope: Int) -> Nil {
+  update(fn(state) {
+    State(..state, deadlines: dict.insert(state.deadlines, seq, scope))
+  })
 }
 
 /// Reserve the sequence number that ties a timer command to its resolution.
@@ -330,6 +559,30 @@ pub fn patched(patch_id: String) -> Bool {
         False -> Nil
       }
       decision
+    }
+  }
+}
+
+/// Record that the code guarded by a patch is now the only code. Lets the `patched` call be
+/// deleted once no run started before the patch can still replay.
+pub fn deprecate_patch(patch_id: String) -> Nil {
+  let state = get()
+  case dict.has_key(state.patch_decisions, patch_id) {
+    True -> Nil
+    False -> {
+      put(
+        State(
+          ..state,
+          patch_decisions: dict.insert(state.patch_decisions, patch_id, True),
+        ),
+      )
+      // Like `patched`, a replay only repeats the marker if history has it.
+      case
+        !state.is_replaying || set.contains(state.notified_patches, patch_id)
+      {
+        True -> push(bridge.SetPatchMarker(patch_id, True))
+        False -> Nil
+      }
     }
   }
 }

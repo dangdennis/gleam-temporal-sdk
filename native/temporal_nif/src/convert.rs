@@ -24,21 +24,21 @@ use temporalio_common::protos::{
         workflow_completion::{self, WorkflowActivationCompletion},
     },
     temporal::api::{
-        common::v1::{Payload, RetryPolicy},
+        common::v1::{Memo, Payload, Payloads, RetryPolicy, SearchAttributes},
         failure::v1::{ApplicationFailureInfo, CanceledFailureInfo, Failure, failure::FailureInfo},
     },
 };
 
 pub type DecodeResult<T> = Result<T, String>;
 
-fn atom<'a>(env: Env<'a>, name: &str) -> Term<'a> {
+pub fn atom<'a>(env: Env<'a>, name: &str) -> Term<'a> {
     Atom::from_str(env, name)
         .expect("atom names are short ASCII")
         .to_term(env)
 }
 
 /// A Gleam record: `{tag, Fields...}`.
-fn rec<'a>(env: Env<'a>, tag: &str, fields: &[Term<'a>]) -> Term<'a> {
+pub fn rec<'a>(env: Env<'a>, tag: &str, fields: &[Term<'a>]) -> Term<'a> {
     let mut terms = Vec::with_capacity(fields.len() + 1);
     terms.push(atom(env, tag));
     terms.extend_from_slice(fields);
@@ -51,7 +51,7 @@ pub fn bin<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
     b.into()
 }
 
-fn option<'a>(env: Env<'a>, value: Option<Term<'a>>) -> Term<'a> {
+pub fn option<'a>(env: Env<'a>, value: Option<Term<'a>>) -> Term<'a> {
     match value {
         Some(t) => (atoms::some(), t).encode(env),
         None => atoms::none().encode(env),
@@ -64,7 +64,7 @@ pub fn opt(term: Term) -> Option<Term> {
     (parts.len() == 2).then(|| parts[1])
 }
 
-fn millis(ts: Option<impl Into<prost_wkt_types::Timestamp>>) -> i64 {
+pub fn millis(ts: Option<impl Into<prost_wkt_types::Timestamp>>) -> i64 {
     ts.map(|t| {
         let t: prost_wkt_types::Timestamp = t.into();
         t.seconds * 1000 + i64::from(t.nanos) / 1_000_000
@@ -72,7 +72,11 @@ fn millis(ts: Option<impl Into<prost_wkt_types::Timestamp>>) -> i64 {
     .unwrap_or(0)
 }
 
-fn duration(ms: u64) -> prost_wkt_types::Duration {
+pub fn duration_ms(d: Option<prost_wkt_types::Duration>) -> Option<i64> {
+    d.map(|d| d.seconds * 1000 + i64::from(d.nanos) / 1_000_000)
+}
+
+pub fn duration(ms: u64) -> prost_wkt_types::Duration {
     prost_wkt_types::Duration {
         seconds: (ms / 1000) as i64,
         nanos: ((ms % 1000) * 1_000_000) as i32,
@@ -89,6 +93,16 @@ pub fn encode_payload<'a>(env: Env<'a>, p: &Payload) -> Term<'a> {
             .expect("map_put on a map");
     }
     rec(env, "payload", &[metadata, bin(env, &p.data)])
+}
+
+pub fn encode_payload_map<'a>(env: Env<'a>, m: &HashMap<String, Payload>) -> Term<'a> {
+    let mut map = Term::map_new(env);
+    for (k, v) in m {
+        map = map
+            .map_put(k.as_str(), encode_payload(env, v))
+            .expect("map_put on a map");
+    }
+    map
 }
 
 fn encode_payloads<'a>(env: Env<'a>, ps: &[Payload]) -> Term<'a> {
@@ -112,6 +126,12 @@ pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
         _ => ("other", "", false),
     };
     let cause = option(env, f.cause.as_deref().map(|c| encode_failure(env, c)));
+    let details = match &f.failure_info {
+        Some(FailureInfo::ApplicationFailureInfo(i)) => i.details.as_ref(),
+        Some(FailureInfo::CanceledFailureInfo(i)) => i.details.as_ref(),
+        _ => None,
+    };
+    let details = encode_payloads(env, details.map(|d| d.payloads.as_slice()).unwrap_or(&[]));
     rec(
         env,
         "failure",
@@ -121,6 +141,7 @@ pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
             error_type.encode(env),
             non_retryable.encode(env),
             cause,
+            details,
         ],
     )
 }
@@ -186,6 +207,9 @@ fn encode_job<'a>(env: Env<'a>, job: Job) -> Term<'a> {
                 encode_payloads(env, &j.arguments),
                 j.randomness_seed.encode(env),
                 j.attempt.encode(env),
+                j.first_execution_run_id.encode(env),
+                j.continued_from_execution_run_id.encode(env),
+                encode_payload_map(env, &j.memo.map(|m| m.fields).unwrap_or_default()),
             ],
         ),
         Job::FireTimer(j) => rec(env, "fire_timer", &[j.seq.encode(env)]),
@@ -276,6 +300,7 @@ pub fn encode_activation<'a>(env: Env<'a>, a: WorkflowActivation) -> Term<'a> {
             a.is_replaying.encode(env),
             a.history_length.encode(env),
             jobs.encode(env),
+            a.continue_as_new_suggested.encode(env),
         ],
     )
 }
@@ -301,6 +326,18 @@ pub fn encode_activity_task<'a>(env: Env<'a>, t: ActivityTask) -> Term<'a> {
                     encode_payloads(env, &s.input),
                     s.attempt.encode(env),
                     encode_payloads(env, &s.heartbeat_details),
+                    s.workflow_type.encode(env),
+                    option(
+                        env,
+                        duration_ms(s.start_to_close_timeout).map(|ms| ms.encode(env)),
+                    ),
+                    option(
+                        env,
+                        duration_ms(s.heartbeat_timeout)
+                            .filter(|ms| *ms > 0)
+                            .map(|ms| ms.encode(env)),
+                    ),
+                    millis(s.scheduled_time).encode(env),
                 ],
             )
         }
@@ -314,7 +351,7 @@ pub fn encode_activity_task<'a>(env: Env<'a>, t: ActivityTask) -> Term<'a> {
 // ---- decoding (Gleam -> core) ----
 
 /// Split a record into its tag and fields; a bare atom is a record without fields.
-fn untag(term: Term) -> DecodeResult<(String, Vec<Term>)> {
+pub fn untag(term: Term) -> DecodeResult<(String, Vec<Term>)> {
     if term.is_atom() {
         return Ok((term.atom_to_string().map_err(|_| "bad atom")?, vec![]));
     }
@@ -326,7 +363,7 @@ fn untag(term: Term) -> DecodeResult<(String, Vec<Term>)> {
     Ok((tag, parts[1..].to_vec()))
 }
 
-fn get<'a, T: rustler::Decoder<'a>>(fields: &[Term<'a>], i: usize) -> DecodeResult<T> {
+pub fn get<'a, T: rustler::Decoder<'a>>(fields: &[Term<'a>], i: usize) -> DecodeResult<T> {
     fields
         .get(i)
         .ok_or_else(|| format!("missing field {i}"))?
@@ -334,7 +371,7 @@ fn get<'a, T: rustler::Decoder<'a>>(fields: &[Term<'a>], i: usize) -> DecodeResu
         .map_err(|_| format!("field {i} has the wrong type"))
 }
 
-fn field<'a>(fields: &[Term<'a>], i: usize) -> DecodeResult<Term<'a>> {
+pub fn field<'a>(fields: &[Term<'a>], i: usize) -> DecodeResult<Term<'a>> {
     fields
         .get(i)
         .copied()
@@ -363,6 +400,26 @@ pub fn decode_payloads(term: Term) -> DecodeResult<Vec<Payload>> {
     list.into_iter().map(decode_payload).collect()
 }
 
+pub fn decode_payload_map(term: Term) -> DecodeResult<HashMap<String, Payload>> {
+    let iter = MapIterator::new(term).ok_or("expected a map of payloads")?;
+    let mut out = HashMap::new();
+    for (k, v) in iter {
+        let k: String = k.decode().map_err(|_| "bad map key")?;
+        out.insert(k, decode_payload(v)?);
+    }
+    Ok(out)
+}
+
+pub fn decode_memo(term: Term) -> DecodeResult<Option<Memo>> {
+    let fields = decode_payload_map(term)?;
+    Ok((!fields.is_empty()).then_some(Memo { fields }))
+}
+
+pub fn decode_search_attributes(term: Term) -> DecodeResult<Option<SearchAttributes>> {
+    let indexed_fields = decode_payload_map(term)?;
+    Ok((!indexed_fields.is_empty()).then_some(SearchAttributes { indexed_fields }))
+}
+
 fn decode_opt_payload(term: Term) -> DecodeResult<Option<Payload>> {
     opt(term).map(decode_payload).transpose()
 }
@@ -370,12 +427,18 @@ fn decode_opt_payload(term: Term) -> DecodeResult<Option<Payload>> {
 pub fn decode_failure(term: Term) -> DecodeResult<Failure> {
     let (_, f) = untag(term)?;
     let (kind, _) = untag(field(&f, 1)?)?;
+    let details = decode_payloads(field(&f, 5)?)?;
+    let details = (!details.is_empty()).then_some(Payloads { payloads: details });
     let info = if kind == "cancelled" {
-        FailureInfo::CanceledFailureInfo(CanceledFailureInfo::default())
+        FailureInfo::CanceledFailureInfo(CanceledFailureInfo {
+            details,
+            ..Default::default()
+        })
     } else {
         FailureInfo::ApplicationFailureInfo(ApplicationFailureInfo {
             r#type: get(&f, 2)?,
             non_retryable: get(&f, 3)?,
+            details,
             ..Default::default()
         })
     };
@@ -392,7 +455,7 @@ pub fn decode_failure(term: Term) -> DecodeResult<Failure> {
     })
 }
 
-fn decode_opt_ms(term: Term) -> DecodeResult<Option<prost_wkt_types::Duration>> {
+pub fn decode_opt_ms(term: Term) -> DecodeResult<Option<prost_wkt_types::Duration>> {
     match opt(term) {
         Some(t) => {
             let ms: u64 = t
@@ -404,7 +467,7 @@ fn decode_opt_ms(term: Term) -> DecodeResult<Option<prost_wkt_types::Duration>> 
     }
 }
 
-fn decode_retry(term: Term) -> DecodeResult<RetryPolicy> {
+pub fn decode_retry(term: Term) -> DecodeResult<RetryPolicy> {
     let (_, f) = untag(term)?;
     Ok(RetryPolicy {
         initial_interval: Some(duration(get(&f, 0)?)),
@@ -433,6 +496,8 @@ fn decode_command(term: Term) -> DecodeResult<WorkflowCommand> {
             start_to_close_timeout: decode_opt_ms(field(&f, 6)?)?,
             heartbeat_timeout: decode_opt_ms(field(&f, 7)?)?,
             retry_policy: opt(field(&f, 8)?).map(decode_retry).transpose()?,
+            schedule_to_start_timeout: decode_opt_ms(field(&f, 9)?)?,
+            cancellation_type: get(&f, 10)?,
             ..Default::default()
         }),
         "request_cancel_activity" => {
@@ -474,12 +539,22 @@ fn decode_command(term: Term) -> DecodeResult<WorkflowCommand> {
             deprecated: get(&f, 1)?,
         }),
         "start_child_workflow" => {
+            let (_, o) = untag(field(&f, 5)?)?;
             Cmd::StartChildWorkflowExecution(wc::StartChildWorkflowExecution {
                 seq: get(&f, 0)?,
                 workflow_id: get(&f, 1)?,
                 workflow_type: get(&f, 2)?,
                 task_queue: get(&f, 3)?,
                 input: decode_payloads(field(&f, 4)?)?,
+                workflow_execution_timeout: decode_opt_ms(field(&o, 0)?)?,
+                workflow_run_timeout: decode_opt_ms(field(&o, 1)?)?,
+                workflow_task_timeout: decode_opt_ms(field(&o, 2)?)?,
+                parent_close_policy: get(&o, 3)?,
+                workflow_id_reuse_policy: get(&o, 4)?,
+                retry_policy: opt(field(&o, 5)?).map(decode_retry).transpose()?,
+                memo: decode_payload_map(field(&o, 6)?)?,
+                search_attributes: decode_search_attributes(field(&o, 7)?)?,
+                cancellation_type: get(&o, 8)?,
                 ..Default::default()
             })
         }

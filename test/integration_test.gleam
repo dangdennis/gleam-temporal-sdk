@@ -8,7 +8,7 @@
 
 import gleam/int
 import gleam/list
-import gleam/option.{None}
+import gleam/result
 import gleam/string
 import temporal/activity
 import temporal/client.{type Client}
@@ -84,8 +84,8 @@ fn timers() {
 /// Sleeps and returns how much workflow time passed.
 fn timers_workflow(ctx: Context, ms: Int) -> Result(Int, Failure) {
   let before = workflow.now(ctx)
-  workflow.sleep(ctx, ms)
-  workflow.sleep(ctx, ms)
+  let assert Ok(Nil) = workflow.sleep(ctx, ms)
+  let assert Ok(Nil) = workflow.sleep(ctx, ms)
   Ok(workflow.now(ctx) - before)
 }
 
@@ -154,12 +154,8 @@ fn cancellable() {
 }
 
 fn cancellable_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
-  let work =
-    workflow.timer(ctx, 600_000) |> workflow.map(fn(_) { Ok("finished") })
-  let cancelled =
-    workflow.cancellation(ctx)
-    |> workflow.map(fn(_) { Error(failure.cancelled()) })
-  workflow.await(workflow.race([work, cancelled]))
+  use _ <- result.map(workflow.sleep(ctx, 600_000))
+  "finished"
 }
 
 fn countdown() {
@@ -167,7 +163,7 @@ fn countdown() {
 }
 
 fn countdown_workflow(ctx: Context, remaining: Int) -> Result(String, Failure) {
-  workflow.sleep(ctx, 10)
+  let assert Ok(Nil) = workflow.sleep(ctx, 10)
   case remaining {
     0 -> Ok("lift-off on attempt " <> int.to_string(workflow.info(ctx).attempt))
     _ -> workflow.continue_as_new(ctx, countdown(), remaining - 1)
@@ -180,7 +176,7 @@ fn parent() {
 
 fn parent_workflow(ctx: Context, name: String) -> Result(String, Failure) {
   let child_id = workflow.info(ctx).workflow_id <> "-child"
-  let options = workflow.ChildOptions(workflow_id: child_id, task_queue: None)
+  let options = workflow.child_options(workflow_id: child_id)
   case workflow.execute_child(ctx, greet(), name, options) {
     Ok(greeting) -> Ok("child said: " <> greeting)
     Error(failure) -> Error(failure)
@@ -195,9 +191,9 @@ fn randomness() {
 /// sequence or drew differently would schedule a different timer and be caught by core.
 fn randomness_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   let first = workflow.random_int(ctx, 50)
-  workflow.sleep(ctx, 10 + first)
+  let assert Ok(Nil) = workflow.sleep(ctx, 10 + first)
   let id = workflow.uuid4(ctx)
-  workflow.sleep(ctx, 10 + workflow.random_int(ctx, 50))
+  let assert Ok(Nil) = workflow.sleep(ctx, 10 + workflow.random_int(ctx, 50))
   Ok(int.to_string(first) <> ":" <> id)
 }
 
@@ -206,7 +202,7 @@ fn patching() {
 }
 
 fn patching_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
-  workflow.sleep(ctx, 10)
+  let assert Ok(Nil) = workflow.sleep(ctx, 10)
   case workflow.patched(ctx, "double-it") {
     True -> workflow.execute_activity(ctx, double(), n, options())
     False -> Ok(n)
@@ -221,7 +217,7 @@ fn replay_probe() {
 /// result, a replay.
 fn replay_probe_workflow(ctx: Context, _: Nil) -> Result(Bool, Failure) {
   let replaying = workflow.is_replaying(ctx)
-  workflow.sleep(ctx, 10)
+  let assert Ok(Nil) = workflow.sleep(ctx, 10)
   Ok(replaying)
 }
 
@@ -274,7 +270,7 @@ fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
 }
 
 fn start_options(env: Env) -> client.StartOptions {
-  client.StartOptions(
+  client.start_options(
     workflow_id: env.task_queue <> "-" <> unique(),
     task_queue: env.task_queue,
   )
@@ -443,13 +439,13 @@ pub fn replay_detects_reordered_commands_test() {
   let task_queue = "reordered-" <> unique()
   let original =
     workflow.handler(reordered(), fn(ctx, n) {
-      workflow.sleep(ctx, 10)
+      let assert Ok(Nil) = workflow.sleep(ctx, 10)
       workflow.execute_activity(ctx, double(), n, options())
     })
   let changed =
     workflow.handler(reordered(), fn(ctx, n) {
       let doubled = workflow.execute_activity(ctx, double(), n, options())
-      workflow.sleep(ctx, 10)
+      let assert Ok(Nil) = workflow.sleep(ctx, 10)
       doubled
     })
   let assert Ok(worker) =
@@ -462,7 +458,7 @@ pub fn replay_detects_reordered_commands_test() {
       client,
       reordered(),
       4,
-      client.StartOptions(workflow_id: task_queue, task_queue:),
+      client.start_options(workflow_id: task_queue, task_queue:),
     )
   assert client.result(handle) == Ok(8)
   worker.stop(worker)
