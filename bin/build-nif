@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Build the Rust NIF and place it where the Erlang loader looks for it.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cargo build --release --manifest-path "$root/native/temporal_nif/Cargo.toml"
+mkdir -p "$root/priv"
+cp "$root/native/temporal_nif/target/release/libtemporal_nif.so" "$root/priv/libtemporal_nif.so"
