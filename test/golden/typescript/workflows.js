@@ -1,5 +1,5 @@
-// The TypeScript twin of `golden_workflow` in test/golden_test.gleam. The two must issue
-// the same commands in the same order.
+// The TypeScript twins of the workflows in test/golden_test.gleam. Each pair must issue the
+// same commands in the same order.
 const wf = require('@temporalio/workflow');
 
 const { double } = wf.proxyActivities({ startToCloseTimeout: '10 seconds' });
@@ -21,4 +21,28 @@ exports.golden = async function golden(n) {
 
 exports.double_child = async function double_child(n) {
   return await double(n);
+};
+
+const { slow } = wf.proxyActivities({ startToCloseTimeout: '30 seconds' });
+
+// Cancellation: a deadline that cancels an activity, a scope that cancels a timer, and
+// shielded cleanup after the workflow itself is cancelled.
+exports.scopes = async function scopes(n) {
+  try {
+    await wf.CancellationScope.withTimeout(200, () => slow(2000));
+  } catch (err) {
+    if (!wf.isCancellation(err)) throw err;
+  }
+  const scope = new wf.CancellationScope();
+  const pending = scope.run(() => wf.sleep(60_000)).catch(() => undefined);
+  await wf.sleep(10);
+  scope.cancel();
+  await pending;
+  try {
+    await wf.sleep(60_000);
+    return n;
+  } catch (err) {
+    await wf.CancellationScope.nonCancellable(() => double(n));
+    throw err;
+  }
 };

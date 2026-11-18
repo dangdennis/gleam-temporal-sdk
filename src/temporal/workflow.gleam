@@ -444,20 +444,21 @@ pub fn with_timeout(
   body: fn(Context) -> Result(a, Failure),
 ) -> Result(a, Failure) {
   let scope = runtime.open_scope(ctx.scope, False)
+  // The deadline timer is the scope's first operation, as in the TypeScript SDK.
   let seq = runtime.next_timer()
-  case runtime.scope_cancelled(ctx.scope) {
+  case runtime.scope_cancelled(scope) {
     Some(_) -> Nil
     None -> {
       runtime.push(bridge.StartTimer(seq, int.max(ms, 1)))
-      runtime.register(ctx.scope, runtime.TimerOp(seq))
+      runtime.register(scope, runtime.TimerOp(seq))
       runtime.set_deadline(seq, scope)
     }
   }
   let outcome = body(Context(scope))
   let timed_out = set.contains(runtime.get().fired_timers, seq)
-  case timed_out, runtime.scope_cancelled(ctx.scope) {
-    False, None -> runtime.cancel_timer(seq)
-    _, _ -> Nil
+  case runtime.scope_cancelled(scope) {
+    Some(_) -> Nil
+    None -> runtime.cancel_timer(seq)
   }
   runtime.close_scope(scope)
   case outcome, timed_out {

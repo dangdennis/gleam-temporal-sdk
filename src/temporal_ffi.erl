@@ -90,8 +90,11 @@ activity_cancel_reason() ->
         Reason -> {some, Reason}
     end.
 
+%% Metadata keys are a fixed set chosen by this library, so making atoms of them is safe.
 log(Level, Message, Metadata) ->
-    logger:log(Level, "~ts", [Message], Metadata#{domain => [temporal]}),
+    Meta = maps:fold(fun(K, V, Acc) -> Acc#{binary_to_atom(K) => V} end,
+                     #{domain => [temporal]}, Metadata),
+    logger:log(Level, "~ts", [Message], Meta),
     nil.
 
 rescue_all(Fun) ->

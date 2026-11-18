@@ -1,5 +1,5 @@
-//// Cross-SDK conformance: a history recorded by the official TypeScript SDK must replay
-//// through this SDK without a nondeterminism error. That holds only if the Gleam workflow
+//// Cross-SDK conformance: histories recorded by the official TypeScript SDK must replay
+//// through this SDK without a nondeterminism error. That holds only if each Gleam workflow
 //// issues the same commands, in the same order and with the same ids, as its TypeScript
 //// twin in `test/golden/typescript/workflows.js`. No server is needed.
 ////
@@ -81,6 +81,88 @@ pub fn typescript_sdk_history_rejects_diverging_code_test() {
   let handlers = [workflow.handler(golden(), diverging_workflow)]
   let assert Error(replayer.Nondeterminism(_)) =
     replayer.replay(handlers, fixture())
+}
+
+fn slow() {
+  activity.Definition("slow", codec.int(), codec.nil())
+}
+
+fn scopes() {
+  workflow.Definition("scopes", codec.int(), codec.int())
+}
+
+/// The twin of `scopes` in workflows.js: a deadline that cancels an activity, a scope that
+/// cancels a timer, and shielded cleanup after the workflow itself is cancelled.
+fn scopes_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
+  scopes_body(ctx, n, fn(ctx, cleanup) {
+    workflow.non_cancellable(ctx, cleanup)
+  })
+}
+
+/// The same workflow without the shield: its cleanup activity is never scheduled.
+fn unshielded_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
+  scopes_body(ctx, n, fn(ctx, cleanup) { cleanup(ctx) })
+}
+
+fn scopes_body(
+  ctx: Context,
+  n: Int,
+  shield: fn(Context, fn(Context) -> Result(Int, Failure)) ->
+    Result(Int, Failure),
+) -> Result(Int, Failure) {
+  let _ =
+    workflow.with_timeout(ctx, 200, fn(scope) {
+      workflow.execute_activity(
+        scope,
+        slow(),
+        2000,
+        workflow.activity_options(start_to_close_ms: 30_000),
+      )
+    })
+  use _ <- try(
+    workflow.with_scope(ctx, fn(scope) {
+      let pending = workflow.timer(scope, 60_000)
+      use _ <- try(workflow.sleep(ctx, 10))
+      workflow.cancel(scope)
+      let _ = workflow.await(pending)
+      Ok(Nil)
+    }),
+  )
+  case workflow.sleep(ctx, 60_000) {
+    Ok(Nil) -> Ok(n)
+    Error(cancelled) -> {
+      let _ =
+        shield(ctx, fn(ctx) {
+          workflow.execute_activity(ctx, double(), n, options())
+        })
+      Error(cancelled)
+    }
+  }
+}
+
+fn scopes_fixture(name: String) -> client.History {
+  let assert Ok(encoded) =
+    read_file("test/fixtures/typescript_sdk_" <> name <> "_history.bin")
+  client.History(workflow_id: name <> "-typescript", encoded:)
+}
+
+pub fn typescript_sdk_cancellation_scopes_replay_test() {
+  let handlers = [workflow.handler(scopes(), scopes_workflow)]
+  assert replayer.replay(handlers, scopes_fixture("scopes")) == Ok(Nil)
+}
+
+/// The run was cancelled while a scope's timer and a plain timer were both pending. Core
+/// accepts those two cancellations in either order, so this checks that both are issued,
+/// not their order; `runtime_test` pins the order.
+pub fn typescript_sdk_early_cancellation_replays_test() {
+  let handlers = [workflow.handler(scopes(), scopes_workflow)]
+  assert replayer.replay(handlers, scopes_fixture("early_cancel")) == Ok(Nil)
+}
+
+pub fn typescript_sdk_cancellation_history_rejects_diverging_code_test() {
+  let handlers = [workflow.handler(scopes(), unshielded_workflow)]
+  let assert Error(replayer.Nondeterminism(_)) =
+    replayer.replay(handlers, scopes_fixture("scopes"))
 }
 
 pub fn fixture_is_not_empty_test() {

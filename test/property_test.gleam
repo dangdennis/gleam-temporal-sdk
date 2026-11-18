@@ -30,6 +30,13 @@ type Step {
   Race(n: Int, ms: Int)
   RandomSleep
   Child(n: Int)
+  /// An activity under a deadline it always meets: the deadline's timer is cancelled.
+  Deadline(n: Int)
+  /// A timer cancelled through its scope before it can fire.
+  CancelledTimer
+  /// An activity raced against a timer, each in a scope of its own, with the loser
+  /// cancelled. Timing decides the winner, so the trace does not record it.
+  CancellingRace(n: Int, ms: Int)
 }
 
 /// A small linear congruential generator, so programs depend only on their seed.
@@ -48,7 +55,7 @@ fn generate(state: Int, remaining: Int, steps: List(Step)) -> List(Step) {
     _ -> {
       let a = next(state)
       let b = next(a)
-      let step = case a / 7 % 6 {
+      let step = case a / 7 % 9 {
         0 -> Sleep(1 + b % 20)
         1 -> Double(b % 1000)
         2 ->
@@ -59,7 +66,10 @@ fn generate(state: Int, remaining: Int, steps: List(Step)) -> List(Step) {
           )
         3 -> Race(b % 1000, 1 + b % 15)
         4 -> RandomSleep
-        _ -> Child(b % 1000)
+        5 -> Child(b % 1000)
+        6 -> Deadline(b % 1000)
+        7 -> CancelledTimer
+        _ -> CancellingRace(b % 1000, 1 + b % 15)
       }
       generate(next(b), remaining - 1, [step, ..steps])
     }
@@ -71,9 +81,10 @@ fn model(steps: List(Step)) -> List(Int) {
   list.flat_map(steps, fn(step) {
     case step {
       Sleep(_) -> [0]
-      Double(n) | Child(n) -> [n * 2]
+      Double(n) | Child(n) | Deadline(n) -> [n * 2]
       FanOut(ns) -> [int.sum(ns) * 2]
-      Race(..) | RandomSleep -> []
+      CancelledTimer -> [-1]
+      Race(..) | RandomSleep | CancellingRace(..) -> []
     }
   })
 }
@@ -144,6 +155,50 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
         let child = workflow.child_options(workflow_id: workflow.uuid4(ctx))
         use doubled <- try(workflow.execute_child(ctx, double_child(), n, child))
         Ok([doubled])
+      }
+      Deadline(n) -> {
+        use doubled <- try(
+          workflow.with_timeout(ctx, 600_000, fn(scope) {
+            workflow.execute_activity(scope, double(), n, options())
+          }),
+        )
+        Ok([doubled])
+      }
+      CancelledTimer ->
+        workflow.with_scope(ctx, fn(scope) {
+          let pending = workflow.timer(scope, 600_000)
+          workflow.cancel(scope)
+          case workflow.await(pending) {
+            Error(_) -> Ok([-1])
+            Ok(Nil) -> Ok([0])
+          }
+        })
+      CancellingRace(n, ms) -> {
+        use work <- workflow.with_scope(ctx)
+        use wait <- workflow.with_scope(ctx)
+        let activity = workflow.start_activity(work, double(), n, options())
+        let timer = workflow.timer(wait, ms)
+        let activity_won =
+          workflow.await(
+            workflow.race([
+              workflow.map(activity, fn(_) { True }),
+              workflow.map(timer, fn(_) { False }),
+            ]),
+          )
+        // Cancel the loser and wait for it to settle, so its outcome is replayed too.
+        case activity_won {
+          True -> {
+            workflow.cancel(wait)
+            let _ = workflow.await(timer)
+            Nil
+          }
+          False -> {
+            workflow.cancel(work)
+            let _ = workflow.await(activity)
+            Nil
+          }
+        }
+        Ok([])
       }
     }
   })

@@ -732,3 +732,39 @@ pub fn invalid_input_fails_the_workflow_test() {
       ),
     ])
 }
+
+@external(erlang, "temporal_test_ffi", "capture_logs")
+fn capture_logs(body: fn() -> Nil) -> List(#(bridge.LogLevel, String, String))
+
+pub fn workflow_logs_once_and_not_on_replay_test() {
+  let chatty = fn() {
+    start(
+      int_workflow("chatty", fn(ctx, n) {
+        workflow.log_info(ctx, "starting")
+        let assert Ok(Nil) = workflow.sleep(ctx, 10)
+        workflow.log_warning(ctx, "slept")
+        Ok(n)
+      }),
+    )
+  }
+  assert capture_logs(fn() {
+      let run = chatty()
+      let _ = activate(run, [init("chatty", 1)])
+      let _ = activate(run, [bridge.FireTimer(1)])
+      Nil
+    })
+    == [#(bridge.Info, "starting", "wf"), #(bridge.Warning, "slept", "wf")]
+
+  // The first task is replayed from history; only the new progress logs.
+  assert capture_logs(fn() {
+      let run = chatty()
+      bridge.send_activation(
+        run.0,
+        Activation("run", 1000, True, 3, [init("chatty", 1)], False),
+      )
+      let assert Ok(_) = process.receive(run.1, 1000)
+      let _ = activate(run, [bridge.FireTimer(1)])
+      Nil
+    })
+    == [#(bridge.Warning, "slept", "wf")]
+}

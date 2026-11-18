@@ -145,12 +145,16 @@ fn decode_tls(term: Term) -> DecodeResult<TlsOptions> {
     };
     let root = opt(field(&f, 0)?).map(bytes).transpose()?;
     let domain: Option<String> = opt(field(&f, 1)?)
-        .map(|t| t.decode().map_err(|_| "domain must be a String".to_string()))
+        .map(|t| {
+            t.decode()
+                .map_err(|_| "domain must be a String".to_string())
+        })
         .transpose()?;
     let client = opt(field(&f, 2)?)
         .map(|t| {
-            let (cert, key): (Term, Term) =
-                t.decode().map_err(|_| "bad client certificate".to_string())?;
+            let (cert, key): (Term, Term) = t
+                .decode()
+                .map_err(|_| "bad client certificate".to_string())?;
             Ok::<_, String>(
                 ClientTlsOptions::builder()
                     .client_cert(bytes(cert)?)

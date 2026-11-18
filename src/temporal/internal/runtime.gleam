@@ -26,11 +26,14 @@ pub type WorkflowFn =
 pub type QueryHandler =
   fn(List(Payload)) -> Result(Payload, String)
 
-/// Something a scope cancels: a timer, activity or child workflow, by sequence number.
+/// Something a scope cancels: a timer, activity or child workflow, by sequence number, or a
+/// nested scope.
 pub type Op {
   TimerOp(seq: Int)
   ActivityOp(seq: Int)
   ChildOp(seq: Int)
+  /// A scope opened beneath this one, by scope id.
+  ScopeOp(id: Int)
 }
 
 /// A cancellation scope. Cancelling one cancels its pending operations and every scope
@@ -343,6 +346,7 @@ pub fn push(command: Command) -> Nil {
 /// unless it is shielded.
 pub fn open_scope(parent: Int, shielded: Bool) -> Int {
   let state = get()
+  let id = state.next_scope
   let cancelled = case shielded {
     True -> None
     False -> scope_cancelled(parent)
@@ -350,44 +354,51 @@ pub fn open_scope(parent: Int, shielded: Bool) -> Int {
   put(
     State(
       ..state,
-      next_scope: state.next_scope + 1,
+      next_scope: id + 1,
       scopes: dict.insert(
         state.scopes,
-        state.next_scope,
+        id,
         Scope(parent:, shielded:, cancelled:, ops: []),
       ),
     ),
   )
-  state.next_scope
+  // A shielded scope is not registered with its parent, so cancellation never reaches it.
+  case shielded {
+    True -> Nil
+    False -> register(parent, ScopeOp(id))
+  }
+  id
 }
 
-/// Close a scope. Whatever is still pending in it now belongs to its parent, so that
-/// cancelling the parent still reaches it.
+/// Close a scope. Whatever is still pending in it takes the scope's place in its parent, so
+/// that cancelling the parent still reaches it.
 pub fn close_scope(id: Int) -> Nil {
   let state = get()
   case dict.get(state.scopes, id) {
     Error(Nil) -> Nil
     Ok(scope) -> {
+      let pending = list.filter(scope.ops, is_pending)
       let scopes =
         dict.delete(state.scopes, id)
-        |> dict.map_values(fn(_, other) {
-          case other.parent == id {
+        |> dict.map_values(fn(other_id, other) {
+          let other = case other.parent == id {
             True -> Scope(..other, parent: scope.parent)
             False -> other
           }
+          case other_id == scope.parent {
+            False -> other
+            True ->
+              Scope(
+                ..other,
+                ops: list.flat_map(other.ops, fn(op) {
+                  case op == ScopeOp(id), scope.shielded {
+                    True, False -> pending
+                    _, _ -> [op]
+                  }
+                }),
+              )
+          }
         })
-      let scopes = case scope.shielded, dict.get(scopes, scope.parent) {
-        False, Ok(parent) ->
-          dict.insert(
-            scopes,
-            scope.parent,
-            Scope(
-              ..parent,
-              ops: list.append(list.filter(scope.ops, is_pending), parent.ops),
-            ),
-          )
-        _, _ -> scopes
-      }
       put(State(..state, scopes:))
     }
   }
@@ -419,9 +430,10 @@ pub fn register(scope_id: Int, op: Op) -> Nil {
   })
 }
 
-/// Cancel a scope: request cancellation of its pending operations, oldest first, then cancel
-/// the scopes beneath it in the order they were opened. The order is fixed because the
-/// commands this emits are checked against history on replay.
+/// Cancel a scope: request cancellation of everything pending in it, in the order it was
+/// started, descending into the scopes opened beneath it. The order is fixed, and matches
+/// the TypeScript SDK's, because the commands this emits are checked against history on
+/// replay.
 pub fn cancel_scope(id: Int, reason: String) -> Nil {
   let state = get()
   case dict.get(state.scopes, id) {
@@ -436,12 +448,15 @@ pub fn cancel_scope(id: Int, reason: String) -> Nil {
           ),
         ),
       )
-      list.each(list.reverse(scope.ops), cancel_op)
-      dict.to_list(get().scopes)
-      |> list.filter(fn(entry) { entry.1.parent == id && !entry.1.shielded })
-      |> list.filter(fn(entry) { entry.0 != id })
-      |> list.sort(fn(a, b) { int.compare(a.0, b.0) })
-      |> list.each(fn(entry) { cancel_scope(entry.0, reason) })
+      list.each(list.reverse(scope.ops), fn(op) {
+        case is_pending(op), op {
+          False, _ -> Nil
+          True, TimerOp(seq) -> cancel_timer(seq)
+          True, ActivityOp(seq) -> push(bridge.RequestCancelActivity(seq))
+          True, ChildOp(seq) -> push(bridge.CancelChildWorkflow(seq))
+          True, ScopeOp(child) -> cancel_scope(child, reason)
+        }
+      })
     }
     _ -> Nil
   }
@@ -463,15 +478,7 @@ fn is_pending(op: Op) -> Bool {
         False, Ok(bridge.ChildStarted(_)) | False, Error(Nil) -> True
         False, Ok(_) -> False
       }
-  }
-}
-
-fn cancel_op(op: Op) -> Nil {
-  case is_pending(op), op {
-    False, _ -> Nil
-    True, TimerOp(seq) -> cancel_timer(seq)
-    True, ActivityOp(seq) -> push(bridge.RequestCancelActivity(seq))
-    True, ChildOp(seq) -> push(bridge.CancelChildWorkflow(seq))
+    ScopeOp(id) -> dict.has_key(state.scopes, id)
   }
 }
 

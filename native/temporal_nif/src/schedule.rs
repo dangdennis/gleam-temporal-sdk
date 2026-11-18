@@ -118,7 +118,12 @@ fn encode_spec<'a>(env: Env<'a>, s: &ScheduleSpec) -> Term<'a> {
             calendars.encode(env),
             s.cron_string.encode(env),
             s.timezone_name.encode(env),
-            option(env, duration_ms(s.jitter).filter(|ms| *ms > 0).map(|ms| ms.encode(env))),
+            option(
+                env,
+                duration_ms(s.jitter)
+                    .filter(|ms| *ms > 0)
+                    .map(|ms| ms.encode(env)),
+            ),
         ],
     )
 }
@@ -152,7 +157,12 @@ fn encode_action<'a>(env: Env<'a>, a: Option<ScheduleAction>) -> Term<'a> {
     let Some(Action::StartWorkflow(w)) = a.and_then(|a| a.action) else {
         return atoms::nil().encode(env);
     };
-    let ms = |d| option(env, duration_ms(d).filter(|ms| *ms > 0).map(|ms| ms.encode(env)));
+    let ms = |d| {
+        option(
+            env,
+            duration_ms(d).filter(|ms| *ms > 0).map(|ms| ms.encode(env)),
+        )
+    };
     let retry = w.retry_policy.map(|r| {
         rec(
             env,
@@ -171,7 +181,10 @@ fn encode_action<'a>(env: Env<'a>, a: Option<ScheduleAction>) -> Term<'a> {
         "start_request",
         &[
             w.workflow_id.encode(env),
-            w.workflow_type.map(|t| t.name).unwrap_or_default().encode(env),
+            w.workflow_type
+                .map(|t| t.name)
+                .unwrap_or_default()
+                .encode(env),
             w.task_queue.map(|t| t.name).unwrap_or_default().encode(env),
             encode_payloads(env, &w.input.map(|p| p.payloads).unwrap_or_default()),
             w.workflow_id_reuse_policy.encode(env),
