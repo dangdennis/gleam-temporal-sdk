@@ -105,7 +105,7 @@ pub fn encode_payload_map<'a>(env: Env<'a>, m: &HashMap<String, Payload>) -> Ter
     map
 }
 
-fn encode_payloads<'a>(env: Env<'a>, ps: &[Payload]) -> Term<'a> {
+pub fn encode_payloads<'a>(env: Env<'a>, ps: &[Payload]) -> Term<'a> {
     ps.iter()
         .map(|p| encode_payload(env, p))
         .collect::<Vec<_>>()

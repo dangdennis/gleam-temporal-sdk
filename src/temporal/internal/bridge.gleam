@@ -251,6 +251,126 @@ pub fn connect(
   tls: Option(Tls),
 ) -> Result(Connection, String)
 
+pub type ScheduleCalendar {
+  /// Each field is a list of `#(start, end, step)` ranges.
+  ScheduleCalendar(
+    second: List(#(Int, Int, Int)),
+    minute: List(#(Int, Int, Int)),
+    hour: List(#(Int, Int, Int)),
+    day_of_month: List(#(Int, Int, Int)),
+    month: List(#(Int, Int, Int)),
+    year: List(#(Int, Int, Int)),
+    day_of_week: List(#(Int, Int, Int)),
+    comment: String,
+  )
+}
+
+pub type ScheduleSpec {
+  ScheduleSpec(
+    /// `#(every_ms, offset_ms)`.
+    intervals: List(#(Int, Int)),
+    calendars: List(ScheduleCalendar),
+    cron_expressions: List(String),
+    /// Empty for UTC.
+    timezone: String,
+    jitter_ms: Option(Int),
+  )
+}
+
+pub type Schedule {
+  Schedule(
+    spec: ScheduleSpec,
+    action: StartRequest,
+    /// The API's `ScheduleOverlapPolicy` value.
+    overlap_policy: Int,
+    catchup_window_ms: Option(Int),
+    pause_on_failure: Bool,
+    paused: Bool,
+    note: String,
+  )
+}
+
+pub type ScheduleInfo {
+  ScheduleInfo(
+    action_count: Int,
+    /// `#(scheduled_time_ms, workflow_id)`, oldest first.
+    recent_actions: List(#(Int, String)),
+    next_action_times_ms: List(Int),
+    running_workflows: Int,
+  )
+}
+
+pub type SchedulePatch {
+  Pause(note: String)
+  Unpause(note: String)
+  Trigger(overlap_policy: Int)
+}
+
+/// Create the schedule, or replace it when given the conflict token of a description.
+@external(erlang, "temporal_ffi", "schedule_put")
+pub fn schedule_put(
+  connection: Connection,
+  schedule_id: String,
+  schedule: Schedule,
+  conflict_token: Option(BitArray),
+  trigger_immediately: Bool,
+) -> Result(Nil, RpcError)
+
+@external(erlang, "temporal_ffi", "schedule_describe")
+pub fn schedule_describe(
+  connection: Connection,
+  schedule_id: String,
+) -> Result(#(Schedule, ScheduleInfo, BitArray), RpcError)
+
+@external(erlang, "temporal_ffi", "schedule_delete")
+pub fn schedule_delete(
+  connection: Connection,
+  schedule_id: String,
+) -> Result(Nil, RpcError)
+
+@external(erlang, "temporal_ffi", "schedule_patch")
+pub fn schedule_patch(
+  connection: Connection,
+  schedule_id: String,
+  patch: SchedulePatch,
+) -> Result(Nil, RpcError)
+
+/// `#(schedule_id, workflow_type, paused, note)` for every schedule.
+@external(erlang, "temporal_ffi", "schedule_list")
+pub fn schedule_list(
+  connection: Connection,
+) -> Result(List(#(String, String, Bool, String)), RpcError)
+
+pub type Server
+
+pub type ServerKind {
+  TimeSkipping
+  Dev
+}
+
+pub type TimeOp {
+  Lock
+  Unlock
+  Sleep(ms: Int)
+  Now
+}
+
+/// Start a test server and return it with its `http://host:port` target.
+@external(erlang, "temporal_ffi", "server_start")
+pub fn server_start(
+  kind: ServerKind,
+  executable: Option(String),
+) -> Result(#(Server, String), String)
+
+@external(erlang, "temporal_ffi", "server_stop")
+pub fn server_stop(server: Server) -> Nil
+
+@external(erlang, "temporal_ffi", "time_control")
+pub fn time_control(
+  connection: Connection,
+  operation: TimeOp,
+) -> Result(Int, RpcError)
+
 @external(erlang, "temporal_ffi", "worker_new")
 pub fn worker_new(
   connection: Connection,

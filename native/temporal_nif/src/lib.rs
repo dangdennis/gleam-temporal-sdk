@@ -9,6 +9,8 @@
 
 mod client;
 mod convert;
+mod schedule;
+mod testing;
 
 use convert::*;
 use futures_util::stream;
@@ -52,7 +54,7 @@ impl rustler::Resource for ConnectionRes {}
 #[rustler::resource_impl]
 impl rustler::Resource for WorkerRes {}
 
-fn runtime() -> &'static CoreRuntime {
+pub fn runtime() -> &'static CoreRuntime {
     static RT: OnceLock<CoreRuntime> = OnceLock::new();
     RT.get_or_init(|| {
         CoreRuntime::new(RuntimeOptions::default(), TokioRuntimeBuilder::default())

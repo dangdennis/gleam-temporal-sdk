@@ -2,7 +2,8 @@
 %% runtime needs that Gleam cannot express.
 -module(temporal_ffi).
 
--export([connect/5, worker_new/3, replay_worker_new/2, poll_workflow/1, complete_workflow/2,
+-export([connect/5, schedule_put/5, schedule_describe/2, schedule_delete/2,
+         schedule_patch/3, schedule_list/1, system_time_ms/0, server_start/2, server_stop/1, time_control/2, worker_new/3, replay_worker_new/2, poll_workflow/1, complete_workflow/2,
          poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/3, worker_shutdown/1,
          start_workflow/3, describe_workflow/3, list_workflows/3, count_workflows/2, signal_workflow/5, query_workflow/5, cancel_workflow/3,
          terminate_workflow/4, workflow_result/3, fetch_history/3,
@@ -20,6 +21,33 @@ call(Start) ->
 
 connect(Target, Namespace, Identity, ApiKey, Tls) ->
     call(fun(P, R) -> temporal_nif:connect(P, R, Target, Namespace, Identity, ApiKey, Tls) end).
+
+system_time_ms() ->
+    erlang:system_time(millisecond).
+
+server_start(Kind, Exe) ->
+    call(fun(P, R) -> temporal_nif:server_start(P, R, Kind, Exe) end).
+
+server_stop(Server) ->
+    call(fun(P, R) -> temporal_nif:server_stop(P, R, Server) end).
+
+time_control(Conn, Op) ->
+    call(fun(P, R) -> temporal_nif:time_control(P, R, Conn, Op) end).
+
+schedule_put(Conn, Id, Schedule, Token, Trigger) ->
+    call(fun(P, R) -> temporal_nif:schedule_put(P, R, Conn, Id, Schedule, Token, Trigger) end).
+
+schedule_describe(Conn, Id) ->
+    call(fun(P, R) -> temporal_nif:schedule_describe(P, R, Conn, Id) end).
+
+schedule_delete(Conn, Id) ->
+    call(fun(P, R) -> temporal_nif:schedule_delete(P, R, Conn, Id) end).
+
+schedule_patch(Conn, Id, Patch) ->
+    call(fun(P, R) -> temporal_nif:schedule_patch(P, R, Conn, Id, Patch) end).
+
+schedule_list(Conn) ->
+    call(fun(P, R) -> temporal_nif:schedule_list(P, R, Conn) end).
 
 worker_new(Conn, TaskQueue, Options) ->
     call(fun(P, R) -> temporal_nif:worker_new(P, R, Conn, TaskQueue, Options) end).

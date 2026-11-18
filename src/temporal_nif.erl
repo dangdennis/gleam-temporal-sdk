@@ -3,7 +3,8 @@
 %% calling these directly.
 -module(temporal_nif).
 
--export([connect/7, describe_workflow/5, list_workflows/5, count_workflows/4, worker_new/5, replay_worker_new/2, worker_poll_workflow/3,
+-export([connect/7, schedule_put/7, schedule_describe/4, schedule_delete/4,
+         schedule_patch/5, schedule_list/3, server_start/4, server_stop/3, time_control/4, describe_workflow/5, list_workflows/5, count_workflows/4, worker_new/5, replay_worker_new/2, worker_poll_workflow/3,
          worker_complete_workflow/4, worker_poll_activity/3, worker_complete_activity/5,
          worker_heartbeat/3, worker_shutdown/3, start_workflow/5, signal_workflow/7,
          query_workflow/7, cancel_workflow/5, terminate_workflow/6, workflow_result/5,
@@ -37,3 +38,11 @@ fetch_history(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
 describe_workflow(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
 list_workflows(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
 count_workflows(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
+server_start(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
+server_stop(_, _, _) -> erlang:nif_error(nif_not_loaded).
+time_control(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
+schedule_put(_, _, _, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
+schedule_describe(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
+schedule_delete(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
+schedule_patch(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
+schedule_list(_, _, _) -> erlang:nif_error(nif_not_loaded).

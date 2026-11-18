@@ -87,8 +87,10 @@ pub type StartError {
 
 /// Why a request about an existing workflow failed.
 pub type Error {
-  /// No such workflow, or no such run of it.
+  /// No such workflow, run or schedule.
   NotFound(message: String)
+  /// A schedule with this id already exists.
+  AlreadyExists(message: String)
   /// The workflow rejected a query, or the query handler failed.
   QueryFailed(message: String)
   /// The server's answer could not be decoded with the codec given.
@@ -383,9 +385,12 @@ pub fn execute(
   }
 }
 
-fn request_error(error: bridge.RpcError) -> Error {
+@internal
+pub fn request_error(error: bridge.RpcError) -> Error {
   case error {
     bridge.RpcError(code, message) if code == not_found -> NotFound(message)
+    bridge.RpcError(code, message) if code == already_exists ->
+      AlreadyExists(message)
     bridge.RpcError(code, message) -> RequestFailed(code, message)
   }
 }

@@ -1,0 +1,199 @@
+//// Schedules against a real Temporal service.
+
+import gleam/dict
+import gleam/erlang/process
+import gleam/list
+import gleam/option.{Some}
+import gleam/string
+import temporal/client
+import temporal/codec
+import temporal/schedule
+import temporal/search_attributes
+import temporal/worker
+import temporal/workflow
+
+@external(erlang, "temporal_test_ffi", "unique")
+fn unique() -> String
+
+@external(erlang, "temporal_test_ffi", "cmd")
+fn cmd(command: String) -> String
+
+fn tick() {
+  workflow.Definition("tick", codec.string(), codec.string())
+}
+
+fn eventually(check: fn() -> Bool) -> Bool {
+  list.any(list.repeat(Nil, 100), fn(_) {
+    case check() {
+      True -> True
+      False -> {
+        process.sleep(100)
+        False
+      }
+    }
+  })
+}
+
+pub fn a_schedule_round_trips_and_can_be_changed_test() {
+  let assert Ok(client) = client.connect(client.local())
+  let id = "schedule-" <> unique()
+  let options =
+    client.StartOptions(
+      ..client.start_options(workflow_id: id <> "-run", task_queue: id),
+      run_timeout_ms: Some(60_000),
+      task_timeout_ms: Some(10_000),
+    )
+    |> client.with_memo("origin", codec.string(), "schedule")
+  let created =
+    schedule.Schedule(
+      ..schedule.new(
+        schedule.every_offset(ms: 3_600_000, offset_ms: 420_000),
+        schedule.action(tick(), "hourly", options),
+      ),
+      overlap: schedule.BufferOne,
+      paused: True,
+      note: "created paused",
+    )
+  let assert Ok(Nil) = schedule.create(client, id, created)
+  let assert Error(client.AlreadyExists(_)) =
+    schedule.create(client, id, created)
+
+  let assert Ok(described) = schedule.describe(client, id)
+  // The server fills in its default catch-up window of a year.
+  assert described.schedule
+    == schedule.Schedule(..created, catchup_window_ms: Some(31_536_000_000))
+  assert described.action_count == 0
+  // Every upcoming action is seven minutes past the hour, as the offset asks.
+  assert described.next_action_times_ms != []
+  assert list.all(described.next_action_times_ms, fn(time) {
+    time % 3_600_000 == 420_000
+  })
+
+  // An update keeps what it does not touch.
+  let assert Ok(Nil) =
+    schedule.update(client, id, fn(current) {
+      schedule.Schedule(
+        ..current,
+        spec: schedule.on(
+            schedule.Calendar(
+              ..schedule.daily(),
+              hour: schedule.exactly(9),
+              minute: schedule.stepping(0, 59, 30),
+              day_of_week: schedule.between(1, 5),
+              comment: "working hours",
+            ),
+          )
+          |> schedule.in_timezone("Europe/Lisbon"),
+      )
+    })
+  let assert Ok(described) = schedule.describe(client, id)
+  let assert [calendar] = described.schedule.spec.calendars
+  assert calendar.hour == schedule.exactly(9)
+  assert calendar.minute == schedule.stepping(0, 59, 30)
+  assert calendar.day_of_week == schedule.between(1, 5)
+  assert calendar.comment == "working hours"
+  assert described.schedule.spec.intervals == []
+  assert described.schedule.spec.timezone == Some("Europe/Lisbon")
+  assert described.schedule.overlap == schedule.BufferOne
+  assert described.schedule.note == "created paused"
+  assert described.schedule.action == created.action
+
+  let assert Ok(Nil) = schedule.unpause(client, id, note: "go")
+  let assert Ok(described) = schedule.describe(client, id)
+  assert !described.schedule.paused
+  assert described.schedule.note == "go"
+  assert described.next_action_times_ms != []
+  let assert Ok(Nil) = schedule.pause(client, id, note: "stop")
+  let assert Ok(described) = schedule.describe(client, id)
+  assert described.schedule.paused
+
+  assert eventually(fn() {
+    let assert Ok(all) = schedule.list(client)
+    list.any(all, fn(summary) {
+      summary.schedule_id == id && summary.workflow_type == "tick"
+    })
+  })
+
+  let assert Ok(Nil) = schedule.delete(client, id)
+  let assert Error(client.NotFound(_)) = schedule.describe(client, id)
+  let assert Error(client.NotFound(_)) =
+    schedule.update(client, id, fn(current) { current })
+}
+
+pub fn a_cron_expression_becomes_a_calendar_test() {
+  let assert Ok(client) = client.connect(client.local())
+  let id = "cron-" <> unique()
+  let action =
+    schedule.action(
+      tick(),
+      "cron",
+      client.start_options(workflow_id: id, task_queue: id),
+    )
+  let assert Ok(Nil) =
+    schedule.create(
+      client,
+      id,
+      schedule.new(schedule.cron("15 3 * * *"), action),
+    )
+  let assert Ok(described) = schedule.describe(client, id)
+  let assert [calendar] = described.schedule.spec.calendars
+  assert calendar.hour == schedule.exactly(3)
+  assert calendar.minute == schedule.exactly(15)
+  let assert Ok(Nil) = schedule.delete(client, id)
+}
+
+pub fn a_triggered_schedule_starts_its_workflow_test() {
+  let assert Ok(client) = client.connect(client.local())
+  let id = "triggered-" <> unique()
+  let _ =
+    cmd(
+      "temporal operator search-attribute create --name GleamTestKeyword --type Keyword 2>&1",
+    )
+  let assert Ok(worker) =
+    worker.new(client, id)
+    |> worker.with_workflows([
+      workflow.handler(tick(), fn(ctx, input) {
+        Ok(
+          input
+          <> " with memo "
+          <> option.unwrap(workflow.memo(ctx, "origin", codec.string()), "none"),
+        )
+      }),
+    ])
+    |> worker.start
+  let options =
+    client.start_options(workflow_id: id <> "-run", task_queue: id)
+    |> client.with_memo("origin", codec.string(), "schedule")
+    |> client.with_search_attribute(
+      "GleamTestKeyword",
+      search_attributes.Keyword(id),
+    )
+  let assert Ok(Nil) =
+    schedule.create(
+      client,
+      id,
+      schedule.new(
+        schedule.every(ms: 86_400_000),
+        schedule.action(tick(), "triggered", options),
+      ),
+    )
+  let assert Ok(Nil) = schedule.trigger(client, id)
+
+  assert eventually(fn() {
+    let assert Ok(described) = schedule.describe(client, id)
+    described.action_count == 1
+  })
+  let assert Ok(described) = schedule.describe(client, id)
+  let assert [action] = described.recent_actions
+  // Each run's id is the action's id with the scheduled time appended.
+  assert string.starts_with(action.workflow_id, id <> "-run-")
+  assert dict.has_key(
+    described.schedule.action.search_attributes,
+    "GleamTestKeyword",
+  )
+  let run = client.handle(client, tick(), action.workflow_id)
+  assert client.result(run) == Ok("triggered with memo schedule")
+
+  let assert Ok(Nil) = schedule.delete(client, id)
+  worker.stop(worker)
+}
