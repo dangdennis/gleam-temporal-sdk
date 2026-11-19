@@ -302,6 +302,7 @@ fn run_activity(
         is_local:,
         headers:,
       ),
+      task_token:,
       // A local activity has no heartbeat: the workflow task it runs in is its lease.
       heartbeat: fn(details) {
         case is_local {
@@ -332,12 +333,18 @@ fn run_activity(
       // Exits are caught too: this process must always report an outcome, or the
       // activity would hang until its timeout.
       Ok(handler) ->
-        case bridge.rescue_all(fn() { handler.run(ctx, input) }) {
-          Ok(Ok(payload)) -> bridge.ActivityCompleted(payload)
-          Ok(Error(failure.Failure(kind: failure.Cancelled, ..) as failure)) ->
-            bridge.ActivityCancelled(failure)
-          Ok(Error(failure)) -> bridge.ActivityFailed(failure)
-          Error(crash) ->
+        case
+          bridge.rescue_all(fn() { handler.run(ctx, input) }),
+          bridge.activity_deferred()
+        {
+          // Whatever a deferred activity returns, its outcome comes later.
+          Ok(_), True -> bridge.ActivityWillCompleteAsync
+          Ok(Ok(payload)), False -> bridge.ActivityCompleted(payload)
+          Ok(Error(failure.Failure(kind: failure.Cancelled, ..) as failure)),
+            False
+          -> bridge.ActivityCancelled(failure)
+          Ok(Error(failure)), False -> bridge.ActivityFailed(failure)
+          Error(crash), _ ->
             bridge.ActivityFailed(failure.new("activity crashed: " <> crash))
         }
     }

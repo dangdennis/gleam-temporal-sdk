@@ -282,5 +282,6 @@ pub fn encode_activity_result(
       bridge.ActivityFailed(encode_failure(codec, failure))
     bridge.ActivityCancelled(failure) ->
       bridge.ActivityCancelled(encode_failure(codec, failure))
+    bridge.ActivityWillCompleteAsync -> result
   }
 }

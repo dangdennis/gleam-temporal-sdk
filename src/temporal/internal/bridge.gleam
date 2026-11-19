@@ -309,6 +309,8 @@ pub type ActivityResult {
   ActivityCompleted(result: Option(Payload))
   ActivityFailed(failure: Failure)
   ActivityCancelled(failure: Failure)
+  /// The activity will be finished later, from elsewhere, by its task token.
+  ActivityWillCompleteAsync
 }
 
 pub type PollError {
@@ -656,6 +658,32 @@ pub fn update_workflow(
   arguments: List(Payload),
   wait_stage: Int,
 ) -> Result(#(String, String, UpdateOutcome), RpcError)
+
+/// Send an update, starting the workflow first if it is not running. `update` is the
+/// update's id (empty for a generated one) and name. Answers the workflow's run id, the
+/// update's id and its outcome.
+@external(erlang, "temporal_ffi", "update_with_start")
+pub fn update_with_start(
+  connection: Connection,
+  request: StartRequest,
+  update: #(String, String),
+  arguments: List(Payload),
+) -> Result(#(String, String, UpdateOutcome), RpcError)
+
+/// Finish an activity that deferred its completion.
+@external(erlang, "temporal_ffi", "complete_activity_async")
+pub fn complete_activity_async(
+  connection: Connection,
+  task_token: BitArray,
+  result: ActivityResult,
+) -> Result(Nil, RpcError)
+
+/// Mark the activity running in the calling process as one that will be completed later.
+@external(erlang, "temporal_ffi", "defer_activity")
+pub fn defer_activity() -> Nil
+
+@external(erlang, "temporal_ffi", "activity_deferred")
+pub fn activity_deferred() -> Bool
 
 /// Wait for an update to complete.
 @external(erlang, "temporal_ffi", "poll_update")

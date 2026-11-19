@@ -194,6 +194,7 @@ pub fn activity_env(info: activity.Info) -> ActivityEnv {
   ActivityEnv(
     context: activity.new_context(
       info:,
+      task_token: <<"test":utf8>>,
       heartbeat: fn(details) { process.send(heartbeats, details) },
       cancel_reason:,
     ),

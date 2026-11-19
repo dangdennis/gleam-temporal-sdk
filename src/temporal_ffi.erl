@@ -2,7 +2,8 @@
 %% runtime needs that Gleam cannot express.
 -module(temporal_ffi).
 
--export([connect/5, follow/1, new_cell/0, read_cell/1, write_cell/2, update_workflow/4, poll_update/4, poll_nexus/1, complete_nexus/3, aes_gcm_encrypt/2, aes_gcm_decrypt/2, schedule_put/5, schedule_describe/2, schedule_delete/2,
+-export([connect/5, update_with_start/4, complete_activity_async/3, defer_activity/0,
+         activity_deferred/0, follow/1, new_cell/0, read_cell/1, write_cell/2, update_workflow/4, poll_update/4, poll_nexus/1, complete_nexus/3, aes_gcm_encrypt/2, aes_gcm_decrypt/2, schedule_put/5, schedule_describe/2, schedule_delete/2,
          schedule_patch/3, schedule_list/1, system_time_ms/0, server_start/2, server_stop/1, time_control/2, worker_new/3, replay_worker_new/2, poll_workflow/1, complete_workflow/2,
          poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/3, worker_shutdown/1,
          start_workflow/3, describe_workflow/3, list_workflows/3, count_workflows/2, signal_workflow/5, query_workflow/5, cancel_workflow/3,
@@ -60,6 +61,20 @@ poll_nexus(Worker) ->
 
 complete_nexus(Worker, Token, Result) ->
     call(fun(P, R) -> temporal_nif:worker_complete_nexus(P, R, Worker, Token, Result) end).
+
+update_with_start(Conn, Request, Update, Args) ->
+    call(fun(P, R) -> temporal_nif:update_with_start(P, R, Conn, Request, Update, Args) end).
+
+complete_activity_async(Conn, Token, Result) ->
+    call(fun(P, R) -> temporal_nif:complete_activity_async(P, R, Conn, Token, Result) end).
+
+%% Whether the activity running in this process said it would be completed later.
+defer_activity() ->
+    erlang:put(temporal_activity_deferred, true),
+    nil.
+
+activity_deferred() ->
+    erlang:get(temporal_activity_deferred) =:= true.
 
 worker_new(Conn, TaskQueue, Options) ->
     call(fun(P, R) -> temporal_nif:worker_new(P, R, Conn, TaskQueue, Options) end).

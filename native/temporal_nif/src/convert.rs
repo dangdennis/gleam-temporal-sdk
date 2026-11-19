@@ -789,6 +789,7 @@ pub fn decode_activity_result(term: Term) -> DecodeResult<ActivityExecutionResul
         "activity_cancelled" => Status::Cancelled(ar::Cancellation {
             failure: Some(decode_failure(field(&f, 0)?)?),
         }),
+        "activity_will_complete_async" => Status::WillCompleteAsync(ar::WillCompleteAsync {}),
         other => return Err(format!("unknown activity result {other}")),
     };
     Ok(ActivityExecutionResult {

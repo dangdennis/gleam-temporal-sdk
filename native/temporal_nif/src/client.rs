@@ -779,3 +779,196 @@ fn fetch_history<'a>(
     });
     atoms::ok()
 }
+
+fn start_request(conn: &ConnectionRes, r: StartRequest) -> StartWorkflowExecutionRequest {
+    StartWorkflowExecutionRequest {
+        namespace: conn.namespace.clone(),
+        workflow_id: r.workflow_id,
+        workflow_type: Some(WorkflowType {
+            name: r.workflow_type,
+        }),
+        task_queue: Some(TaskQueue {
+            name: r.task_queue,
+            ..Default::default()
+        }),
+        input: Some(Payloads { payloads: r.input }),
+        identity: conn.identity.clone(),
+        request_id: r.request_id,
+        workflow_id_reuse_policy: r.id_reuse_policy,
+        workflow_id_conflict_policy: r.id_conflict_policy,
+        workflow_execution_timeout: r.execution_timeout,
+        workflow_run_timeout: r.run_timeout,
+        workflow_task_timeout: r.task_timeout,
+        retry_policy: r.retry,
+        memo: r.memo,
+        search_attributes: r.search_attributes,
+        header: r.header,
+        ..Default::default()
+    }
+}
+
+/// Send an update to a workflow, starting the workflow first if it is not running, as one
+/// request. `update` is the update's id (empty for a generated one) and name. Answers the
+/// workflow's run id, the update's id and its outcome.
+#[rustler::nif]
+fn update_with_start<'a>(
+    env: Env<'a>,
+    pid: LocalPid,
+    reference: Term<'a>,
+    conn: ResourceArc<ConnectionRes>,
+    request: Term<'a>,
+    update: (String, String),
+    input: Term<'a>,
+) -> Term<'a> {
+    use temporalio_common::protos::temporal::api::workflowservice::v1::{
+        ExecuteMultiOperationRequest,
+        execute_multi_operation_request::{Operation, operation},
+        execute_multi_operation_response::response,
+    };
+    let r = match decode_start_request(request) {
+        Ok(r) => r,
+        Err(e) => return invalid(env, format!("invalid start request: {e}")),
+    };
+    let args = match payloads_arg(env, input) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let (update_id, name) = update;
+    let update_id = if update_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        update_id
+    };
+    let fut = async move {
+        let workflow_id = r.workflow_id.clone();
+        let start = start_request(&conn, r);
+        let update = UpdateWorkflowExecutionRequest {
+            namespace: conn.namespace.clone(),
+            workflow_execution: execution(workflow_id, String::new()),
+            wait_policy: Some(WaitPolicy { lifecycle_stage: 3 }),
+            request: Some(update::Request {
+                meta: Some(update::Meta {
+                    update_id: update_id.clone(),
+                    identity: conn.identity.clone(),
+                }),
+                input: Some(update::Input {
+                    name,
+                    args: Some(Payloads { payloads: args }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request = ExecuteMultiOperationRequest {
+            namespace: conn.namespace.clone(),
+            operations: vec![
+                Operation {
+                    operation: Some(operation::Operation::StartWorkflow(start)),
+                },
+                Operation {
+                    operation: Some(operation::Operation::UpdateWorkflow(update)),
+                },
+            ],
+            ..Default::default()
+        };
+        let response = conn
+            .connection
+            .workflow_service()
+            .execute_multi_operation(request.into_request())
+            .await?
+            .into_inner();
+        let mut run_id = String::new();
+        let mut outcome = None;
+        for part in response.responses {
+            match part.response {
+                Some(response::Response::StartWorkflow(started)) => run_id = started.run_id,
+                Some(response::Response::UpdateWorkflow(updated)) => outcome = updated.outcome,
+                None => {}
+            }
+        }
+        Ok::<_, tonic::Status>((run_id, update_id, outcome))
+    };
+    spawn_reply(pid, reference, fut, |env, r| match r {
+        Ok((run_id, update_id, outcome)) => ok(
+            env,
+            (run_id, update_id, encode_update_outcome(env, outcome)).encode(env),
+        ),
+        Err(s) => rpc_err(env, &s),
+    });
+    atoms::ok().encode(env)
+}
+
+/// Finish an activity that said it would be completed later, by its task token.
+#[rustler::nif]
+fn complete_activity_async<'a>(
+    env: Env<'a>,
+    pid: LocalPid,
+    reference: Term<'a>,
+    conn: ResourceArc<ConnectionRes>,
+    task_token: rustler::Binary<'a>,
+    result: Term<'a>,
+) -> Term<'a> {
+    use temporalio_common::protos::{
+        coresdk::activity_result::activity_execution_result::Status,
+        temporal::api::workflowservice::v1::{
+            RespondActivityTaskCanceledRequest, RespondActivityTaskCompletedRequest,
+            RespondActivityTaskFailedRequest,
+        },
+    };
+    let status = match decode_activity_result(result) {
+        Ok(r) => r.status,
+        Err(e) => return invalid(env, format!("invalid activity result: {e}")),
+    };
+    let task_token = task_token.as_slice().to_vec();
+    let fut = async move {
+        let mut service = conn.connection.workflow_service();
+        let namespace = conn.namespace.clone();
+        let identity = conn.identity.clone();
+        match status {
+            Some(Status::Completed(done)) => service
+                .respond_activity_task_completed(
+                    RespondActivityTaskCompletedRequest {
+                        task_token,
+                        result: done.result.map(|p| Payloads { payloads: vec![p] }),
+                        identity,
+                        namespace,
+                        ..Default::default()
+                    }
+                    .into_request(),
+                )
+                .await
+                .map(|_| ()),
+            Some(Status::Failed(failed)) => service
+                .respond_activity_task_failed(
+                    RespondActivityTaskFailedRequest {
+                        task_token,
+                        failure: failed.failure,
+                        identity,
+                        namespace,
+                        ..Default::default()
+                    }
+                    .into_request(),
+                )
+                .await
+                .map(|_| ()),
+            Some(Status::Cancelled(_)) => service
+                .respond_activity_task_canceled(
+                    RespondActivityTaskCanceledRequest {
+                        task_token,
+                        identity,
+                        namespace,
+                        ..Default::default()
+                    }
+                    .into_request(),
+                )
+                .await
+                .map(|_| ()),
+            _ => Err(tonic::Status::invalid_argument(
+                "an activity is finished with a result, a failure or a cancellation",
+            )),
+        }
+    };
+    spawn_reply(pid, reference, fut, unit_reply);
+    atoms::ok().encode(env)
+}

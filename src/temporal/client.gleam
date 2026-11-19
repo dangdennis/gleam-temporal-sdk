@@ -6,6 +6,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/time/duration.{type Duration}
 import gleam/time/timestamp.{type Timestamp}
+import temporal/activity
 import temporal/codec.{type Codec, type Payload, type PayloadCodec}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
@@ -734,4 +735,92 @@ pub fn update_result(update: UpdateHandle(result)) -> Result(result, Error) {
         "the update did not finish before the request gave up",
       ))
   }
+}
+
+/// Send an update to the workflow with this id, starting it first if it is not running, as
+/// one request, and wait for the workflow's answer. Use it when the first thing a caller
+/// does to a workflow is ask it something, such as adding the first item to a cart.
+///
+/// The start options must say what to do if the workflow is already running: set
+/// `id_conflict_policy` to `UseExisting`, the usual choice, or leave it at `FailIfRunning`
+/// to insist on a new workflow.
+pub fn execute_update_with_start(
+  client: Client,
+  definition: workflow.Definition(input, output),
+  input: input,
+  options: StartOptions,
+  update: workflow.UpdateDefinition(argument, result),
+  argument: argument,
+) -> Result(#(Handle(output), result), Error) {
+  let request =
+    start_request(
+      definition.name,
+      codec.encode_arguments(definition.input, input),
+      options,
+    )
+    |> encode_request(client, _)
+  case
+    bridge.update_with_start(
+      client.connection,
+      request,
+      #("", update.name),
+      transcode.encode_list(
+        client.codec,
+        codec.encode_arguments(update.argument, argument),
+      ),
+    )
+  {
+    Error(error) -> Error(request_error(error))
+    Ok(#(run_id, update_id, outcome)) -> {
+      let handle =
+        Handle(client, options.workflow_id, Some(run_id), definition.output)
+      UpdateHandle(
+        client:,
+        workflow_id: options.workflow_id,
+        run_id:,
+        update_id:,
+        result: update.result,
+        outcome: Some(outcome),
+      )
+      |> update_result
+      |> result.map(fn(answer) { #(handle, answer) })
+    }
+  }
+}
+
+// ---- finishing activities from outside ----
+
+/// Finish an activity that deferred its completion with `activity.complete_later`, giving
+/// its result. `task_token` is what the activity read with `activity.task_token`.
+pub fn complete_activity(
+  client: Client,
+  task_token: BitArray,
+  definition: activity.Definition(input, output),
+  value: output,
+) -> Result(Nil, Error) {
+  bridge.complete_activity_async(
+    client.connection,
+    task_token,
+    bridge.ActivityCompleted(
+      Some(transcode.encode_one(
+        client.codec,
+        codec.encode(definition.output, value),
+      )),
+    ),
+  )
+  |> result.map_error(request_error)
+}
+
+/// Fail an activity that deferred its completion. Its retry policy applies as usual.
+pub fn fail_activity(
+  client: Client,
+  task_token: BitArray,
+  failure: Failure,
+) -> Result(Nil, Error) {
+  bridge.complete_activity_async(
+    client.connection,
+    task_token,
+    bridge.ActivityFailed(transcode.encode_failure(client.codec, failure)),
+  )
+  |> result.map_error(request_error)
 }

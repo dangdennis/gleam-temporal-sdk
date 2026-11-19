@@ -709,3 +709,106 @@ fn in_both_modes_with(
 fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
   in_both_modes_with(name, support.local_client(), scenario)
 }
+
+// ---- update-with-start ----
+
+pub fn an_update_can_start_the_workflow_it_is_sent_to_test() {
+  use env <- in_both_modes("update-with-start")
+  let options =
+    client.StartOptions(
+      ..start_options(env),
+      id_conflict_policy: client.UseExisting,
+    )
+  // The first call starts the counter at 100 and adds to it.
+  let assert Ok(#(first, 102)) =
+    client.execute_update_with_start(
+      env.client,
+      counter(),
+      100,
+      options,
+      add(),
+      1,
+    )
+  // The second reaches the same workflow: its starting value is ignored.
+  let assert Ok(#(second, 122)) =
+    client.execute_update_with_start(
+      env.client,
+      counter(),
+      5000,
+      options,
+      add(),
+      10,
+    )
+  assert client.run_id(first) == client.run_id(second)
+  let assert Ok(Nil) = client.signal(first, finish(), Nil)
+  assert client.result(first) == Ok(122)
+  assert_replays(first)
+}
+
+// ---- finishing an activity from outside ----
+
+fn approval() {
+  activity.Definition("approval", codec.string(), codec.string())
+}
+
+fn approving() {
+  workflow.Definition("approving", codec.string(), codec.string())
+}
+
+fn approving_workflow(
+  ctx: Context,
+  request: String,
+) -> Result(String, Failure) {
+  workflow.execute_activity(
+    ctx,
+    approval(),
+    request,
+    workflow.ActivityOptions(
+      ..options(),
+      retry: Some(workflow.retry_policy(maximum_attempts: 1)),
+    ),
+  )
+}
+
+pub fn an_activity_can_be_finished_later_from_outside_test() {
+  let client = support.local_client()
+  let task_queue = "approval-" <> unique()
+  let tokens = process.new_subject()
+  let assert Ok(worker) =
+    worker.new(client, task_queue)
+    |> worker.with_workflows([workflow.handler(approving(), approving_workflow)])
+    |> worker.with_activities([
+      // Hands its token to whoever will decide, and returns without an answer.
+      activity.handler(approval(), fn(ctx, _request) {
+        process.send(tokens, activity.task_token(ctx))
+        Error(activity.complete_later(ctx))
+      }),
+    ])
+    |> worker.start
+  let start = fn(id) {
+    let assert Ok(handle) =
+      client.start(
+        client,
+        approving(),
+        "a request",
+        client.start_options(workflow_id: task_queue <> id, task_queue:),
+      )
+    let assert Ok(token) = process.receive(tokens, 10_000)
+    #(handle, token)
+  }
+
+  let #(approved, token) = start("-approved")
+  let assert Ok(Nil) =
+    client.complete_activity(client, token, approval(), "yes")
+  assert client.result(approved) == Ok("yes")
+  // The token is spent.
+  let assert Error(client.NotFound(_)) =
+    client.complete_activity(client, token, approval(), "again")
+
+  let #(refused, token) = start("-refused")
+  let assert Ok(Nil) =
+    client.fail_activity(client, token, failure.new("declined"))
+  let assert Error(client.WorkflowFailed(failed)) = client.result(refused)
+  assert failure.root_cause(failed).message == "declined"
+  worker.stop(worker)
+}

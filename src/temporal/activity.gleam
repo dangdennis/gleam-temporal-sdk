@@ -8,6 +8,7 @@ import gleam/time/duration.{type Duration}
 import gleam/time/timestamp.{type Timestamp}
 import temporal/codec.{type Codec, type Payload}
 import temporal/failure.{type Failure}
+import temporal/internal/bridge
 
 /// An activity's name and the codecs for its argument and result. Shared by the code that
 /// implements the activity and the workflows that call it.
@@ -63,6 +64,7 @@ pub type CancelReason {
 pub opaque type Context {
   Context(
     info: Info,
+    task_token: BitArray,
     heartbeat: fn(List(Payload)) -> Nil,
     cancel_reason: fn() -> Option(CancelReason),
   )
@@ -114,10 +116,11 @@ pub fn wrap(handler: Handler, middleware: Middleware) -> Handler {
 @internal
 pub fn new_context(
   info info: Info,
+  task_token task_token: BitArray,
   heartbeat heartbeat: fn(List(Payload)) -> Nil,
   cancel_reason cancel_reason: fn() -> Option(CancelReason),
 ) -> Context {
-  Context(info:, heartbeat:, cancel_reason:)
+  Context(info:, task_token:, heartbeat:, cancel_reason:)
 }
 
 /// The task the activity is running for.
@@ -155,4 +158,27 @@ pub fn is_cancelled(ctx: Context) -> Bool {
 /// Why the activity was asked to stop, or `None` if it was not.
 pub fn cancel_reason(ctx: Context) -> Option(CancelReason) {
   ctx.cancel_reason()
+}
+
+/// The token that names this activity task to the server. Hand it to whatever will finish
+/// the activity later with `client.complete_activity`.
+pub fn task_token(ctx: Context) -> BitArray {
+  ctx.task_token
+}
+
+/// Say that the activity will be finished later, from somewhere else: by a person, a
+/// webhook, another service. Return the failure this gives; it is not recorded.
+///
+/// ```gleam
+/// fn await_approval(ctx: activity.Context, request: Request) {
+///   send_for_approval(request, activity.task_token(ctx))
+///   Error(activity.complete_later(ctx))
+/// }
+/// ```
+///
+/// The activity stays open, subject to its timeouts, until `client.complete_activity` or
+/// `client.fail_activity` is called with its token.
+pub fn complete_later(_ctx: Context) -> Failure {
+  bridge.defer_activity()
+  failure.new("the activity will be completed later")
 }
