@@ -14,6 +14,10 @@ pub type Kind {
   Activity
   /// Wraps the failure of a child workflow; the real error is in `cause`.
   ChildWorkflow
+  /// Wraps the failure of a Nexus operation; the real error is in `cause`.
+  NexusOperation
+  /// A Nexus handler could not process a request. `error_type` is the Nexus error type.
+  NexusHandler
   Other
 }
 
@@ -72,7 +76,10 @@ pub fn timeout(message: String) -> Failure {
 pub fn is_cancellation(failure: Failure) -> Bool {
   case failure.kind, failure.cause {
     Cancelled, _ -> True
-    Activity, Some(cause) | ChildWorkflow, Some(cause) -> is_cancellation(cause)
+    Activity, Some(cause)
+    | ChildWorkflow, Some(cause)
+    | NexusOperation, Some(cause)
+    -> is_cancellation(cause)
     _, _ -> False
   }
 }
@@ -82,7 +89,10 @@ pub fn is_cancellation(failure: Failure) -> Bool {
 pub fn is_timeout(failure: Failure) -> Bool {
   case failure.kind, failure.cause {
     Timeout, _ -> True
-    Activity, Some(cause) | ChildWorkflow, Some(cause) -> is_timeout(cause)
+    Activity, Some(cause)
+    | ChildWorkflow, Some(cause)
+    | NexusOperation, Some(cause)
+    -> is_timeout(cause)
     _, _ -> False
   }
 }

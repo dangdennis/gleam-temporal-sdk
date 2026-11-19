@@ -2,7 +2,7 @@
 %% runtime needs that Gleam cannot express.
 -module(temporal_ffi).
 
--export([connect/5, schedule_put/5, schedule_describe/2, schedule_delete/2,
+-export([connect/5, update_workflow/4, poll_update/4, poll_nexus/1, complete_nexus/3, aes_gcm_encrypt/2, aes_gcm_decrypt/2, schedule_put/5, schedule_describe/2, schedule_delete/2,
          schedule_patch/3, schedule_list/1, system_time_ms/0, server_start/2, server_stop/1, time_control/2, worker_new/3, replay_worker_new/2, poll_workflow/1, complete_workflow/2,
          poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/3, worker_shutdown/1,
          start_workflow/3, describe_workflow/3, list_workflows/3, count_workflows/2, signal_workflow/5, query_workflow/5, cancel_workflow/3,
@@ -48,6 +48,18 @@ schedule_patch(Conn, Id, Patch) ->
 
 schedule_list(Conn) ->
     call(fun(P, R) -> temporal_nif:schedule_list(P, R, Conn) end).
+
+update_workflow(Conn, Target, Args, Stage) ->
+    call(fun(P, R) -> temporal_nif:update_workflow(P, R, Conn, Target, Args, Stage) end).
+
+poll_update(Conn, Id, RunId, UpdateId) ->
+    call(fun(P, R) -> temporal_nif:poll_update(P, R, Conn, Id, RunId, UpdateId) end).
+
+poll_nexus(Worker) ->
+    poll_error(call(fun(P, R) -> temporal_nif:worker_poll_nexus(P, R, Worker) end)).
+
+complete_nexus(Worker, Token, Result) ->
+    call(fun(P, R) -> temporal_nif:worker_complete_nexus(P, R, Worker, Token, Result) end).
 
 worker_new(Conn, TaskQueue, Options) ->
     call(fun(P, R) -> temporal_nif:worker_new(P, R, Conn, TaskQueue, Options) end).
@@ -169,3 +181,21 @@ exit_normal() ->
 kill(Pid) ->
     exit(Pid, kill),
     nil.
+
+%% AES-256-GCM with a random 12-byte nonce: Nonce ++ Ciphertext ++ Tag.
+aes_gcm_encrypt(Key, Plain) ->
+    Nonce = crypto:strong_rand_bytes(12),
+    {Cipher, Tag} = crypto:crypto_one_time_aead(aes_256_gcm, Key, Nonce, Plain, <<>>, 16, true),
+    <<Nonce/binary, Cipher/binary, Tag/binary>>.
+
+aes_gcm_decrypt(Key, <<Nonce:12/binary, Rest/binary>>) when byte_size(Rest) >= 16 ->
+    Size = byte_size(Rest) - 16,
+    <<Cipher:Size/binary, Tag:16/binary>> = Rest,
+    try crypto:crypto_one_time_aead(aes_256_gcm, Key, Nonce, Cipher, <<>>, Tag, false) of
+        error -> {error, nil};
+        Plain -> {ok, Plain}
+    catch
+        _:_ -> {error, nil}
+    end;
+aes_gcm_decrypt(_, _) ->
+    {error, nil}.

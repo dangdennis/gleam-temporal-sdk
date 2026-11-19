@@ -21,6 +21,7 @@ import gleam/result
 import temporal/client.{type Client, type Error}
 import temporal/codec.{type Payload}
 import temporal/internal/bridge
+import temporal/internal/transcode
 import temporal/workflow
 
 /// When the schedule fires: the union of its intervals, calendars and cron expressions.
@@ -286,6 +287,8 @@ fn to_request(action: Action) -> bridge.StartRequest {
     search_attributes: action.search_attributes,
     start_delay_ms: None,
     cron_schedule: "",
+    request_id: "",
+    callbacks: [],
   )
 }
 
@@ -297,7 +300,7 @@ fn from_ranges(values: List(#(Int, Int, Int))) -> List(Range) {
   list.map(values, fn(range) { Range(range.0, range.1, range.2) })
 }
 
-fn to_bridge(schedule: Schedule) -> bridge.Schedule {
+fn to_bridge(client: Client, schedule: Schedule) -> bridge.Schedule {
   let spec = schedule.spec
   bridge.Schedule(
     spec: bridge.ScheduleSpec(
@@ -320,7 +323,7 @@ fn to_bridge(schedule: Schedule) -> bridge.Schedule {
       timezone: option.unwrap(spec.timezone, ""),
       jitter_ms: spec.jitter_ms,
     ),
-    action: to_request(schedule.action),
+    action: client.encode_request(client, to_request(schedule.action)),
     overlap_policy: overlap_value(schedule.overlap),
     catchup_window_ms: schedule.catchup_window_ms,
     pause_on_failure: schedule.pause_on_failure,
@@ -329,8 +332,18 @@ fn to_bridge(schedule: Schedule) -> bridge.Schedule {
   )
 }
 
-fn from_bridge(schedule: bridge.Schedule) -> Schedule {
+fn from_bridge(client: Client, schedule: bridge.Schedule) -> Schedule {
   let spec = schedule.spec
+  let codec = client.payload_codec(client)
+  // An action stored without this client's codec is returned as stored.
+  let action =
+    bridge.StartRequest(
+      ..schedule.action,
+      input: transcode.decode_list(codec, schedule.action.input)
+        |> result.unwrap(schedule.action.input),
+      memo: transcode.decode_map(codec, schedule.action.memo)
+        |> result.unwrap(schedule.action.memo),
+    )
   Schedule(
     spec: Spec(
       intervals: list.map(spec.intervals, fn(interval) {
@@ -355,7 +368,7 @@ fn from_bridge(schedule: bridge.Schedule) -> Schedule {
       },
       jitter_ms: spec.jitter_ms,
     ),
-    action: from_request(schedule.action),
+    action: from_request(action),
     overlap: case schedule.overlap_policy {
       2 -> BufferOne
       3 -> BufferAll
@@ -382,7 +395,7 @@ pub fn create(
   bridge.schedule_put(
     client.connection(client),
     schedule_id,
-    to_bridge(schedule),
+    to_bridge(client, schedule),
     None,
     False,
   )
@@ -398,7 +411,7 @@ pub fn describe(
     |> result.map_error(client.request_error),
   )
   Description(
-    schedule: from_bridge(schedule),
+    schedule: from_bridge(client, schedule),
     action_count: info.action_count,
     recent_actions: list.map(info.recent_actions, fn(action) {
       RecentAction(scheduled_time_ms: action.0, workflow_id: action.1)
@@ -423,7 +436,7 @@ pub fn update(
   bridge.schedule_put(
     client.connection(client),
     schedule_id,
-    to_bridge(change(from_bridge(schedule))),
+    to_bridge(client, change(from_bridge(client, schedule))),
     option.Some(conflict_token),
     False,
   )

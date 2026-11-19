@@ -13,6 +13,7 @@ import temporal/internal/poller
 import temporal/middleware.{
   type ActivityCall, type ChildCall, type Outbound, Outbound,
 }
+import temporal/nexus
 import temporal/workflow
 
 pub type Config {
@@ -35,6 +36,19 @@ pub type Config {
     workflow_middleware: List(workflow.Middleware),
     activity_middleware: List(activity.Middleware),
     outbound: Outbound,
+    nexus_handlers: List(nexus.Handler),
+    deployment: Option(Deployment),
+  )
+}
+
+/// The version of a worker deployment this worker belongs to. Workers that run the same
+/// code share a build id; the server routes each workflow to the build it should run on.
+pub type Deployment {
+  Deployment(
+    name: String,
+    build_id: String,
+    /// What workflows that do not declare a behaviour with `workflow.with_versioning` do.
+    default_behavior: workflow.VersioningBehavior,
   )
 }
 
@@ -56,6 +70,8 @@ pub fn new(client: Client, task_queue: String) -> Config {
     workflow_middleware: [],
     activity_middleware: [],
     outbound: middleware.none(),
+    nexus_handlers: [],
+    deployment: None,
   )
 }
 
@@ -151,6 +167,22 @@ pub fn with_outbound_child(
   )
 }
 
+/// Serve Nexus operations from this worker's task queue. A Nexus endpoint registered on the
+/// server must point at the queue.
+pub fn with_nexus_handlers(
+  config: Config,
+  handlers: List(nexus.Handler),
+) -> Config {
+  Config(..config, nexus_handlers: list.append(config.nexus_handlers, handlers))
+}
+
+/// Run as one version of a worker deployment, so the server routes workflows by build.
+/// Tasks reach this worker only once its version is the deployment's current or ramping
+/// version, or for workflows pinned to it; set that with the Temporal CLI or UI.
+pub fn with_deployment(config: Config, deployment: Deployment) -> Config {
+  Config(..config, deployment: Some(deployment))
+}
+
 /// Start polling in background processes. Returns once the worker is registered. A worker
 /// with no workflows polls only for activities, and the other way round.
 pub fn start(config: Config) -> Result(Worker, String) {
@@ -165,8 +197,21 @@ pub fn start(config: Config) -> Result(Worker, String) {
       max_activities_per_second: config.max_activities_per_second,
       enable_workflows: config.workflows != [],
       enable_activities: config.activities != [],
+      enable_nexus: config.nexus_handlers != [],
+      deployment: option.map(config.deployment, fn(deployment) {
+        bridge.Deployment(
+          name: deployment.name,
+          build_id: deployment.build_id,
+          use_versioning: True,
+          default_behavior: case deployment.default_behavior {
+            workflow.Pinned -> 1
+            workflow.AutoUpgrade -> 2
+          },
+        )
+      }),
     ),
   ))
+  let codec = client.payload_codec(config.client)
   let workflows =
     dict.from_list(
       list.map(config.workflows, fn(handler) {
@@ -193,6 +238,7 @@ pub fn start(config: Config) -> Result(Worker, String) {
             workflows,
             config.task_queue,
             config.outbound,
+            codec,
             False,
           )
         {
@@ -204,12 +250,22 @@ pub fn start(config: Config) -> Result(Worker, String) {
       Nil
     }
   }
-  case config.activities {
-    [] -> Nil
-    _ -> {
+  // The activity poller also delivers local activities, which core issues to any worker
+  // that runs workflows.
+  case config.activities, config.workflows {
+    [], [] -> Nil
+    _, _ -> {
       process.spawn_unlinked(fn() {
-        poller.activity_loop(nif, activities, config.task_queue)
+        poller.activity_loop(nif, activities, config.task_queue, codec)
       })
+      Nil
+    }
+  }
+  case config.nexus_handlers {
+    [] -> Nil
+    handlers -> {
+      let dispatch = nexus.dispatcher(handlers, config.client)
+      process.spawn_unlinked(fn() { poller.nexus_loop(nif, dispatch) })
       Nil
     }
   }

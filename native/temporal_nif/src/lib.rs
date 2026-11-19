@@ -27,7 +27,9 @@ use temporalio_common::{
         coresdk::{ActivityHeartbeat, ActivityTaskCompletion},
         temporal::api::history::v1::History,
     },
-    worker::WorkerTaskTypes,
+    worker::{
+        VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes,
+    },
 };
 use temporalio_sdk_core::{
     CoreRuntime, PollError, PollerBehavior, RuntimeOptions, TokioRuntimeBuilder, Url, Worker,
@@ -47,6 +49,8 @@ pub struct ConnectionRes {
 
 pub struct WorkerRes {
     pub worker: Arc<Worker>,
+    /// The namespace commands that name another workflow are addressed to.
+    pub namespace: String,
 }
 
 #[rustler::resource_impl]
@@ -178,6 +182,7 @@ struct WorkerOptions {
     task_queue_activities_per_second: Option<f64>,
     worker_activities_per_second: Option<f64>,
     task_types: WorkerTaskTypes,
+    versioning: WorkerVersioningStrategy,
 }
 
 fn decode_worker_options(term: Term) -> DecodeResult<WorkerOptions> {
@@ -195,11 +200,40 @@ fn decode_worker_options(term: Term) -> DecodeResult<WorkerOptions> {
         worker_activities_per_second: rate(4)?,
         task_types: WorkerTaskTypes {
             enable_workflows: get(&f, 5)?,
-            enable_local_activities: false,
+            // Local activities run in the worker that runs the workflow.
+            enable_local_activities: get(&f, 5)?,
             enable_remote_activities: get(&f, 6)?,
-            enable_nexus: false,
+            enable_nexus: get(&f, 7)?,
+        },
+        versioning: match opt(field(&f, 8)?) {
+            None => unversioned(),
+            Some(deployment) => {
+                let (_, d) = untag(deployment)?;
+                let behavior = match get::<i32>(&d, 3)? {
+                    1 => Some(VersioningBehavior::Pinned),
+                    2 => Some(VersioningBehavior::AutoUpgrade),
+                    _ => None,
+                };
+                WorkerVersioningStrategy::WorkerDeploymentBased(
+                    WorkerDeploymentOptions::new(
+                        WorkerDeploymentVersion::builder()
+                            .deployment_name(get::<String>(&d, 0)?)
+                            .build_id(get::<String>(&d, 1)?)
+                            .build(),
+                    )
+                    .use_worker_versioning(get(&d, 2)?)
+                    .maybe_default_versioning_behavior(behavior)
+                    .build(),
+                )
+            }
         },
     })
+}
+
+fn unversioned() -> WorkerVersioningStrategy {
+    WorkerVersioningStrategy::None {
+        build_id: "temporal-gleam".to_string(),
+    }
 }
 
 fn worker_config(
@@ -220,9 +254,7 @@ fn worker_config(
         .maybe_max_worker_activities_per_second(options.worker_activities_per_second)
         .max_outstanding_local_activities(100usize)
         .max_outstanding_nexus_tasks(1usize)
-        .versioning_strategy(WorkerVersioningStrategy::None {
-            build_id: "temporal-gleam".to_string(),
-        })
+        .versioning_strategy(options.versioning)
         .build()
 }
 
@@ -241,6 +273,7 @@ fn worker_new<'a>(
     };
     let fut = async move {
         let config = worker_config(conn.namespace.clone(), task_queue, options)?;
+        let conn = conn.clone();
         let worker = temporalio_sdk_core::init_worker(runtime(), config, conn.connection.clone())
             .map_err(|e| format!("worker init failed: {e}"))?;
         worker
@@ -249,6 +282,7 @@ fn worker_new<'a>(
             .map_err(|e| format!("worker validation failed: {e}"))?;
         Ok::<_, String>(WorkerRes {
             worker: Arc::new(worker),
+            namespace: conn.namespace.clone(),
         })
     };
     spawn_reply(env, pid, reference, fut, |env, r| match r {
@@ -279,6 +313,7 @@ fn replay_worker_new<'a>(
         task_queue_activities_per_second: None,
         worker_activities_per_second: None,
         task_types: WorkerTaskTypes::workflow_only(),
+        versioning: unversioned(),
     };
     let config = match worker_config("replay".to_string(), task_queue, options) {
         Ok(c) => c,
@@ -293,6 +328,7 @@ fn replay_worker_new<'a>(
             env,
             ResourceArc::new(WorkerRes {
                 worker: Arc::new(worker),
+                namespace: "replay".to_string(),
             })
             .encode(env),
         ),
@@ -330,7 +366,7 @@ fn worker_complete_workflow<'a>(
     w: ResourceArc<WorkerRes>,
     completion: Term<'a>,
 ) -> Term<'a> {
-    let completion = match decode_completion(completion) {
+    let completion = match decode_completion(completion, &w.namespace) {
         Ok(c) => c,
         Err(e) => return err(env, format!("invalid completion: {e}")),
     };
@@ -390,6 +426,39 @@ fn worker_heartbeat<'a>(
         });
     }
     atoms::nil()
+}
+
+#[rustler::nif]
+fn worker_poll_nexus<'a>(
+    env: Env<'a>,
+    pid: LocalPid,
+    reference: Term<'a>,
+    w: ResourceArc<WorkerRes>,
+) -> Atom {
+    let fut = async move { w.worker.poll_nexus_task().await };
+    spawn_reply(env, pid, reference, fut, |env, r| match r {
+        Ok(task) => ok(env, encode_nexus_task(env, task)),
+        Err(e) => poll_error(env, e),
+    });
+    atoms::ok()
+}
+
+#[rustler::nif]
+fn worker_complete_nexus<'a>(
+    env: Env<'a>,
+    pid: LocalPid,
+    reference: Term<'a>,
+    w: ResourceArc<WorkerRes>,
+    task_token: Binary<'a>,
+    result: Term<'a>,
+) -> Term<'a> {
+    let completion = match decode_nexus_result(result, task_token.as_slice().to_vec()) {
+        Ok(c) => c,
+        Err(e) => return err(env, format!("invalid nexus result: {e}")),
+    };
+    let fut = async move { w.worker.complete_nexus_task(completion).await };
+    spawn_reply(env, pid, reference, fut, unit_result);
+    atoms::ok().encode(env)
 }
 
 /// Stop polling. Outstanding polls resolve with `{error, shutdown}` once in-flight tasks finish.

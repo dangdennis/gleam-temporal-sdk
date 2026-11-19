@@ -202,6 +202,8 @@ fn encode_action<'a>(env: Env<'a>, a: Option<ScheduleAction>) -> Term<'a> {
             ),
             atoms::none().encode(env),
             "".encode(env),
+            "".encode(env),
+            Vec::<Term>::new().encode(env),
         ],
     )
 }

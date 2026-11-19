@@ -4,11 +4,13 @@ import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid}
 import gleam/io
 import gleam/list
-import gleam/option
+import gleam/option.{type Option}
 import temporal/activity
+import temporal/codec.{type PayloadCodec}
 import temporal/failure
 import temporal/internal/bridge.{type NifWorker}
 import temporal/internal/runtime
+import temporal/internal/transcode
 import temporal/middleware.{type Outbound}
 
 /// A run that core removed from the cache, with core's `EvictionReason` value.
@@ -24,6 +26,7 @@ pub fn workflow_loop(
   workflows: Dict(String, runtime.WorkflowFn),
   task_queue: String,
   outbound: Outbound,
+  codec: Option(PayloadCodec),
   record_evictions: Bool,
 ) -> Result(List(Eviction), String) {
   do_workflow_loop(
@@ -31,6 +34,7 @@ pub fn workflow_loop(
     workflows,
     task_queue,
     outbound,
+    codec,
     record_evictions,
     dict.new(),
     [],
@@ -42,6 +46,7 @@ fn do_workflow_loop(
   workflows: Dict(String, runtime.WorkflowFn),
   task_queue: String,
   outbound: Outbound,
+  codec: Option(PayloadCodec),
   record_evictions: Bool,
   runs: Dict(String, Pid),
   evictions: List(Eviction),
@@ -59,6 +64,7 @@ fn do_workflow_loop(
           }
         })
       let complete = fn(completion) {
+        let completion = transcode.encode_completion(codec, completion)
         case bridge.complete_workflow(worker, completion) {
           Ok(Nil) -> Nil
           Error(reason) ->
@@ -75,27 +81,22 @@ fn do_workflow_loop(
           }
         Error(Nil) -> Error(Nil)
       }
-      let runs = case existing, eviction {
-        Ok(pid), Ok(_) -> {
-          bridge.send_activation(pid, activation)
-          dict.delete(runs, activation.run_id)
-        }
-        Ok(pid), Error(Nil) -> {
-          bridge.send_activation(pid, activation)
+      let decoded = transcode.decode_activation(codec, activation)
+      let runs = case decoded {
+        Ok(activation) ->
+          dispatch(activation, existing, eviction, runs, complete, fn() {
+            runtime.run(workflows, task_queue, outbound, complete)
+          })
+        // Core evicts the run after a failed task and replays it, so the run's process,
+        // if there is one, is left as it is.
+        Error(reason) -> {
+          complete(bridge.TaskFailure(
+            activation.run_id,
+            failure.new(
+              "payload codec could not decode the workflow task: " <> reason,
+            ),
+          ))
           runs
-        }
-        // Nothing to evict: the run's process is already gone.
-        Error(Nil), Ok(_) -> {
-          complete(bridge.Success(activation.run_id, []))
-          dict.delete(runs, activation.run_id)
-        }
-        Error(Nil), Error(Nil) -> {
-          let pid =
-            process.spawn_unlinked(fn() {
-              runtime.run(workflows, task_queue, outbound, complete)
-            })
-          bridge.send_activation(pid, activation)
-          dict.insert(runs, activation.run_id, pid)
         }
       }
       let evictions = case eviction, record_evictions {
@@ -107,10 +108,41 @@ fn do_workflow_loop(
         workflows,
         task_queue,
         outbound,
+        codec,
         record_evictions,
         runs,
         evictions,
       )
+    }
+  }
+}
+
+fn dispatch(
+  activation: bridge.Activation,
+  existing: Result(Pid, Nil),
+  eviction: Result(Eviction, Nil),
+  runs: Dict(String, Pid),
+  complete: fn(bridge.Completion) -> Nil,
+  run: fn() -> Nil,
+) -> Dict(String, Pid) {
+  case existing, eviction {
+    Ok(pid), Ok(_) -> {
+      bridge.send_activation(pid, activation)
+      dict.delete(runs, activation.run_id)
+    }
+    Ok(pid), Error(Nil) -> {
+      bridge.send_activation(pid, activation)
+      runs
+    }
+    // Nothing to evict: the run's process is already gone.
+    Error(Nil), Ok(_) -> {
+      complete(bridge.Success(activation.run_id, [], 0))
+      dict.delete(runs, activation.run_id)
+    }
+    Error(Nil), Error(Nil) -> {
+      let pid = process.spawn_unlinked(run)
+      bridge.send_activation(pid, activation)
+      dict.insert(runs, activation.run_id, pid)
     }
   }
 }
@@ -120,18 +152,39 @@ pub fn activity_loop(
   worker: NifWorker,
   activities: Dict(String, activity.Handler),
   task_queue: String,
+  codec: Option(PayloadCodec),
 ) -> Nil {
-  do_activity_loop(worker, activities, task_queue, dict.new())
+  do_activity_loop(worker, activities, task_queue, codec, dict.new())
 }
 
 fn do_activity_loop(
   worker: NifWorker,
   activities: Dict(String, activity.Handler),
   task_queue: String,
+  codec: Option(PayloadCodec),
   running: Dict(BitArray, Pid),
 ) -> Nil {
   let running = dict.filter(running, fn(_, pid) { process.is_alive(pid) })
-  case bridge.poll_activity(worker) {
+  let task = case bridge.poll_activity(worker) {
+    Ok(bridge.ActivityStart(task_token:, ..) as task) ->
+      case transcode.decode_activity_task(codec, task) {
+        Ok(task) -> Ok(task)
+        // Report the failure and wait for the next task.
+        Error(reason) -> {
+          let _ =
+            bridge.complete_activity(
+              worker,
+              task_token,
+              bridge.ActivityFailed(failure.new(
+                "payload codec could not decode the activity task: " <> reason,
+              )),
+            )
+          Ok(bridge.ActivityCancel(task_token, -1))
+        }
+      }
+    other -> other
+  }
+  case task {
     Error(bridge.Shutdown) -> Nil
     Error(bridge.PollFailed(message)) ->
       io.println_error("temporal: activity polling failed: " <> message)
@@ -148,6 +201,7 @@ fn do_activity_loop(
       start_to_close_ms:,
       heartbeat_timeout_ms:,
       scheduled_time_ms:,
+      is_local:,
     )) -> {
       let ctx =
         activity.Context(
@@ -163,9 +217,19 @@ fn do_activity_loop(
             start_to_close_ms:,
             heartbeat_timeout_ms:,
             scheduled_time_ms:,
+            is_local:,
           ),
+          // A local activity has no heartbeat: the workflow task it runs in is its lease.
           heartbeat: fn(details) {
-            bridge.heartbeat(worker, task_token, details)
+            case is_local {
+              True -> Nil
+              False ->
+                bridge.heartbeat(
+                  worker,
+                  task_token,
+                  transcode.encode_list(codec, details),
+                )
+            }
           },
           cancel_reason: fn() {
             option.map(bridge.activity_cancel_reason(), cancel_reason)
@@ -198,13 +262,19 @@ fn do_activity_loop(
                   ))
               }
           }
-          let _ = bridge.complete_activity(worker, task_token, result)
+          let _ =
+            bridge.complete_activity(
+              worker,
+              task_token,
+              transcode.encode_activity_result(codec, result),
+            )
           Nil
         })
       do_activity_loop(
         worker,
         activities,
         task_queue,
+        codec,
         dict.insert(running, task_token, pid),
       )
     }
@@ -216,7 +286,7 @@ fn do_activity_loop(
         Ok(pid) -> bridge.send_activity_cancel(pid, reason)
         Error(Nil) -> Nil
       }
-      do_activity_loop(worker, activities, task_queue, running)
+      do_activity_loop(worker, activities, task_queue, codec, running)
     }
   }
 }
@@ -230,5 +300,25 @@ fn cancel_reason(reason: Int) -> activity.CancelReason {
     4 -> activity.Paused
     5 -> activity.Reset
     _ -> activity.CancelRequested
+  }
+}
+
+/// Answer Nexus tasks until the worker shuts down, each in its own process. `handle` turns
+/// a task into its result and must not crash.
+pub fn nexus_loop(
+  worker: NifWorker,
+  handle: fn(bridge.NexusTask) -> bridge.NexusResult,
+) -> Nil {
+  case bridge.poll_nexus(worker) {
+    Error(bridge.Shutdown) -> Nil
+    Error(bridge.PollFailed(message)) ->
+      io.println_error("temporal: nexus polling failed: " <> message)
+    Ok(task) -> {
+      process.spawn_unlinked(fn() {
+        let _ = bridge.complete_nexus(worker, task.task_token, handle(task))
+        Nil
+      })
+      nexus_loop(worker, handle)
+    }
   }
 }

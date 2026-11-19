@@ -123,6 +123,10 @@ pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
         Some(FailureInfo::ServerFailureInfo(i)) => ("server", "", i.non_retryable),
         Some(FailureInfo::ActivityFailureInfo(_)) => ("activity", "", false),
         Some(FailureInfo::ChildWorkflowExecutionFailureInfo(_)) => ("child_workflow", "", false),
+        Some(FailureInfo::NexusOperationExecutionFailureInfo(_)) => ("nexus_operation", "", false),
+        Some(FailureInfo::NexusHandlerFailureInfo(i)) => {
+            ("nexus_handler", i.r#type.as_str(), false)
+        }
         _ => ("other", "", false),
     };
     let cause = option(env, f.cause.as_deref().map(|c| encode_failure(env, c)));
@@ -169,10 +173,16 @@ fn encode_activity_resolution<'a>(env: Env<'a>, r: Option<ActivityResolution>) -
         Some(activity_resolution::Status::Cancelled(c)) => {
             rec(env, "cancelled", &[failure_or_default(env, &c.failure)])
         }
-        // Backoff is only issued for local activities, which this SDK never schedules.
-        Some(activity_resolution::Status::Backoff(_)) | None => {
-            rec(env, "failed", &[failure_or_default(env, &None)])
-        }
+        Some(activity_resolution::Status::Backoff(b)) => rec(
+            env,
+            "backoff",
+            &[
+                b.attempt.encode(env),
+                duration_ms(b.backoff_duration).unwrap_or(0).encode(env),
+                millis(b.original_schedule_time).encode(env),
+            ],
+        ),
+        None => rec(env, "failed", &[failure_or_default(env, &None)]),
     }
 }
 
@@ -270,18 +280,68 @@ fn encode_job<'a>(env: Env<'a>, job: Job) -> Term<'a> {
             "remove_from_cache",
             &[j.message.encode(env), j.reason.encode(env)],
         ),
-        Job::ResolveSignalExternalWorkflow(_) => unsupported(env, "resolve_signal_external"),
-        Job::ResolveRequestCancelExternalWorkflow(_) => {
-            unsupported(env, "resolve_request_cancel_external")
+        Job::ResolveSignalExternalWorkflow(j) => rec(
+            env,
+            "resolve_external_signal",
+            &[
+                j.seq.encode(env),
+                option(env, j.failure.as_ref().map(|f| encode_failure(env, f))),
+            ],
+        ),
+        Job::ResolveRequestCancelExternalWorkflow(j) => rec(
+            env,
+            "resolve_external_cancel",
+            &[
+                j.seq.encode(env),
+                option(env, j.failure.as_ref().map(|f| encode_failure(env, f))),
+            ],
+        ),
+        Job::DoUpdate(j) => rec(
+            env,
+            "do_update",
+            &[
+                j.id.encode(env),
+                j.protocol_instance_id.encode(env),
+                j.name.encode(env),
+                encode_payloads(env, &j.input),
+                j.run_validator.encode(env),
+            ],
+        ),
+        Job::ResolveNexusOperationStart(j) => {
+            use temporalio_common::protos::coresdk::workflow_activation::resolve_nexus_operation_start::Status;
+            let status = match j.status {
+                Some(Status::OperationToken(token)) => {
+                    rec(env, "nexus_started_async", &[token.encode(env)])
+                }
+                Some(Status::StartedSync(_)) => atom(env, "nexus_started_sync"),
+                Some(Status::Failed(f)) => {
+                    rec(env, "nexus_start_failed", &[encode_failure(env, &f)])
+                }
+                None => rec(
+                    env,
+                    "nexus_start_failed",
+                    &[encode_failure(env, &Failure::default())],
+                ),
+            };
+            rec(env, "resolve_nexus_start", &[j.seq.encode(env), status])
         }
-        Job::DoUpdate(_) => unsupported(env, "do_update"),
-        Job::ResolveNexusOperationStart(_) => unsupported(env, "resolve_nexus_operation_start"),
-        Job::ResolveNexusOperation(_) => unsupported(env, "resolve_nexus_operation"),
+        Job::ResolveNexusOperation(j) => {
+            use temporalio_common::protos::coresdk::nexus::nexus_operation_result::Status;
+            let result = match j.result.and_then(|r| r.status) {
+                Some(Status::Completed(p)) => rec(
+                    env,
+                    "completed",
+                    &[option(env, Some(encode_payload(env, &p)))],
+                ),
+                Some(Status::Cancelled(f)) => rec(env, "cancelled", &[encode_failure(env, &f)]),
+                Some(Status::Failed(f)) | Some(Status::TimedOut(f)) => {
+                    rec(env, "failed", &[encode_failure(env, &f)])
+                }
+                None => rec(env, "failed", &[encode_failure(env, &Failure::default())]),
+            };
+            rec(env, "resolve_nexus", &[j.seq.encode(env), result])
+        }
     }
-}
-
-fn unsupported<'a>(env: Env<'a>, name: &str) -> Term<'a> {
-    rec(env, "unsupported_job", &[name.encode(env)])
 }
 
 pub fn encode_activation<'a>(env: Env<'a>, a: WorkflowActivation) -> Term<'a> {
@@ -338,6 +398,7 @@ pub fn encode_activity_task<'a>(env: Env<'a>, t: ActivityTask) -> Term<'a> {
                             .map(|ms| ms.encode(env)),
                     ),
                     millis(s.scheduled_time).encode(env),
+                    s.is_local.encode(env),
                 ],
             )
         }
@@ -478,7 +539,15 @@ pub fn decode_retry(term: Term) -> DecodeResult<RetryPolicy> {
     })
 }
 
-fn decode_command(term: Term) -> DecodeResult<WorkflowCommand> {
+fn timestamp(ms: i64) -> prost_wkt_types::Timestamp {
+    prost_wkt_types::Timestamp {
+        seconds: ms.div_euclid(1000),
+        nanos: (ms.rem_euclid(1000) * 1_000_000) as i32,
+    }
+}
+
+fn decode_command(term: Term, namespace: &str) -> DecodeResult<WorkflowCommand> {
+    use temporalio_common::protos::coresdk::common::NamespacedWorkflowExecution;
     let (tag, f) = untag(term)?;
     let variant = match tag.as_str() {
         "start_timer" => Cmd::StartTimer(wc::StartTimer {
@@ -564,6 +633,98 @@ fn decode_command(term: Term) -> DecodeResult<WorkflowCommand> {
                 reason: String::new(),
             })
         }
+        "schedule_local_activity" => Cmd::ScheduleLocalActivity(wc::ScheduleLocalActivity {
+            seq: get(&f, 0)?,
+            activity_id: get(&f, 1)?,
+            activity_type: get(&f, 2)?,
+            attempt: get(&f, 3)?,
+            original_schedule_time: opt(field(&f, 4)?)
+                .map(|t| t.decode::<i64>().map(timestamp))
+                .transpose()
+                .map_err(|_| "schedule time must be an Int")?,
+            arguments: decode_payloads(field(&f, 5)?)?,
+            schedule_to_close_timeout: decode_opt_ms(field(&f, 6)?)?,
+            schedule_to_start_timeout: decode_opt_ms(field(&f, 7)?)?,
+            start_to_close_timeout: decode_opt_ms(field(&f, 8)?)?,
+            retry_policy: opt(field(&f, 9)?).map(decode_retry).transpose()?,
+            local_retry_threshold: decode_opt_ms(field(&f, 10)?)?,
+            cancellation_type: get(&f, 11)?,
+            ..Default::default()
+        }),
+        "request_cancel_local_activity" => {
+            Cmd::RequestCancelLocalActivity(wc::RequestCancelLocalActivity { seq: get(&f, 0)? })
+        }
+        "signal_external" => {
+            use wc::signal_external_workflow_execution::Target;
+            let (target_tag, t) = untag(field(&f, 1)?)?;
+            let target = if target_tag == "child_workflow_target" {
+                Target::ChildWorkflowId(get(&t, 0)?)
+            } else {
+                Target::WorkflowExecution(NamespacedWorkflowExecution {
+                    namespace: namespace.to_string(),
+                    workflow_id: get(&t, 0)?,
+                    run_id: get(&t, 1)?,
+                })
+            };
+            Cmd::SignalExternalWorkflowExecution(wc::SignalExternalWorkflowExecution {
+                seq: get(&f, 0)?,
+                target: Some(target),
+                signal_name: get(&f, 2)?,
+                args: decode_payloads(field(&f, 3)?)?,
+                ..Default::default()
+            })
+        }
+        "cancel_signal_external" => {
+            Cmd::CancelSignalWorkflow(wc::CancelSignalWorkflow { seq: get(&f, 0)? })
+        }
+        "cancel_external" => Cmd::RequestCancelExternalWorkflowExecution(
+            wc::RequestCancelExternalWorkflowExecution {
+                seq: get(&f, 0)?,
+                workflow_execution: Some(NamespacedWorkflowExecution {
+                    namespace: namespace.to_string(),
+                    workflow_id: get(&f, 1)?,
+                    run_id: get(&f, 2)?,
+                }),
+                reason: get(&f, 3)?,
+            },
+        ),
+        "update_accepted" => Cmd::UpdateResponse(wc::UpdateResponse {
+            protocol_instance_id: get(&f, 0)?,
+            response: Some(wc::update_response::Response::Accepted(())),
+        }),
+        "update_rejected" => Cmd::UpdateResponse(wc::UpdateResponse {
+            protocol_instance_id: get(&f, 0)?,
+            response: Some(wc::update_response::Response::Rejected(decode_failure(
+                field(&f, 1)?,
+            )?)),
+        }),
+        "update_completed" => Cmd::UpdateResponse(wc::UpdateResponse {
+            protocol_instance_id: get(&f, 0)?,
+            response: Some(wc::update_response::Response::Completed(decode_payload(
+                field(&f, 1)?,
+            )?)),
+        }),
+        "schedule_nexus_operation" => Cmd::ScheduleNexusOperation(wc::ScheduleNexusOperation {
+            seq: get(&f, 0)?,
+            endpoint: get(&f, 1)?,
+            service: get(&f, 2)?,
+            operation: get(&f, 3)?,
+            input: Some(decode_payload(field(&f, 4)?)?),
+            schedule_to_close_timeout: decode_opt_ms(field(&f, 5)?)?,
+            cancellation_type: get(&f, 6)?,
+            ..Default::default()
+        }),
+        "cancel_nexus_operation" => {
+            Cmd::RequestCancelNexusOperation(wc::RequestCancelNexusOperation { seq: get(&f, 0)? })
+        }
+        "upsert_search_attributes" => {
+            Cmd::UpsertWorkflowSearchAttributes(wc::UpsertWorkflowSearchAttributes {
+                search_attributes: decode_search_attributes(field(&f, 0)?)?,
+            })
+        }
+        "upsert_memo" => Cmd::ModifyWorkflowProperties(wc::ModifyWorkflowProperties {
+            upserted_memo: decode_memo(field(&f, 0)?)?,
+        }),
         other => return Err(format!("unknown command {other}")),
     };
     Ok(WorkflowCommand {
@@ -572,7 +733,10 @@ fn decode_command(term: Term) -> DecodeResult<WorkflowCommand> {
     })
 }
 
-pub fn decode_completion(term: Term) -> DecodeResult<WorkflowActivationCompletion> {
+pub fn decode_completion(
+    term: Term,
+    namespace: &str,
+) -> DecodeResult<WorkflowActivationCompletion> {
     use workflow_completion::workflow_activation_completion::Status;
     let (tag, f) = untag(term)?;
     let status = match tag.as_str() {
@@ -581,8 +745,9 @@ pub fn decode_completion(term: Term) -> DecodeResult<WorkflowActivationCompletio
             Status::Successful(workflow_completion::Success {
                 commands: commands
                     .into_iter()
-                    .map(decode_command)
+                    .map(|c| decode_command(c, namespace))
                     .collect::<DecodeResult<_>>()?,
+                versioning_behavior: get(&f, 2)?,
                 ..Default::default()
             })
         }
@@ -616,6 +781,131 @@ pub fn decode_activity_result(term: Term) -> DecodeResult<ActivityExecutionResul
         other => return Err(format!("unknown activity result {other}")),
     };
     Ok(ActivityExecutionResult {
+        status: Some(status),
+    })
+}
+
+// ---- Nexus tasks ----
+
+fn encode_string_map<'a>(env: Env<'a>, m: &HashMap<String, String>) -> Term<'a> {
+    let mut map = Term::map_new(env);
+    for (k, v) in m {
+        map = map
+            .map_put(k.as_str(), v.as_str())
+            .expect("map_put on a map");
+    }
+    map
+}
+
+pub fn encode_nexus_task<'a>(
+    env: Env<'a>,
+    task: temporalio_common::protos::coresdk::nexus::NexusTask,
+) -> Term<'a> {
+    use temporalio_common::protos::{
+        coresdk::nexus::nexus_task::Variant, temporal::api::nexus::v1::request,
+    };
+    match task.variant {
+        Some(Variant::Task(t)) => {
+            let token = bin(env, &t.task_token);
+            let request = t.request.unwrap_or_default();
+            match request.variant {
+                Some(request::Variant::StartOperation(s)) => rec(
+                    env,
+                    "nexus_start_task",
+                    &[
+                        token,
+                        s.service.encode(env),
+                        s.operation.encode(env),
+                        s.request_id.encode(env),
+                        option(env, s.payload.as_ref().map(|p| encode_payload(env, p))),
+                        s.callback.encode(env),
+                        encode_string_map(env, &s.callback_header),
+                        encode_string_map(env, &request.header),
+                    ],
+                ),
+                Some(request::Variant::CancelOperation(c)) => rec(
+                    env,
+                    "nexus_cancel_task",
+                    &[
+                        token,
+                        c.service.encode(env),
+                        c.operation.encode(env),
+                        c.operation_token.encode(env),
+                    ],
+                ),
+                None => rec(env, "nexus_task_cancelled", &[token]),
+            }
+        }
+        Some(Variant::CancelTask(c)) => {
+            rec(env, "nexus_task_cancelled", &[bin(env, &c.task_token)])
+        }
+        None => rec(env, "nexus_task_cancelled", &[bin(env, &[])]),
+    }
+}
+
+pub fn decode_nexus_result(
+    term: Term,
+    task_token: Vec<u8>,
+) -> DecodeResult<temporalio_common::protos::coresdk::nexus::NexusTaskCompletion> {
+    use temporalio_common::protos::{
+        coresdk::nexus::{NexusTaskCompletion, nexus_task_completion::Status},
+        temporal::api::{
+            failure::v1::NexusHandlerFailureInfo,
+            nexus::v1::{
+                CancelOperationResponse, Response, StartOperationResponse, response,
+                start_operation_response,
+            },
+        },
+    };
+    let start = |variant| {
+        Status::Completed(Response {
+            variant: Some(response::Variant::StartOperation(StartOperationResponse {
+                variant: Some(variant),
+            })),
+        })
+    };
+    let (tag, f) = untag(term)?;
+    let status = match tag.as_str() {
+        "nexus_sync_success" => start(start_operation_response::Variant::SyncSuccess(
+            start_operation_response::Sync {
+                payload: Some(decode_payload(field(&f, 0)?)?),
+                ..Default::default()
+            },
+        )),
+        "nexus_async_success" => start(start_operation_response::Variant::AsyncSuccess(
+            start_operation_response::Async {
+                operation_token: get(&f, 0)?,
+                ..Default::default()
+            },
+        )),
+        "nexus_operation_failed" => start(start_operation_response::Variant::Failure(
+            decode_failure(field(&f, 0)?)?,
+        )),
+        "nexus_handler_failed" => {
+            let cause = decode_failure(field(&f, 1)?)?;
+            Status::Failure(Failure {
+                message: cause.message.clone(),
+                source: "GleamSDK".to_string(),
+                cause: Some(Box::new(cause)),
+                failure_info: Some(FailureInfo::NexusHandlerFailureInfo(
+                    NexusHandlerFailureInfo {
+                        r#type: get(&f, 0)?,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })
+        }
+        "nexus_cancel_acknowledged" => Status::Completed(Response {
+            variant: Some(response::Variant::CancelOperation(
+                CancelOperationResponse {},
+            )),
+        }),
+        "nexus_task_cancel_acknowledged" => Status::AckCancel(true),
+        other => return Err(format!("unknown nexus result {other}")),
+    };
+    Ok(NexusTaskCompletion {
+        task_token,
         status: Some(status),
     })
 }

@@ -6,7 +6,9 @@
 
 import gleam/dict
 import gleam/list
+import gleam/option.{type Option, None}
 import temporal/client.{type History}
+import temporal/codec.{type PayloadCodec}
 import temporal/internal/bridge
 import temporal/internal/poller
 import temporal/middleware.{type Outbound}
@@ -24,18 +26,28 @@ const nondeterminism = 3
 
 const benign_reasons = [1, 5, 10]
 
+/// What the worker that recorded a history ran with, where it changes what replay sees.
+pub type Options {
+  Options(outbound: Outbound, codec: Option(PayloadCodec))
+}
+
+pub fn options() -> Options {
+  Options(outbound: middleware.none(), codec: None)
+}
+
 pub fn replay(
   workflows: List(workflow.Handler),
   history: History,
 ) -> Result(Nil, ReplayError) {
-  replay_with(workflows, history, middleware.none())
+  replay_with(workflows, history, options())
 }
 
-/// Replay with the outbound middleware the worker that recorded the history ran with.
+/// Replay with the outbound middleware and payload codec of the worker that recorded the
+/// history.
 pub fn replay_with(
   workflows: List(workflow.Handler),
   history: History,
-  outbound: Outbound,
+  options: Options,
 ) -> Result(Nil, ReplayError) {
   let registry = dict.from_list(list.map(workflows, fn(w) { #(w.name, w.run) }))
   case
@@ -45,7 +57,16 @@ pub fn replay_with(
   {
     Error(message) -> Error(ReplayFailed(message))
     Ok(worker) ->
-      case poller.workflow_loop(worker, registry, "replay", outbound, True) {
+      case
+        poller.workflow_loop(
+          worker,
+          registry,
+          "replay",
+          options.outbound,
+          options.codec,
+          True,
+        )
+      {
         Error(message) -> Error(ReplayFailed(message))
         Ok(evictions) ->
           list.try_each(list.reverse(evictions), fn(eviction) {

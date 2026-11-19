@@ -28,6 +28,8 @@ pub type Info {
     heartbeat_timeout_ms: Option(Int),
     /// When the activity was first scheduled, in milliseconds since the Unix epoch.
     scheduled_time_ms: Int,
+    /// Whether the workflow started this as a local activity.
+    is_local: Bool,
   )
 }
 

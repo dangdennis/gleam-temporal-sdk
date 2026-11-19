@@ -166,6 +166,7 @@ pub fn activity_info() -> activity.Info {
     start_to_close_ms: None,
     heartbeat_timeout_ms: None,
     scheduled_time_ms: 0,
+    is_local: False,
   )
 }
 

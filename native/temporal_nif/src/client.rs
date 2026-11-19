@@ -2,23 +2,26 @@
 
 use crate::{ConnectionRes, atoms, convert::*, ok, spawn_reply};
 use rustler::{Atom, Encoder, Env, LocalPid, ResourceArc, Term};
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use temporalio_common::protos::temporal::api::{
     common::v1::{
-        Memo, Payload, Payloads, RetryPolicy, SearchAttributes, WorkflowExecution, WorkflowType,
+        Callback, Memo, Payload, Payloads, RetryPolicy, SearchAttributes, WorkflowExecution,
+        WorkflowType, callback,
     },
     enums::v1::HistoryEventFilterType,
     failure::v1::Failure,
     history::v1::{History, history_event::Attributes},
     query::v1::WorkflowQuery,
     taskqueue::v1::TaskQueue,
+    update::v1::{self as update, Outcome as UpdateOutcome, WaitPolicy, outcome},
     workflow::v1::WorkflowExecutionInfo,
     workflowservice::v1::{
         CountWorkflowExecutionsRequest, DescribeWorkflowExecutionRequest,
-        GetWorkflowExecutionHistoryRequest, ListWorkflowExecutionsRequest, QueryWorkflowRequest,
+        GetWorkflowExecutionHistoryRequest, ListWorkflowExecutionsRequest,
+        PollWorkflowExecutionUpdateRequest, QueryWorkflowRequest,
         RequestCancelWorkflowExecutionRequest, SignalWithStartWorkflowExecutionRequest,
         SignalWorkflowExecutionRequest, StartWorkflowExecutionRequest,
-        TerminateWorkflowExecutionRequest,
+        TerminateWorkflowExecutionRequest, UpdateWorkflowExecutionRequest,
     },
 };
 use tonic::{Code, IntoRequest};
@@ -75,6 +78,8 @@ pub struct StartRequest {
     pub search_attributes: Option<SearchAttributes>,
     pub start_delay: Option<prost_wkt_types::Duration>,
     pub cron_schedule: String,
+    pub request_id: String,
+    pub callbacks: Vec<Callback>,
 }
 
 pub fn decode_start_request(term: Term) -> DecodeResult<StartRequest> {
@@ -94,6 +99,17 @@ pub fn decode_start_request(term: Term) -> DecodeResult<StartRequest> {
         search_attributes: decode_search_attributes(field(&f, 11)?)?,
         start_delay: decode_opt_ms(field(&f, 12)?)?,
         cron_schedule: get(&f, 13)?,
+        request_id: match get::<String>(&f, 14)? {
+            id if id.is_empty() => uuid::Uuid::new_v4().to_string(),
+            id => id,
+        },
+        callbacks: get::<Vec<(String, HashMap<String, String>)>>(&f, 15)?
+            .into_iter()
+            .map(|(url, header)| Callback {
+                variant: Some(callback::Variant::Nexus(callback::Nexus { url, header })),
+                ..Default::default()
+            })
+            .collect(),
     })
 }
 
@@ -133,7 +149,7 @@ fn start_workflow<'a>(
             ..Default::default()
         });
         let input = Some(Payloads { payloads: r.input });
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = r.request_id;
         match signal {
             None => {
                 let request = StartWorkflowExecutionRequest {
@@ -154,6 +170,7 @@ fn start_workflow<'a>(
                     search_attributes: r.search_attributes,
                     workflow_start_delay: r.start_delay,
                     cron_schedule: r.cron_schedule,
+                    completion_callbacks: r.callbacks,
                     ..Default::default()
                 };
                 service
@@ -198,6 +215,147 @@ fn start_workflow<'a>(
         Err(s) => rpc_err(env, &s),
     });
     atoms::ok().encode(env)
+}
+
+fn encode_update_outcome<'a>(env: Env<'a>, outcome: Option<UpdateOutcome>) -> Term<'a> {
+    match outcome.and_then(|o| o.value) {
+        Some(outcome::Value::Success(p)) => rec(
+            env,
+            "update_succeeded",
+            &[encode_payloads(env, &p.payloads)],
+        ),
+        Some(outcome::Value::Failure(f)) => rec(env, "update_failed", &[encode_failure(env, &f)]),
+        None => atom(env, "update_pending"),
+    }
+}
+
+/// Send an update and wait for it to reach `wait_stage`. The server may answer before then
+/// when its own long-poll limit passes, so the answer can be `update_pending`.
+#[rustler::nif]
+fn update_workflow<'a>(
+    env: Env<'a>,
+    pid: LocalPid,
+    reference: Term<'a>,
+    conn: ResourceArc<ConnectionRes>,
+    target: (String, String, String, String),
+    input: Term<'a>,
+    wait_stage: i32,
+) -> Term<'a> {
+    // Workflow id, run id, update id and update name.
+    let (workflow_id, run_id, update_id, name) = target;
+    // The id makes re-sending the request idempotent, so one is always set.
+    let update_id = if update_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        update_id
+    };
+    let args = match payloads_arg(env, input) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let fut = async move {
+        let request = UpdateWorkflowExecutionRequest {
+            namespace: conn.namespace.clone(),
+            workflow_execution: execution(workflow_id, run_id),
+            wait_policy: Some(WaitPolicy {
+                lifecycle_stage: wait_stage,
+            }),
+            request: Some(update::Request {
+                meta: Some(update::Meta {
+                    update_id: update_id.clone(),
+                    identity: conn.identity.clone(),
+                }),
+                input: Some(update::Input {
+                    name,
+                    args: Some(Payloads { payloads: args }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        loop {
+            let mut request = request.clone().into_request();
+            request.set_timeout(Duration::from_secs(60));
+            match conn
+                .connection
+                .workflow_service()
+                .update_workflow_execution(request)
+                .await
+            {
+                Ok(r) => {
+                    let r = r.into_inner();
+                    // Not yet accepted: the server's wait ran out. Ask again; the update
+                    // id makes the request idempotent.
+                    if r.stage < 2 && r.outcome.is_none() {
+                        continue;
+                    }
+                    let run_id = r
+                        .update_ref
+                        .and_then(|u| u.workflow_execution)
+                        .map(|e| e.run_id)
+                        .unwrap_or_default();
+                    return Ok((run_id, update_id, r.outcome));
+                }
+                Err(s) if matches!(s.code(), Code::DeadlineExceeded | Code::Cancelled) => continue,
+                Err(s) => return Err(s),
+            }
+        }
+    };
+    spawn_reply(env, pid, reference, fut, |env, r| match r {
+        Ok((run_id, update_id, outcome)) => ok(
+            env,
+            (run_id, update_id, encode_update_outcome(env, outcome)).encode(env),
+        ),
+        Err(s) => rpc_err(env, &s),
+    });
+    atoms::ok().encode(env)
+}
+
+/// Wait for an update to complete.
+#[rustler::nif]
+fn poll_update<'a>(
+    env: Env<'a>,
+    pid: LocalPid,
+    reference: Term<'a>,
+    conn: ResourceArc<ConnectionRes>,
+    workflow_id: String,
+    run_id: String,
+    update_id: String,
+) -> Atom {
+    let fut = async move {
+        loop {
+            let mut request = PollWorkflowExecutionUpdateRequest {
+                namespace: conn.namespace.clone(),
+                update_ref: Some(update::UpdateRef {
+                    workflow_execution: execution(workflow_id.clone(), run_id.clone()),
+                    update_id: update_id.clone(),
+                }),
+                identity: conn.identity.clone(),
+                wait_policy: Some(WaitPolicy { lifecycle_stage: 3 }),
+            }
+            .into_request();
+            request.set_timeout(Duration::from_secs(60));
+            match conn
+                .connection
+                .workflow_service()
+                .poll_workflow_execution_update(request)
+                .await
+            {
+                Ok(r) => match r.into_inner().outcome {
+                    Some(outcome) => return Ok(Some(outcome)),
+                    None => continue,
+                },
+                Err(s) if matches!(s.code(), Code::DeadlineExceeded | Code::Cancelled) => continue,
+                Err(s) => return Err(s),
+            }
+        }
+    };
+    spawn_reply(env, pid, reference, fut, |env, r| match r {
+        Ok(outcome) => ok(env, encode_update_outcome(env, outcome)),
+        Err(s) => rpc_err(env, &s),
+    });
+    atoms::ok()
 }
 
 /// `bridge.Execution` from the server's description of a run.

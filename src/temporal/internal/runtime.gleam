@@ -32,8 +32,41 @@ pub type Op {
   TimerOp(seq: Int)
   ActivityOp(seq: Int)
   ChildOp(seq: Int)
+  /// A signal to another workflow that has not been delivered yet.
+  SignalOp(seq: Int)
+  NexusOp(seq: Int)
   /// A scope opened beneath this one, by scope id.
   ScopeOp(id: Int)
+}
+
+/// An update a client sent, waiting for the workflow to take it.
+pub type PendingUpdate {
+  PendingUpdate(
+    id: String,
+    protocol_instance_id: String,
+    name: String,
+    input: List(Payload),
+    /// False on replay: history already says the update was accepted.
+    run_validator: Bool,
+    accepted: Bool,
+  )
+}
+
+/// A local activity across its retries. Core runs the attempts that fit inside a workflow
+/// task; for a longer wait it answers with a backoff, and the runtime starts a timer and
+/// schedules the activity again under a new sequence number.
+pub type Local {
+  Local(
+    /// The command that schedules it, re-sent with a new seq and attempt after a backoff.
+    command: Command,
+    /// The sequence number of the attempt in flight, or of the backoff timer.
+    waiting: LocalWait,
+  )
+}
+
+pub type LocalWait {
+  LocalRunning(seq: Int)
+  LocalBackingOff(timer: Int, attempt: Int, original_schedule_time_ms: Int)
 }
 
 /// A cancellation scope. Cancelling one cancels its pending operations and every scope
@@ -74,6 +107,24 @@ pub type State {
     next_timer: Int,
     next_activity: Int,
     next_child: Int,
+    next_signal: Int,
+    next_cancel: Int,
+    next_nexus: Int,
+    /// Outcomes of signals sent to and cancellations requested of other workflows.
+    external_signals: Dict(Int, Option(Failure)),
+    external_cancels: Dict(Int, Option(Failure)),
+    nexus_starts: Dict(Int, bridge.NexusStart),
+    nexus_results: Dict(Int, bridge.Resolution),
+    /// Local activities by the sequence number of their first attempt, which is also the
+    /// key their final outcome is stored under in `activities`.
+    locals: Dict(Int, Local),
+    /// Oldest first.
+    updates: List(PendingUpdate),
+    /// The update names the workflow handles, each with the check an update must pass to
+    /// be accepted.
+    update_checks: Dict(String, fn(List(Payload)) -> Result(Nil, String)),
+    /// The API's `VersioningBehavior` value reported with every completion.
+    versioning_behavior: Int,
     fired_timers: Set(Int),
     cancelled_timers: Set(Int),
     scopes: Dict(Int, Scope),
@@ -135,6 +186,17 @@ pub fn run(
     next_timer: 1,
     next_activity: 1,
     next_child: 1,
+    next_signal: 1,
+    next_cancel: 1,
+    next_nexus: 1,
+    external_signals: dict.new(),
+    external_cancels: dict.new(),
+    nexus_starts: dict.new(),
+    nexus_results: dict.new(),
+    locals: dict.new(),
+    updates: [],
+    update_checks: dict.new(),
+    versioning_behavior: 0,
     fired_timers: set.new(),
     cancelled_timers: set.new(),
     scopes: dict.from_list([#(root_scope, Scope(root_scope, False, None, []))]),
@@ -210,13 +272,127 @@ pub fn block() -> Nil {
 }
 
 fn flush() -> Nil {
+  // The workflow has run as far as it can: any update it has not claimed is settled now.
+  list.each(get().updates, fn(update) {
+    case update.accepted {
+      True -> Nil
+      False -> settle_update(update)
+    }
+  })
   let state = get()
   let answers = list.map(list.reverse(state.pending_queries), answer_query)
   put(State(..state, commands: [], pending_queries: []))
   state.complete(bridge.Success(
     state.run_id,
     list.append(list.reverse(state.commands), answers),
+    state.versioning_behavior,
   ))
+}
+
+// ---- updates ----
+
+/// Declare that the workflow handles updates with this name. `check` decides whether an
+/// update is accepted; a later registration for the same name replaces it only when
+/// `replace` is set.
+pub fn register_update(
+  name: String,
+  check: fn(List(Payload)) -> Result(Nil, String),
+  replace: Bool,
+) -> Nil {
+  let state = get()
+  case replace || !dict.has_key(state.update_checks, name) {
+    True ->
+      put(
+        State(
+          ..state,
+          update_checks: dict.insert(state.update_checks, name, check),
+        ),
+      )
+    False -> Nil
+  }
+}
+
+/// Accept or reject an update that has not been settled yet. An accepted update stays
+/// queued for the workflow to take; a rejected one is dropped.
+fn settle_update(update: PendingUpdate) -> Nil {
+  let state = get()
+  let verdict = case
+    update.run_validator,
+    dict.get(state.update_checks, update.name)
+  {
+    // History already records the acceptance; validators do not run on replay.
+    False, _ -> Ok(Nil)
+    True, Ok(check) ->
+      case bridge.rescue(fn() { check(update.input) }) {
+        Ok(verdict) -> verdict
+        Error(crash) -> Error("update validator crashed: " <> crash)
+      }
+    True, Error(Nil) ->
+      Error("no handler registered for update \"" <> update.name <> "\"")
+  }
+  case verdict {
+    Ok(Nil) -> {
+      put(
+        State(
+          ..state,
+          updates: list.map(state.updates, fn(other) {
+            case other.protocol_instance_id == update.protocol_instance_id {
+              True -> PendingUpdate(..other, accepted: True)
+              False -> other
+            }
+          }),
+        ),
+      )
+      push(bridge.UpdateAccepted(update.protocol_instance_id))
+    }
+    Error(reason) -> {
+      put(
+        State(
+          ..state,
+          updates: list.filter(state.updates, fn(other) {
+            other.protocol_instance_id != update.protocol_instance_id
+          }),
+        ),
+      )
+      push(bridge.UpdateRejected(
+        update.protocol_instance_id,
+        failure.new(reason) |> failure.with_type("UpdateRejected"),
+      ))
+    }
+  }
+}
+
+/// Take the oldest accepted update with this name, settling queued ones on the way.
+pub fn take_update(name: String) -> Option(PendingUpdate) {
+  case list.find(get().updates, fn(update) { update.name == name }) {
+    Error(Nil) -> None
+    Ok(update) -> {
+      case update.accepted {
+        True -> Nil
+        False -> settle_update(update)
+      }
+      let state = get()
+      case
+        list.find(state.updates, fn(other) {
+          other.protocol_instance_id == update.protocol_instance_id
+        })
+      {
+        // Rejected: look at the next one.
+        Error(Nil) -> take_update(name)
+        Ok(accepted) -> {
+          put(
+            State(
+              ..state,
+              updates: list.filter(state.updates, fn(other) {
+                other.protocol_instance_id != update.protocol_instance_id
+              }),
+            ),
+          )
+          Some(accepted)
+        }
+      }
+    }
+  }
 }
 
 fn answer_query(query: #(String, String, List(Payload))) -> Command {
@@ -285,10 +461,55 @@ fn apply_job(job: bridge.Job) -> Nil {
         Ok(scope) -> cancel_scope(scope, "timed out")
         Error(Nil) -> Nil
       }
+      retry_local_after(seq)
     }
-    bridge.ResolveActivity(seq, result) ->
+    bridge.ResolveActivity(seq, result) -> resolve_activity(seq, result)
+    bridge.DoUpdate(id:, protocol_instance_id:, name:, input:, run_validator:) -> {
+      let update =
+        PendingUpdate(
+          id:,
+          protocol_instance_id:,
+          name:,
+          input:,
+          run_validator:,
+          accepted: False,
+        )
+      put(State(..state, updates: list.append(state.updates, [update])))
+      // An update the workflow already handles is settled at once, like the other SDKs
+      // do. One it does not handle yet waits until the workflow has had a chance to
+      // register for it.
+      case dict.has_key(state.update_checks, name) {
+        True -> settle_update(update)
+        False -> Nil
+      }
+    }
+    bridge.ResolveExternalSignal(seq, outcome) ->
       put(
-        State(..state, activities: dict.insert(state.activities, seq, result)),
+        State(
+          ..state,
+          external_signals: dict.insert(state.external_signals, seq, outcome),
+        ),
+      )
+    bridge.ResolveExternalCancel(seq, outcome) ->
+      put(
+        State(
+          ..state,
+          external_cancels: dict.insert(state.external_cancels, seq, outcome),
+        ),
+      )
+    bridge.ResolveNexusStart(seq, result) ->
+      put(
+        State(
+          ..state,
+          nexus_starts: dict.insert(state.nexus_starts, seq, result),
+        ),
+      )
+    bridge.ResolveNexus(seq, result) ->
+      put(
+        State(
+          ..state,
+          nexus_results: dict.insert(state.nexus_results, seq, result),
+        ),
       )
     bridge.ResolveChildWorkflow(seq, result) ->
       put(State(..state, children: dict.insert(state.children, seq, result)))
@@ -328,11 +549,130 @@ fn apply_job(job: bridge.Job) -> Nil {
         ),
       )
     bridge.RemoveFromCache(..) -> {
-      state.complete(bridge.Success(state.run_id, []))
+      state.complete(bridge.Success(state.run_id, [], state.versioning_behavior))
       bridge.exit_normal()
     }
-    bridge.UnsupportedJob(name) ->
-      fail_task("this SDK does not support the workflow job \"" <> name <> "\"")
+  }
+}
+
+// ---- local activities ----
+
+/// Schedule a local activity under a fresh sequence number, which is returned and names
+/// the activity from then on.
+pub fn start_local(command: fn(Int) -> Command) -> Int {
+  let seq = next_activity()
+  let command = command(seq)
+  push(command)
+  update(fn(state) {
+    State(
+      ..state,
+      locals: dict.insert(state.locals, seq, Local(command, LocalRunning(seq))),
+    )
+  })
+  seq
+}
+
+/// The local activity whose attempt in flight has this sequence number.
+fn local_running(seq: Int) -> Result(#(Int, Local), Nil) {
+  dict.to_list(get().locals)
+  |> list.find(fn(entry) { { entry.1 }.waiting == LocalRunning(seq) })
+}
+
+fn resolve_activity(seq: Int, result: bridge.Resolution) -> Nil {
+  let state = get()
+  case local_running(seq), result {
+    Ok(#(first, local)), bridge.Backoff(attempt, backoff_ms, original) -> {
+      // The next attempt is too far off to wait for inside a workflow task: wait with a
+      // durable timer, then schedule the activity again.
+      let timer = next_timer()
+      push(bridge.StartTimer(timer, int.max(backoff_ms, 1)))
+      update(fn(state) {
+        State(
+          ..state,
+          locals: dict.insert(
+            state.locals,
+            first,
+            Local(..local, waiting: LocalBackingOff(timer, attempt, original)),
+          ),
+        )
+      })
+    }
+    Ok(#(first, _)), _ ->
+      put(
+        State(
+          ..state,
+          locals: dict.delete(state.locals, first),
+          activities: dict.insert(state.activities, first, result),
+        ),
+      )
+    Error(Nil), _ ->
+      put(
+        State(..state, activities: dict.insert(state.activities, seq, result)),
+      )
+  }
+}
+
+/// If `timer` was the backoff of a local activity, schedule its next attempt.
+fn retry_local_after(timer: Int) -> Nil {
+  let waiting =
+    dict.to_list(get().locals)
+    |> list.find(fn(entry) {
+      case { entry.1 }.waiting {
+        LocalBackingOff(timer: found, ..) -> found == timer
+        LocalRunning(_) -> False
+      }
+    })
+  case waiting {
+    Ok(#(first, Local(command, LocalBackingOff(_, attempt, original)))) -> {
+      let seq = next_activity()
+      let command = case command {
+        bridge.ScheduleLocalActivity(..) ->
+          bridge.ScheduleLocalActivity(
+            ..command,
+            seq:,
+            attempt:,
+            original_schedule_time_ms: Some(original),
+          )
+        other -> other
+      }
+      push(command)
+      update(fn(state) {
+        State(
+          ..state,
+          locals: dict.insert(
+            state.locals,
+            first,
+            Local(command, LocalRunning(seq)),
+          ),
+        )
+      })
+    }
+    _ -> Nil
+  }
+}
+
+fn cancel_activity(seq: Int) -> Nil {
+  let state = get()
+  case dict.get(state.locals, seq) {
+    Error(Nil) -> push(bridge.RequestCancelActivity(seq))
+    Ok(Local(waiting: LocalRunning(running), ..)) ->
+      push(bridge.RequestCancelLocalActivity(running))
+    // Between attempts there is nothing running to cancel: stop the timer and settle the
+    // activity as cancelled here.
+    Ok(Local(waiting: LocalBackingOff(timer:, ..), ..)) -> {
+      put(
+        State(
+          ..state,
+          locals: dict.delete(state.locals, seq),
+          activities: dict.insert(
+            state.activities,
+            seq,
+            bridge.Cancelled(failure.cancelled()),
+          ),
+        ),
+      )
+      cancel_timer(timer)
+    }
   }
 }
 
@@ -452,7 +792,9 @@ pub fn cancel_scope(id: Int, reason: String) -> Nil {
         case is_pending(op), op {
           False, _ -> Nil
           True, TimerOp(seq) -> cancel_timer(seq)
-          True, ActivityOp(seq) -> push(bridge.RequestCancelActivity(seq))
+          True, ActivityOp(seq) -> cancel_activity(seq)
+          True, SignalOp(seq) -> push(bridge.CancelSignalExternal(seq))
+          True, NexusOp(seq) -> push(bridge.CancelNexusOperation(seq))
           True, ChildOp(seq) -> push(bridge.CancelChildWorkflow(seq))
           True, ScopeOp(child) -> cancel_scope(child, reason)
         }
@@ -477,6 +819,15 @@ fn is_pending(op: Op) -> Bool {
         True, _ -> False
         False, Ok(bridge.ChildStarted(_)) | False, Error(Nil) -> True
         False, Ok(_) -> False
+      }
+    SignalOp(seq) -> !dict.has_key(state.external_signals, seq)
+    NexusOp(seq) ->
+      case
+        dict.has_key(state.nexus_results, seq),
+        dict.get(state.nexus_starts, seq)
+      {
+        True, _ | False, Ok(bridge.NexusStartFailed(_)) -> False
+        False, _ -> True
       }
     ScopeOp(id) -> dict.has_key(state.scopes, id)
   }
@@ -528,6 +879,24 @@ pub fn next_child() -> Int {
   let state = get()
   put(State(..state, next_child: state.next_child + 1))
   state.next_child
+}
+
+pub fn next_signal() -> Int {
+  let state = get()
+  put(State(..state, next_signal: state.next_signal + 1))
+  state.next_signal
+}
+
+pub fn next_cancel() -> Int {
+  let state = get()
+  put(State(..state, next_cancel: state.next_cancel + 1))
+  state.next_cancel
+}
+
+pub fn next_nexus() -> Int {
+  let state = get()
+  put(State(..state, next_nexus: state.next_nexus + 1))
+  state.next_nexus
 }
 
 /// Take the oldest undelivered signal with this name.

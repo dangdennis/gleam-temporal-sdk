@@ -426,7 +426,12 @@ fn start_options(env: Env) -> client.StartOptions {
 fn assert_replays(handle: client.Handle(output)) -> Nil {
   let assert Ok(history) = client.history(handle)
   let wrapped = list.map(workflows(), workflow.wrap(_, tag_failures))
-  assert replayer.replay_with(wrapped, history, outbound()) == Ok(Nil)
+  assert replayer.replay_with(
+      wrapped,
+      history,
+      replayer.Options(..replayer.options(), outbound: outbound()),
+    )
+    == Ok(Nil)
 }
 
 fn run(

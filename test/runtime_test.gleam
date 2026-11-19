@@ -54,7 +54,8 @@ fn activate(
   jobs: List(bridge.Job),
 ) -> List(bridge.Command) {
   bridge.send_activation(run.0, Activation("run", 1000, False, 3, jobs, False))
-  let assert Ok(bridge.Success("run", commands)) = process.receive(run.1, 1000)
+  let assert Ok(bridge.Success("run", commands, _)) =
+    process.receive(run.1, 1000)
   commands
 }
 
@@ -517,7 +518,7 @@ pub fn info_and_memo_come_from_the_start_event_test() {
       True,
     ),
   )
-  let assert Ok(bridge.Success("run", [bridge.CompleteWorkflow(result)])) =
+  let assert Ok(bridge.Success("run", [bridge.CompleteWorkflow(result)], _)) =
     process.receive(run.1, 1000)
   assert result == int_payload(3)
 }
@@ -666,7 +667,7 @@ pub fn replay_without_the_patch_marker_takes_the_old_path_test() {
   let replay = fn(jobs) {
     let run = start(handler)
     bridge.send_activation(run.0, Activation("run", 1000, True, 3, jobs, False))
-    let assert Ok(bridge.Success("run", commands)) =
+    let assert Ok(bridge.Success("run", commands, _)) =
       process.receive(run.1, 1000)
     commands
   }

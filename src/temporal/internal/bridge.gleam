@@ -48,8 +48,20 @@ pub type Job {
   ResolveChildWorkflow(seq: Int, result: Resolution)
   /// `reason` is core's `EvictionReason` enum value.
   RemoveFromCache(message: String, reason: Int)
-  /// A job this SDK does not implement, such as a workflow update.
-  UnsupportedJob(name: String)
+  /// A client's update. `protocol_instance_id` ties the workflow's answers to it.
+  /// `run_validator` is false on replay, when the update is already known to be accepted.
+  DoUpdate(
+    id: String,
+    protocol_instance_id: String,
+    name: String,
+    input: List(Payload),
+    run_validator: Bool,
+  )
+  /// The outcome of signalling another workflow: `None` is success.
+  ResolveExternalSignal(seq: Int, failure: Option(Failure))
+  ResolveExternalCancel(seq: Int, failure: Option(Failure))
+  ResolveNexusStart(seq: Int, result: NexusStart)
+  ResolveNexus(seq: Int, result: Resolution)
 }
 
 /// How an activity or child workflow ended.
@@ -57,6 +69,17 @@ pub type Resolution {
   Completed(result: Option(Payload))
   Failed(failure: Failure)
   Cancelled(failure: Failure)
+  /// A local activity that must be retried after a timer: core asks for one when the
+  /// wait is too long to spend inside a workflow task.
+  Backoff(attempt: Int, backoff_ms: Int, original_schedule_time_ms: Int)
+}
+
+pub type NexusStart {
+  /// The operation runs on; its result follows in a `ResolveNexus` job.
+  NexusStartedAsync(operation_token: String)
+  /// The operation finished at once; its result follows in the same activation.
+  NexusStartedSync
+  NexusStartFailed(failure: Failure)
 }
 
 pub type ChildStart {
@@ -113,6 +136,53 @@ pub type Command {
     options: ChildStartOptions,
   )
   CancelChildWorkflow(seq: Int)
+  ScheduleLocalActivity(
+    seq: Int,
+    activity_id: String,
+    activity_type: String,
+    /// 1 for a first attempt; the attempt a `Backoff` named when retrying after one.
+    attempt: Int,
+    /// The time a `Backoff` named, when retrying after one.
+    original_schedule_time_ms: Option(Int),
+    arguments: List(Payload),
+    schedule_to_close_ms: Option(Int),
+    schedule_to_start_ms: Option(Int),
+    start_to_close_ms: Option(Int),
+    retry: Option(RetryPolicy),
+    local_retry_threshold_ms: Option(Int),
+    cancellation_type: Int,
+  )
+  RequestCancelLocalActivity(seq: Int)
+  SignalExternal(
+    seq: Int,
+    target: SignalTarget,
+    signal_name: String,
+    input: List(Payload),
+  )
+  CancelSignalExternal(seq: Int)
+  CancelExternal(seq: Int, workflow_id: String, run_id: String, reason: String)
+  UpdateAccepted(protocol_instance_id: String)
+  UpdateRejected(protocol_instance_id: String, failure: Failure)
+  UpdateCompleted(protocol_instance_id: String, result: Payload)
+  ScheduleNexusOperation(
+    seq: Int,
+    endpoint: String,
+    service: String,
+    operation: String,
+    input: Payload,
+    schedule_to_close_ms: Option(Int),
+    /// Core's `NexusOperationCancellationType` value.
+    cancellation_type: Int,
+  )
+  CancelNexusOperation(seq: Int)
+  UpsertSearchAttributes(attributes: Dict(String, Payload))
+  UpsertMemo(memo: Dict(String, Payload))
+}
+
+pub type SignalTarget {
+  /// An empty `run_id` means the workflow's current run.
+  ExternalWorkflow(workflow_id: String, run_id: String)
+  ChildWorkflowTarget(workflow_id: String)
 }
 
 pub type ChildStartOptions {
@@ -133,7 +203,9 @@ pub type ChildStartOptions {
 }
 
 pub type Completion {
-  Success(run_id: String, commands: List(Command))
+  /// `versioning_behavior` is the API's `VersioningBehavior` value; 0 leaves it to the
+  /// worker's default.
+  Success(run_id: String, commands: List(Command), versioning_behavior: Int)
   /// Fails the workflow task, not the workflow: the server retries the task.
   TaskFailure(run_id: String, failure: Failure)
 }
@@ -152,6 +224,7 @@ pub type ActivityTask {
     start_to_close_ms: Option(Int),
     heartbeat_timeout_ms: Option(Int),
     scheduled_time_ms: Int,
+    is_local: Bool,
   )
   ActivityCancel(task_token: BitArray, reason: Int)
 }
@@ -165,8 +238,67 @@ pub type WorkerOptions {
     max_activities_per_second: Option(Float),
     enable_workflows: Bool,
     enable_activities: Bool,
+    enable_nexus: Bool,
+    deployment: Option(Deployment),
   )
 }
+
+pub type Deployment {
+  Deployment(
+    name: String,
+    build_id: String,
+    /// Whether the server routes tasks by deployment version.
+    use_versioning: Bool,
+    /// The API's `VersioningBehavior` value for workflows that do not set their own.
+    default_behavior: Int,
+  )
+}
+
+pub type NexusTask {
+  NexusStartTask(
+    task_token: BitArray,
+    service: String,
+    operation: String,
+    request_id: String,
+    input: Option(Payload),
+    /// Where the service must report an asynchronous operation's result. Empty when the
+    /// caller did not ask for a callback.
+    callback_url: String,
+    callback_headers: Dict(String, String),
+    headers: Dict(String, String),
+  )
+  NexusCancelTask(
+    task_token: BitArray,
+    service: String,
+    operation: String,
+    operation_token: String,
+  )
+  /// The task timed out or the worker is shutting down; it must be acknowledged.
+  NexusTaskCancelled(task_token: BitArray)
+}
+
+pub type NexusResult {
+  NexusSyncSuccess(result: Payload)
+  NexusAsyncSuccess(operation_token: String)
+  /// The operation itself failed or was cancelled: the caller's operation ends.
+  NexusOperationFailed(failure: Failure)
+  /// The handler could not process the request. `error_type` is one of the Nexus error
+  /// types, such as `BAD_REQUEST`, `NOT_FOUND` or `INTERNAL`; the caller retries the
+  /// retryable ones.
+  NexusHandlerFailed(error_type: String, failure: Failure)
+  NexusCancelAcknowledged
+  NexusTaskCancelAcknowledged
+}
+
+@external(erlang, "temporal_ffi", "poll_nexus")
+pub fn poll_nexus(worker: NifWorker) -> Result(NexusTask, PollError)
+
+@external(erlang, "temporal_ffi", "complete_nexus")
+pub fn complete_nexus(
+  worker: NifWorker,
+  task_token: BitArray,
+  result: NexusResult,
+) -> Result(Nil, String)
 
 pub type ActivityResult {
   ActivityCompleted(result: Option(Payload))
@@ -213,7 +345,20 @@ pub type StartRequest {
     start_delay_ms: Option(Int),
     /// Empty for none.
     cron_schedule: String,
+    /// Makes retries of the same start idempotent. Empty for a random one.
+    request_id: String,
+    /// Nexus callbacks to invoke when the workflow closes: `#(url, headers)`.
+    callbacks: List(#(String, Dict(String, String))),
   )
+}
+
+/// How far an update has got: 2 is accepted, 3 is completed (the API's
+/// `UpdateWorkflowExecutionLifecycleStage`).
+pub type UpdateOutcome {
+  UpdateSucceeded(result: List(Payload))
+  UpdateFailed(failure: Failure)
+  /// Accepted but not finished: ask again with `poll_update`.
+  UpdatePending
 }
 
 /// The server's description of a run.
@@ -494,6 +639,26 @@ pub fn fetch_history(
   workflow_id: String,
   run_id: String,
 ) -> Result(BitArray, RpcError)
+
+/// Send an update and wait until it reaches `wait_stage`. `target` is the workflow id, run
+/// id, update id (empty for a generated one) and update name. Answers the run id the
+/// update landed on, the update's id and its outcome so far.
+@external(erlang, "temporal_ffi", "update_workflow")
+pub fn update_workflow(
+  connection: Connection,
+  target: #(String, String, String, String),
+  arguments: List(Payload),
+  wait_stage: Int,
+) -> Result(#(String, String, UpdateOutcome), RpcError)
+
+/// Wait for an update to complete.
+@external(erlang, "temporal_ffi", "poll_update")
+pub fn poll_update(
+  connection: Connection,
+  workflow_id: String,
+  run_id: String,
+  update_id: String,
+) -> Result(UpdateOutcome, RpcError)
 
 @external(erlang, "temporal_ffi", "describe_workflow")
 pub fn describe_workflow(
