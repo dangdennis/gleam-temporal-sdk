@@ -21,8 +21,9 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import support.{type Env, Env, cmd, read_file, unique, write_file}
 import temporal/activity
-import temporal/client.{type Client}
+import temporal/client
 import temporal/codec
 import temporal/encryption
 import temporal/failure.{type Failure}
@@ -30,18 +31,6 @@ import temporal/nexus
 import temporal/replayer
 import temporal/worker
 import temporal/workflow.{type Context}
-
-@external(erlang, "temporal_test_ffi", "read_file")
-fn read_file(path: String) -> Result(BitArray, String)
-
-@external(erlang, "temporal_test_ffi", "write_file")
-fn write_file(path: String, bytes: BitArray) -> Nil
-
-@external(erlang, "temporal_test_ffi", "unique")
-fn unique() -> String
-
-@external(erlang, "temporal_test_ffi", "cmd")
-fn cmd(command: String) -> String
 
 // ---- activities ----
 
@@ -483,10 +472,6 @@ fn check_typescript_history(
   let assert Error(replayer.Nondeterminism(_)) =
     replayer.replay_with(diverging_workflows(), history, replay_options(codec))
   Nil
-}
-
-type Env {
-  Env(client: Client, task_queue: String)
 }
 
 /// Step 3: run the Gleam twin on a real server in both cache modes, replay its history,

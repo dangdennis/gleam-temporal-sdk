@@ -25,6 +25,7 @@ pub type ChildCall {
   )
 }
 
+/// The outbound middleware of a worker.
 pub type Outbound {
   Outbound(
     activity: fn(ActivityCall) -> ActivityCall,

@@ -14,6 +14,7 @@ import temporal/internal/poller
 import temporal/middleware.{type Outbound}
 import temporal/workflow
 
+/// Why a history did not replay.
 pub type ReplayError {
   /// The code issued different commands than the history records.
   Nondeterminism(message: String)
@@ -31,10 +32,13 @@ pub type Options {
   Options(outbound: Outbound, codec: Option(PayloadCodec))
 }
 
+/// No outbound middleware and no codec.
 pub fn options() -> Options {
   Options(outbound: middleware.none(), codec: None)
 }
 
+/// Run the workflow code against a recorded history. `Ok` means the code issues the
+/// commands the history records, so runs started on the old code can continue on the new.
 pub fn replay(
   workflows: List(workflow.Handler),
   history: History,

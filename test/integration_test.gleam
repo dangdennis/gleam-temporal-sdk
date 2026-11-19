@@ -10,19 +10,14 @@ import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
+import support.{type Env, cmd, start_options, unique}
 import temporal/activity
-import temporal/client.{type Client}
+import temporal/client
 import temporal/codec
 import temporal/failure.{type Failure}
 import temporal/replayer
 import temporal/worker
 import temporal/workflow.{type Context}
-
-@external(erlang, "temporal_test_ffi", "unique")
-fn unique() -> String
-
-@external(erlang, "temporal_test_ffi", "cmd")
-fn cmd(command: String) -> String
 
 // ---- activities ----
 
@@ -249,33 +244,6 @@ fn workflows() -> List(workflow.Handler) {
 
 // ---- harness ----
 
-type Env {
-  Env(client: Client, task_queue: String)
-}
-
-/// Run `scenario` against a fresh worker on its own task queue, in both cache modes.
-fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
-  let assert Ok(client) = client.connect(client.local())
-  list.each([1000, 0], fn(max_cached) {
-    let task_queue = name <> "-" <> int.to_string(max_cached) <> "-" <> unique()
-    let assert Ok(worker) =
-      worker.new(client, task_queue)
-      |> worker.with_workflows(workflows())
-      |> worker.with_activities(activities())
-      |> worker.with_max_cached_workflows(max_cached)
-      |> worker.start
-    scenario(Env(client, task_queue))
-    worker.stop(worker)
-  })
-}
-
-fn start_options(env: Env) -> client.StartOptions {
-  client.start_options(
-    workflow_id: env.task_queue <> "-" <> unique(),
-    task_queue: env.task_queue,
-  )
-}
-
 /// Start a workflow, wait for it, and check that its history replays cleanly.
 fn run(
   env: Env,
@@ -467,4 +435,12 @@ pub fn replay_detects_reordered_commands_test() {
   assert replayer.replay([original], history) == Ok(Nil)
   let assert Error(replayer.Nondeterminism(_)) =
     replayer.replay([changed], history)
+}
+
+/// Run `scenario` against a fresh worker in both cache modes.
+fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
+  use config <- support.in_both_modes(name, support.local_client(), _, scenario)
+  config
+  |> worker.with_workflows(workflows())
+  |> worker.with_activities(activities())
 }

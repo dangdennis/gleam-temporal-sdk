@@ -96,6 +96,8 @@ pub type Action {
   )
 }
 
+/// A timetable, the workflow it starts, and how it behaves. Build with `new` and change
+/// what differs.
 pub type Schedule {
   Schedule(
     spec: Spec,
@@ -126,10 +128,12 @@ pub type Description {
   )
 }
 
+/// One time the schedule started its workflow.
 pub type RecentAction {
   RecentAction(scheduled_time_ms: Int, workflow_id: String)
 }
 
+/// A schedule as it appears in a listing.
 pub type Summary {
   Summary(
     schedule_id: String,
@@ -141,10 +145,10 @@ pub type Summary {
 
 // ---- building ----
 
-/// A spec that fires every `ms`, aligned to the Unix epoch.
-pub fn every(ms ms: Int) -> Spec {
+/// A spec that never fires, to build on.
+fn empty() -> Spec {
   Spec(
-    intervals: [Interval(every_ms: ms, offset_ms: 0)],
+    intervals: [],
     calendars: [],
     cron_expressions: [],
     timezone: None,
@@ -152,22 +156,29 @@ pub fn every(ms ms: Int) -> Spec {
   )
 }
 
+/// A spec that fires every `ms`, aligned to the Unix epoch.
+pub fn every(ms ms: Int) -> Spec {
+  every_offset(ms:, offset_ms: 0)
+}
+
 /// A spec that fires every `ms`, `offset_ms` after the epoch-aligned times. Give schedules
 /// with the same interval different offsets so they do not all fire together.
 pub fn every_offset(ms ms: Int, offset_ms offset_ms: Int) -> Spec {
-  Spec(..every(ms:), intervals: [Interval(every_ms: ms, offset_ms:)])
+  Spec(..empty(), intervals: [Interval(every_ms: ms, offset_ms:)])
 }
 
 /// A spec that fires when the calendar matches.
 pub fn on(calendar: Calendar) -> Spec {
-  Spec(..every(ms: 0), intervals: [], calendars: [calendar])
+  Spec(..empty(), calendars: [calendar])
 }
 
 /// A spec from a cron expression.
 pub fn cron(expression: String) -> Spec {
-  Spec(..every(ms: 0), intervals: [], cron_expressions: [expression])
+  Spec(..empty(), cron_expressions: [expression])
 }
 
+/// Interpret the spec's calendars and cron expressions in an IANA time zone, such as
+/// `Europe/Lisbon`.
 pub fn in_timezone(spec: Spec, timezone: String) -> Spec {
   Spec(..spec, timezone: option.Some(timezone))
 }
@@ -187,10 +198,12 @@ pub fn daily() -> Calendar {
   )
 }
 
+/// The single value `value`.
 pub fn exactly(value: Int) -> List(Range) {
   [Range(value, value, 1)]
 }
 
+/// Every value from `start` to `end`, inclusive.
 pub fn between(start: Int, end: Int) -> List(Range) {
   [Range(start, end, 1)]
 }
@@ -249,15 +262,7 @@ fn from_request(request: bridge.StartRequest) -> Action {
     execution_timeout_ms: request.execution_timeout_ms,
     run_timeout_ms: request.run_timeout_ms,
     task_timeout_ms: request.task_timeout_ms,
-    retry: option.map(request.retry, fn(retry) {
-      workflow.RetryPolicy(
-        initial_interval_ms: retry.initial_interval_ms,
-        backoff_coefficient: retry.backoff_coefficient,
-        maximum_interval_ms: retry.maximum_interval_ms,
-        maximum_attempts: retry.maximum_attempts,
-        non_retryable_error_types: retry.non_retryable_error_types,
-      )
-    }),
+    retry: option.map(request.retry, workflow.from_bridge_retry),
     memo: request.memo,
     search_attributes: request.search_attributes,
   )
@@ -274,15 +279,7 @@ fn to_request(action: Action) -> bridge.StartRequest {
     execution_timeout_ms: action.execution_timeout_ms,
     run_timeout_ms: action.run_timeout_ms,
     task_timeout_ms: action.task_timeout_ms,
-    retry: option.map(action.retry, fn(retry) {
-      bridge.RetryPolicy(
-        initial_interval_ms: retry.initial_interval_ms,
-        backoff_coefficient: retry.backoff_coefficient,
-        maximum_interval_ms: retry.maximum_interval_ms,
-        maximum_attempts: retry.maximum_attempts,
-        non_retryable_error_types: retry.non_retryable_error_types,
-      )
-    }),
+    retry: option.map(action.retry, workflow.to_bridge_retry),
     memo: action.memo,
     search_attributes: action.search_attributes,
     start_delay_ms: None,
@@ -402,6 +399,7 @@ pub fn create(
   |> result.map_error(client.request_error)
 }
 
+/// The schedule as the server has it, with what it has done and what is due next.
 pub fn describe(
   client: Client,
   schedule_id: String,
@@ -443,6 +441,7 @@ pub fn update(
   |> result.map_error(client.request_error)
 }
 
+/// Delete the schedule. Workflows it has already started carry on.
 pub fn delete(client: Client, schedule_id: String) -> Result(Nil, Error) {
   bridge.schedule_delete(client.connection(client), schedule_id)
   |> result.map_error(client.request_error)
@@ -466,6 +465,7 @@ pub fn pause(
   patch(client, schedule_id, bridge.Pause(note))
 }
 
+/// Resume taking actions. `note` replaces the schedule's note.
 pub fn unpause(
   client: Client,
   schedule_id: String,

@@ -9,8 +9,9 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import support.{type Env, eventually, record, recorded, start_options, unique}
 import temporal/activity
-import temporal/client.{type Client}
+import temporal/client
 import temporal/codec
 import temporal/failure.{type Failure}
 import temporal/middleware
@@ -18,18 +19,6 @@ import temporal/replayer
 import temporal/search_attributes
 import temporal/worker
 import temporal/workflow.{type Context}
-
-@external(erlang, "temporal_test_ffi", "unique")
-fn unique() -> String
-
-@external(erlang, "temporal_test_ffi", "cmd")
-fn cmd(command: String) -> String
-
-@external(erlang, "temporal_test_ffi", "record")
-fn record(key: String, value: String) -> Nil
-
-@external(erlang, "temporal_test_ffi", "recorded")
-fn recorded(key: String) -> String
 
 // ---- activities ----
 
@@ -392,37 +381,6 @@ fn count_activities(ctx: activity.Context, next) {
 
 // ---- harness ----
 
-type Env {
-  Env(client: Client, task_queue: String)
-}
-
-fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
-  let assert Ok(client) = client.connect(client.local())
-  list.each([1000, 0], fn(max_cached) {
-    let task_queue = name <> "-" <> int.to_string(max_cached) <> "-" <> unique()
-    let assert Ok(worker) =
-      worker.new(client, task_queue)
-      |> worker.with_workflows(workflows())
-      |> worker.with_activities(activities())
-      |> worker.with_max_cached_workflows(max_cached)
-      |> worker.with_max_concurrent_activities(20)
-      |> worker.with_max_activities_per_second(500.0)
-      |> worker.with_workflow_middleware(tag_failures)
-      |> worker.with_activity_middleware(count_activities)
-      |> worker.with_outbound_activity(outbound().activity)
-      |> worker.start
-    scenario(Env(client, task_queue))
-    worker.stop(worker)
-  })
-}
-
-fn start_options(env: Env) -> client.StartOptions {
-  client.start_options(
-    workflow_id: env.task_queue <> "-" <> unique(),
-    task_queue: env.task_queue,
-  )
-}
-
 fn assert_replays(handle: client.Handle(output)) -> Nil {
   let assert Ok(history) = client.history(handle)
   let wrapped = list.map(workflows(), workflow.wrap(_, tag_failures))
@@ -624,11 +582,7 @@ pub fn requests_about_a_missing_workflow_are_not_found_test() {
 pub fn workflows_can_be_listed_and_counted_test() {
   let assert Ok(client) = client.connect(client.local())
   let task_queue = "listing-" <> unique()
-  // Custom search attributes must be registered before use. Registering again is harmless.
-  let _ =
-    cmd(
-      "temporal operator search-attribute create --name GleamTestKeyword --type Keyword 2>&1",
-    )
+  let attribute = support.register_search_attribute()
   let assert Ok(worker) =
     worker.new(client, task_queue)
     |> worker.with_workflows(workflows())
@@ -645,7 +599,7 @@ pub fn workflows_can_be_listed_and_counted_test() {
             task_queue:,
           )
             |> client.with_search_attribute(
-              "GleamTestKeyword",
+              attribute,
               search_attributes.Keyword(task_queue),
             ),
         )
@@ -655,24 +609,11 @@ pub fn workflows_can_be_listed_and_counted_test() {
     assert client.result(handle) == Ok("nobody nudged")
   })
   worker.stop(worker)
-  let query = "GleamTestKeyword = \"" <> task_queue <> "\""
+  let query = attribute <> " = \"" <> task_queue <> "\""
   assert eventually(fn() { client.count(client, query) == Ok(3) })
   let assert Ok(found) = client.list(client, query, limit: 2)
   assert list.length(found) == 2
   assert list.all(found, fn(run) { run.status == client.Completed })
-}
-
-/// Poll for something the visibility store reports with a delay.
-fn eventually(check: fn() -> Bool) -> Bool {
-  list.any(list.repeat(Nil, 50), fn(_) {
-    case check() {
-      True -> True
-      False -> {
-        process.sleep(100)
-        False
-      }
-    }
-  })
 }
 
 // ---- middleware and workers ----
@@ -719,4 +660,18 @@ pub fn workflows_and_activities_can_run_on_separate_workers_test() {
     == Ok("describe_self/introspecting/1/1/Some(30000)/False")
   worker.stop(workflow_worker)
   worker.stop(activity_worker)
+}
+
+/// Run `scenario` against a fresh worker in both cache modes, with every kind of
+/// middleware installed.
+fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
+  use config <- support.in_both_modes(name, support.local_client(), _, scenario)
+  config
+  |> worker.with_workflows(workflows())
+  |> worker.with_activities(activities())
+  |> worker.with_max_concurrent_activities(20)
+  |> worker.with_max_activities_per_second(500.0)
+  |> worker.with_workflow_middleware(tag_failures)
+  |> worker.with_activity_middleware(count_activities)
+  |> worker.with_outbound_activity(outbound().activity)
 }

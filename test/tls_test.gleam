@@ -4,20 +4,12 @@
 import gleam/int
 import gleam/option.{None, Some}
 import gleam/string
+import support.{cmd, read_file, unique}
 import temporal/activity
 import temporal/client
 import temporal/codec
 import temporal/worker
 import temporal/workflow
-
-@external(erlang, "temporal_test_ffi", "unique")
-fn unique() -> String
-
-@external(erlang, "temporal_test_ffi", "cmd")
-fn cmd(command: String) -> String
-
-@external(erlang, "temporal_test_ffi", "read_file")
-fn read_file(path: String) -> Result(BitArray, String)
 
 @external(erlang, "temporal_test_ffi", "tls_proxy")
 fn tls_proxy(certificate_directory: String, upstream_port: Int) -> Int

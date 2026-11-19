@@ -45,10 +45,14 @@ pub type Definition(input, output) {
   Definition(name: String, input: Codec(input), output: Codec(output))
 }
 
+/// A signal's name and the codec for its value. A signal is a one-way message to a running
+/// workflow.
 pub type SignalDefinition(a) {
   SignalDefinition(name: String, codec: Codec(a))
 }
 
+/// A query's name and the codecs for its argument and result. A query reads a workflow's
+/// state without changing it.
 pub type QueryDefinition(argument, result) {
   QueryDefinition(
     name: String,
@@ -104,12 +108,15 @@ pub opaque type Future(a) {
   Future(poll: fn() -> Option(a))
 }
 
+/// What a workflow knows about its own run.
 pub type Info {
   Info(
     workflow_id: String,
+    /// Changes with every run: after continue-as-new and after a retry.
     run_id: String,
     workflow_type: String,
     task_queue: String,
+    /// Starts at 1 and grows each time the workflow is retried.
     attempt: Int,
     /// The first run of the chain this run belongs to: the same across continue-as-new.
     first_execution_run_id: String,
@@ -122,13 +129,19 @@ pub type Info {
   )
 }
 
+/// How failures are retried. The wait before attempt `n` is `initial_interval_ms` times
+/// `backoff_coefficient` to the power `n - 1`, capped at `maximum_interval_ms`.
 pub type RetryPolicy {
   RetryPolicy(
+    /// The wait before the second attempt.
     initial_interval_ms: Int,
+    /// What the wait is multiplied by after each attempt.
     backoff_coefficient: Float,
+    /// The longest wait. `None` is one hundred times the initial interval.
     maximum_interval_ms: Option(Int),
     /// Zero means unlimited.
     maximum_attempts: Int,
+    /// Failures whose `error_type` is listed here are not retried.
     non_retryable_error_types: List(String),
   )
 }
@@ -143,6 +156,7 @@ pub type ActivityCancellation {
   AbandonActivity
 }
 
+/// How an activity is run. Build with `activity_options` and change what differs.
 pub type ActivityOptions {
   ActivityOptions(
     /// Longest a single attempt may run.
@@ -151,11 +165,14 @@ pub type ActivityOptions {
     schedule_to_close_ms: Option(Int),
     /// Longest the activity may wait for a worker to pick it up.
     schedule_to_start_ms: Option(Int),
+    /// The longest gap between heartbeats before the attempt is failed. `None` never fails
+    /// an attempt for silence.
     heartbeat_timeout_ms: Option(Int),
     /// `None` uses the server's default policy, which retries without limit.
     retry: Option(RetryPolicy),
     /// `None` runs the activity on the workflow's own task queue.
     task_queue: Option(String),
+    /// What cancelling the activity's scope does.
     cancellation: ActivityCancellation,
   )
 }
@@ -166,6 +183,7 @@ pub type ParentClosePolicy {
   TerminateChild
   /// The child carries on.
   AbandonChild
+  /// The child is asked to cancel.
   RequestCancelChild
 }
 
@@ -175,6 +193,7 @@ pub type IdReusePolicy {
   AllowDuplicate
   /// Only if the last run did not complete successfully.
   AllowDuplicateFailedOnly
+  /// Never.
   RejectDuplicate
 }
 
@@ -190,8 +209,10 @@ pub type ChildCancellation {
   AbandonChildCancellation
 }
 
+/// How a child workflow is run. Build with `child_options` and change what differs.
 pub type ChildOptions {
   ChildOptions(
+    /// No two open workflows in a namespace share an id.
     workflow_id: String,
     /// `None` runs the child on the parent's task queue.
     task_queue: Option(String),
@@ -201,10 +222,12 @@ pub type ChildOptions {
     execution_timeout_ms: Option(Int),
     /// Longest a single run of the child may take.
     run_timeout_ms: Option(Int),
+    /// Longest one workflow task may take. `None` is ten seconds.
     task_timeout_ms: Option(Int),
     /// `None` does not retry a failed child.
     retry: Option(RetryPolicy),
     memo: Dict(String, Payload),
+    /// What cancelling the child's scope does.
     cancellation: ChildCancellation,
   )
 }
@@ -245,6 +268,7 @@ pub fn wrap(handler: Handler, middleware: Middleware) -> Handler {
   })
 }
 
+/// The run's identity and how far it has got.
 pub fn info(_ctx: Context) -> Info {
   let state = runtime.get()
   Info(
@@ -347,14 +371,17 @@ pub fn log_debug(_ctx: Context, message: String) -> Nil {
   log(bridge.Debug, message)
 }
 
+/// Log at info level. See `log_debug`.
 pub fn log_info(_ctx: Context, message: String) -> Nil {
   log(bridge.Info, message)
 }
 
+/// Log at warning level. See `log_debug`.
 pub fn log_warning(_ctx: Context, message: String) -> Nil {
   log(bridge.Warning, message)
 }
 
+/// Log at error level. See `log_debug`.
 pub fn log_error(_ctx: Context, message: String) -> Nil {
   log(bridge.Error, message)
 }
@@ -372,6 +399,7 @@ pub fn await(future: Future(a)) -> a {
   }
 }
 
+/// A future of `transform` applied to the value of `future`.
 pub fn map(future: Future(a), with transform: fn(a) -> b) -> Future(b) {
   Future(fn() { option.map(future.poll(), transform) })
 }
@@ -503,6 +531,7 @@ pub fn cancel(ctx: Context) -> Nil {
   runtime.cancel_scope(ctx.scope, "cancelled by workflow code")
 }
 
+/// Whether the context has been cancelled.
 pub fn is_cancelled(ctx: Context) -> Bool {
   option.is_some(runtime.scope_cancelled(ctx.scope))
 }
@@ -542,6 +571,8 @@ pub fn timer(ctx: Context, ms: Int) -> Future(Result(Nil, Failure)) {
   }
 }
 
+/// Wait `ms` with a durable timer. Fails with a cancellation if the context is cancelled
+/// first.
 pub fn sleep(ctx: Context, ms: Int) -> Result(Nil, Failure) {
   await(timer(ctx, ms))
 }
@@ -563,6 +594,7 @@ pub fn activity_options(
   )
 }
 
+/// Set the retry policy.
 pub fn with_retry(
   options: ActivityOptions,
   retry: RetryPolicy,
@@ -582,8 +614,20 @@ pub fn retry_policy(maximum_attempts maximum_attempts: Int) -> RetryPolicy {
   )
 }
 
-fn bridge_retry(retry: RetryPolicy) -> bridge.RetryPolicy {
+@internal
+pub fn to_bridge_retry(retry: RetryPolicy) -> bridge.RetryPolicy {
   bridge.RetryPolicy(
+    initial_interval_ms: retry.initial_interval_ms,
+    backoff_coefficient: retry.backoff_coefficient,
+    maximum_interval_ms: retry.maximum_interval_ms,
+    maximum_attempts: retry.maximum_attempts,
+    non_retryable_error_types: retry.non_retryable_error_types,
+  )
+}
+
+@internal
+pub fn from_bridge_retry(retry: bridge.RetryPolicy) -> RetryPolicy {
+  RetryPolicy(
     initial_interval_ms: retry.initial_interval_ms,
     backoff_coefficient: retry.backoff_coefficient,
     maximum_interval_ms: retry.maximum_interval_ms,
@@ -623,7 +667,7 @@ pub fn start_activity(
           schedule_to_close_ms: options.schedule_to_close_ms,
           start_to_close_ms: Some(options.start_to_close_ms),
           heartbeat_timeout_ms: options.heartbeat_timeout_ms,
-          retry: option.map(options.retry, bridge_retry),
+          retry: option.map(options.retry, to_bridge_retry),
           schedule_to_start_ms: options.schedule_to_start_ms,
           cancellation_type: case options.cancellation {
             TryCancel -> 0
@@ -737,7 +781,7 @@ pub fn start_child(
             AllowDuplicateFailedOnly -> 2
             RejectDuplicate -> 3
           },
-          retry: option.map(options.retry, bridge_retry),
+          retry: option.map(options.retry, to_bridge_retry),
           memo: options.memo,
           search_attributes: dict.new(),
           cancellation_type: case options.cancellation {
@@ -788,10 +832,12 @@ pub fn child_result(child: Child(output)) -> Future(Result(output, Failure)) {
   child.result
 }
 
+/// The child's workflow id.
 pub fn child_workflow_id(child: Child(output)) -> String {
   child.workflow_id
 }
 
+/// The id of the child's first run.
 pub fn child_run_id(child: Child(output)) -> String {
   child.run_id
 }
@@ -897,6 +943,8 @@ pub fn deprecate_patch(_ctx: Context, patch_id: String) -> Nil {
 
 // ---- local activities ----
 
+/// How a local activity is run. Build with `local_activity_options` and change what
+/// differs.
 pub type LocalActivityOptions {
   LocalActivityOptions(
     /// Longest a single attempt may run.
@@ -909,10 +957,12 @@ pub type LocalActivityOptions {
     /// task: the workflow starts a durable timer and tries again when it fires. `None`
     /// uses core's default of one minute.
     local_retry_threshold_ms: Option(Int),
+    /// What cancelling the activity's scope does.
     cancellation: ActivityCancellation,
   )
 }
 
+/// Options with only the per-attempt timeout set, and default retries.
 pub fn local_activity_options(
   start_to_close_ms start_to_close_ms: Int,
 ) -> LocalActivityOptions {
@@ -961,7 +1011,7 @@ pub fn start_local_activity(
             schedule_to_close_ms: options.schedule_to_close_ms,
             schedule_to_start_ms: None,
             start_to_close_ms: Some(options.start_to_close_ms),
-            retry: option.map(options.retry, bridge_retry),
+            retry: option.map(options.retry, to_bridge_retry),
             local_retry_threshold_ms: options.local_retry_threshold_ms,
             cancellation_type: case options.cancellation {
               TryCancel -> 0
@@ -979,6 +1029,7 @@ pub fn start_local_activity(
   }
 }
 
+/// Run a local activity and wait for its result. See `start_local_activity`.
 pub fn execute_local_activity(
   ctx: Context,
   definition: activity.Definition(input, output),
@@ -1088,6 +1139,7 @@ pub fn try_receive_update(
   update(ctx, definition).poll()
 }
 
+/// The value the client sent with the update.
 pub fn update_argument(update: Update(argument, result)) -> argument {
   update.argument
 }
@@ -1206,14 +1258,17 @@ pub type NexusCancellation {
   AbandonNexus
 }
 
+/// How a Nexus operation is run. Build with `nexus_options` and change what differs.
 pub type NexusOptions {
   NexusOptions(
     /// Longest the operation may take, retries included. `None` leaves it to the server.
     schedule_to_close_ms: Option(Int),
+    /// What cancelling the operation's scope does.
     cancellation: NexusCancellation,
   )
 }
 
+/// No deadline of its own; cancellation waits for the operation to end.
 pub fn nexus_options() -> NexusOptions {
   NexusOptions(schedule_to_close_ms: None, cancellation: WaitNexusCancelled)
 }
@@ -1278,6 +1333,7 @@ pub fn start_nexus_operation(
   }
 }
 
+/// The operation's result, once it finishes.
 pub fn nexus_result(
   handle: NexusHandle(output),
 ) -> Future(Result(output, Failure)) {

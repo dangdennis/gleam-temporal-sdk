@@ -11,6 +11,7 @@ import temporal/internal/transcode
 import temporal/search_attributes
 import temporal/workflow
 
+/// A connection to one namespace of a Temporal service. Safe to share between processes.
 pub opaque type Client {
   Client(
     connection: bridge.Connection,
@@ -19,6 +20,7 @@ pub opaque type Client {
   )
 }
 
+/// How to reach the service. Start from `local()` or `cloud(..)` and change what differs.
 pub type Options {
   Options(
     /// The frontend address, such as `http://localhost:7233`.
@@ -26,6 +28,7 @@ pub type Options {
     namespace: String,
     /// Recorded in history as the author of this client's requests.
     identity: String,
+    /// Sent with every request. Needs `tls`.
     api_key: Option(String),
     /// `None` connects without TLS.
     tls: Option(Tls),
@@ -35,6 +38,7 @@ pub type Options {
   )
 }
 
+/// TLS settings. All `None` means TLS with the system's root certificates.
 pub type Tls {
   Tls(
     /// PEM root certificate to trust instead of the system's.
@@ -62,34 +66,44 @@ pub type IdConflictPolicy {
   FailIfRunning
   /// Return a handle to the running workflow instead of starting one.
   UseExisting
+  /// Terminate the running workflow and start a new one.
   TerminateExisting
 }
 
+/// How a workflow is started. Build with `start_options` and change what differs.
 pub type StartOptions {
   StartOptions(
+    /// The workflow's identity. No two open workflows in a namespace share an id.
     workflow_id: String,
     task_queue: String,
+    /// Whether an id may be used again once its workflow has closed.
     id_reuse_policy: workflow.IdReusePolicy,
+    /// What to do if a workflow with the id is still running.
     id_conflict_policy: IdConflictPolicy,
     /// Longest the workflow may take across retries and continue-as-new.
     execution_timeout_ms: Option(Int),
     /// Longest a single run may take.
     run_timeout_ms: Option(Int),
+    /// Longest one workflow task may take. `None` is ten seconds.
     task_timeout_ms: Option(Int),
     /// `None` does not retry a failed workflow.
     retry: Option(workflow.RetryPolicy),
     /// Unindexed data readable by the workflow and by `describe`.
     memo: Dict(String, Payload),
+    /// Indexed values, for finding the workflow with `list`.
     search_attributes: Dict(String, search_attributes.Value),
     /// Wait this long before the first workflow task.
     start_delay_ms: Option(Int),
+    /// Run again on this cron timetable. Prefer `temporal/schedule`.
     cron_schedule: Option(String),
   )
 }
 
+/// Why a workflow could not be started.
 pub type StartError {
   /// A workflow with this id is already running, or its id may not be reused.
   AlreadyStarted
+  /// Anything else, with the server's message.
   StartFailed(message: String)
 }
 
@@ -109,14 +123,19 @@ pub type Error {
 
 /// Why a workflow did not produce a result.
 pub type WorkflowError {
+  /// The workflow returned a failure.
   Failed(failure: Failure)
+  /// The workflow accepted a request to cancel.
   Cancelled
+  /// The workflow was terminated from outside.
   Terminated
+  /// A run or execution timeout passed.
   TimedOut
   /// The result could not be fetched or decoded.
   ClientError(message: String)
 }
 
+/// Where a run is in its life.
 pub type Status {
   Running
   Completed
@@ -125,6 +144,7 @@ pub type Status {
   WorkflowTerminated
   ContinuedAsNew
   WorkflowTimedOut
+  /// A status this SDK does not know.
   UnknownStatus
 }
 
@@ -136,12 +156,15 @@ pub type Description {
     workflow_type: String,
     task_queue: String,
     status: Status,
+    /// Milliseconds since the Unix epoch.
     start_time_ms: Int,
+    /// `None` while the run is open.
     close_time_ms: Option(Int),
     history_length: Int,
     memo: Dict(String, Payload),
     /// The raw payloads; their `data` is JSON.
     search_attributes: Dict(String, Payload),
+    /// `None` unless the run was started as a child.
     parent_workflow_id: Option(String),
   )
 }
@@ -181,6 +204,7 @@ pub fn cloud(
   )
 }
 
+/// Connect to the service. Fails if it cannot be reached or refuses the credentials.
 pub fn connect(options: Options) -> Result(Client, String) {
   bridge.connect(
     options.target,
@@ -194,15 +218,18 @@ pub fn connect(options: Options) -> Result(Client, String) {
   |> result.map(Client(_, options.codec, options.namespace))
 }
 
+/// The codec workers started with this client apply.
 @internal
 pub fn payload_codec(client: Client) -> Option(PayloadCodec) {
   client.codec
 }
 
+/// The namespace the client is connected to.
 pub fn namespace(client: Client) -> String {
   client.namespace
 }
 
+/// The connection workers started with this client poll through.
 @internal
 pub fn connection(client: Client) -> bridge.Connection {
   client.connection
@@ -243,6 +270,7 @@ pub fn with_memo(
   )
 }
 
+/// Add a search attribute. Custom attributes must be registered on the namespace first.
 pub fn with_search_attribute(
   options: StartOptions,
   name: String,
@@ -254,6 +282,7 @@ pub fn with_search_attribute(
   )
 }
 
+/// The start request for a workflow type and its options, before the codec is applied.
 @internal
 pub fn start_request(
   workflow_type: String,
@@ -278,15 +307,7 @@ pub fn start_request(
     execution_timeout_ms: options.execution_timeout_ms,
     run_timeout_ms: options.run_timeout_ms,
     task_timeout_ms: options.task_timeout_ms,
-    retry: option.map(options.retry, fn(retry) {
-      bridge.RetryPolicy(
-        initial_interval_ms: retry.initial_interval_ms,
-        backoff_coefficient: retry.backoff_coefficient,
-        maximum_interval_ms: retry.maximum_interval_ms,
-        maximum_attempts: retry.maximum_attempts,
-        non_retryable_error_types: retry.non_retryable_error_types,
-      )
-    }),
+    retry: option.map(options.retry, workflow.to_bridge_retry),
     memo: options.memo,
     search_attributes: search_attributes.encode(options.search_attributes),
     start_delay_ms: options.start_delay_ms,
@@ -370,6 +391,7 @@ fn start_with(
   }
 }
 
+/// Start a workflow and return a handle to the run. Does not wait for it to finish.
 pub fn start(
   client: Client,
   definition: workflow.Definition(input, output),
@@ -407,6 +429,7 @@ pub fn handle(
   Handle(client, workflow_id, "", definition.output)
 }
 
+/// The id of the workflow the handle refers to.
 pub fn workflow_id(handle: Handle(output)) -> String {
   handle.workflow_id
 }
@@ -456,6 +479,7 @@ pub fn execute(
   }
 }
 
+/// A failed request as the error callers see.
 @internal
 pub fn request_error(error: bridge.RpcError) -> Error {
   case error {
@@ -466,6 +490,8 @@ pub fn request_error(error: bridge.RpcError) -> Error {
   }
 }
 
+/// Send a signal. Returns once the server has recorded it, not once the workflow has
+/// acted on it.
 pub fn signal(
   handle: Handle(output),
   definition: workflow.SignalDefinition(a),
@@ -481,6 +507,8 @@ pub fn signal(
   |> result.map_error(request_error)
 }
 
+/// Ask the workflow for a value without changing it. Works on finished workflows too,
+/// as long as a worker for them is running.
 pub fn query(
   handle: Handle(output),
   definition: workflow.QueryDefinition(argument, result),
@@ -568,6 +596,7 @@ fn description(client: Client, execution: bridge.Execution) -> Description {
   )
 }
 
+/// What the server knows about the run: its status, times, memo and search attributes.
 pub fn describe(handle: Handle(output)) -> Result(Description, Error) {
   bridge.describe_workflow(
     handle.client.connection,
@@ -696,6 +725,7 @@ pub fn start_update_with_id(
   send_update(handle, definition, argument, update_id, accepted)
 }
 
+/// The id of the update: the one given to `start_update_with_id`, or a generated one.
 pub fn update_id(update: UpdateHandle(result)) -> String {
   update.update_id
 }

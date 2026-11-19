@@ -1,7 +1,7 @@
-//// End-to-end tests of payload codecs, updates, signalling and cancelling other workflows,
-//// local activities, Nexus operations and worker versioning, against a real Temporal
-//// service. Workflow scenarios run with and without the workflow cache and their histories
-//// are replayed.
+//// End-to-end tests of what the conformance suite does not reach: the update client,
+//// cancelling a local activity, memo changes as the server sees them, encryption and key
+//// rotation, Nexus results and failures, worker versioning, and losing a worker. Workflow
+//// scenarios run with and without the workflow cache and their histories are replayed.
 
 import gleam/bit_array
 import gleam/dict
@@ -11,6 +11,9 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import support.{
+  type Env, cmd, eventually, read_file, start_options, unique, write_file,
+}
 import temporal/activity
 import temporal/client.{type Client}
 import temporal/codec
@@ -20,12 +23,6 @@ import temporal/nexus
 import temporal/replayer
 import temporal/worker
 import temporal/workflow.{type Context}
-
-@external(erlang, "temporal_test_ffi", "unique")
-fn unique() -> String
-
-@external(erlang, "temporal_test_ffi", "cmd")
-fn cmd(command: String) -> String
 
 // ---- activities ----
 
@@ -140,88 +137,7 @@ fn listener_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   }
 }
 
-fn messenger() {
-  workflow.Definition("messenger", codec.string(), codec.string())
-}
-
-/// Signals one workflow, cancels another, and reports what happened with a third that does
-/// not exist. Its input is the prefix of the three workflow ids.
-fn messenger_workflow(ctx: Context, prefix: String) -> Result(String, Failure) {
-  use _ <- result.try(
-    workflow.await(workflow.signal_external(
-      ctx,
-      prefix <> "-signalled",
-      poke(),
-      "hello",
-    )),
-  )
-  use _ <- result.try(
-    workflow.await(workflow.cancel_external(ctx, prefix <> "-cancelled")),
-  )
-  let missing =
-    workflow.await(workflow.signal_external(
-      ctx,
-      prefix <> "-missing",
-      poke(),
-      "anyone?",
-    ))
-  Ok("missing workflow: " <> string.inspect(result.is_error(missing)))
-}
-
-fn nanny() {
-  workflow.Definition("nanny", codec.string(), codec.string())
-}
-
-/// Starts a child and signals it.
-fn nanny_workflow(ctx: Context, child_id: String) -> Result(String, Failure) {
-  use child <- result.try(workflow.start_child(
-    ctx,
-    listener(),
-    Nil,
-    workflow.child_options(workflow_id: child_id),
-  ))
-  use _ <- result.try(
-    workflow.await(workflow.signal_child(ctx, child, poke(), "from parent")),
-  )
-  workflow.await(workflow.child_result(child))
-}
-
 // ---- local activities ----
-
-fn quick() {
-  workflow.Definition("quick", codec.int(), codec.string())
-}
-
-/// Local activities: one that succeeds at once, and one that fails `attempts - 1` times
-/// with a retry interval long enough that core hands the wait back as a timer.
-fn quick_workflow(ctx: Context, attempts: Int) -> Result(String, Failure) {
-  let local = workflow.local_activity_options(start_to_close_ms: 5000)
-  use doubled <- result.try(workflow.execute_local_activity(
-    ctx,
-    double(),
-    21,
-    local,
-  ))
-  let retrying =
-    workflow.LocalActivityOptions(
-      ..local,
-      retry: Some(
-        workflow.RetryPolicy(
-          ..workflow.retry_policy(maximum_attempts: 5),
-          initial_interval_ms: 1500,
-          backoff_coefficient: 1.0,
-        ),
-      ),
-      local_retry_threshold_ms: Some(1000),
-    )
-  use outcome <- result.map(workflow.execute_local_activity(
-    ctx,
-    stubborn(),
-    attempts,
-    retrying,
-  ))
-  int.to_string(doubled) <> ", " <> outcome
-}
 
 fn hasty() {
   workflow.Definition("hasty", codec.nil(), codec.string())
@@ -358,9 +274,6 @@ fn workflows() -> List(workflow.Handler) {
   [
     workflow.handler(counter(), counter_workflow),
     workflow.handler(listener(), listener_workflow),
-    workflow.handler(messenger(), messenger_workflow),
-    workflow.handler(nanny(), nanny_workflow),
-    workflow.handler(quick(), quick_workflow),
     workflow.handler(hasty(), hasty_workflow),
     workflow.handler(annotating(), annotating_workflow),
     workflow.handler(caller(), caller_workflow),
@@ -369,40 +282,6 @@ fn workflows() -> List(workflow.Handler) {
 }
 
 // ---- harness ----
-
-type Env {
-  Env(client: Client, task_queue: String)
-}
-
-fn in_both_modes_with(
-  name: String,
-  client: Client,
-  scenario: fn(Env) -> Nil,
-) -> Nil {
-  list.each([1000, 0], fn(max_cached) {
-    let task_queue = name <> "-" <> int.to_string(max_cached) <> "-" <> unique()
-    let assert Ok(worker) =
-      worker.new(client, task_queue)
-      |> worker.with_workflows(workflows())
-      |> worker.with_activities(activities("unversioned"))
-      |> worker.with_max_cached_workflows(max_cached)
-      |> worker.start
-    scenario(Env(client, task_queue))
-    worker.stop(worker)
-  })
-}
-
-fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
-  let assert Ok(client) = client.connect(client.local())
-  in_both_modes_with(name, client, scenario)
-}
-
-fn start_options(env: Env) -> client.StartOptions {
-  client.start_options(
-    workflow_id: env.task_queue <> "-" <> unique(),
-    task_queue: env.task_queue,
-  )
-}
 
 fn assert_replays(handle: client.Handle(output)) -> Nil {
   let assert Ok(history) = client.history(handle)
@@ -457,56 +336,7 @@ pub fn an_update_nobody_handles_is_rejected_test() {
   assert_replays(handle)
 }
 
-// ---- other workflows ----
-
-pub fn a_workflow_signals_and_cancels_other_workflows_test() {
-  use env <- in_both_modes("messenger")
-  let prefix = env.task_queue
-  let start = fn(suffix) {
-    let assert Ok(handle) =
-      client.start(
-        env.client,
-        listener(),
-        Nil,
-        client.start_options(
-          workflow_id: prefix <> suffix,
-          task_queue: env.task_queue,
-        ),
-      )
-    handle
-  }
-  let signalled = start("-signalled")
-  let cancelled = start("-cancelled")
-  let assert Ok(messenger) =
-    client.start(env.client, messenger(), prefix, start_options(env))
-  assert client.result(messenger) == Ok("missing workflow: True")
-  assert client.result(signalled) == Ok("poked: hello")
-  assert client.result(cancelled) == Error(client.Cancelled)
-  assert_replays(messenger)
-}
-
-pub fn a_parent_signals_its_child_test() {
-  use env <- in_both_modes("nanny")
-  let assert Ok(handle) =
-    client.start(
-      env.client,
-      nanny(),
-      env.task_queue <> "-child",
-      start_options(env),
-    )
-  assert client.result(handle) == Ok("poked: from parent")
-  assert_replays(handle)
-}
-
 // ---- local activities ----
-
-pub fn local_activities_run_and_retry_across_a_backoff_test() {
-  use env <- in_both_modes("quick")
-  let assert Ok(handle) =
-    client.start(env.client, quick(), 3, start_options(env))
-  assert client.result(handle) == Ok("42, attempt 3 local=True")
-  assert_replays(handle)
-}
 
 pub fn a_local_activity_waiting_to_retry_can_be_cancelled_test() {
   use env <- in_both_modes("hasty")
@@ -762,25 +592,7 @@ pub fn a_pinned_workflow_stays_on_its_build_and_an_upgrading_one_moves_test() {
   worker.stop(v2)
 }
 
-fn eventually(check: fn() -> Bool) -> Bool {
-  list.any(list.repeat(Nil, 100), fn(_) {
-    case check() {
-      True -> True
-      False -> {
-        process.sleep(200)
-        False
-      }
-    }
-  })
-}
-
 // ---- losing a worker in the middle of a local activity ----
-
-@external(erlang, "temporal_test_ffi", "read_file")
-fn read_file(path: String) -> Result(BitArray, String)
-
-@external(erlang, "temporal_test_ffi", "write_file")
-fn write_file(path: String, bytes: BitArray) -> Nil
 
 fn fragile() {
   workflow.Definition("fragile", codec.nil(), codec.string())
@@ -878,4 +690,20 @@ pub fn a_local_activity_runs_again_after_its_worker_is_killed_test() {
   let assert Ok(history) = client.history(handle)
   assert replayer.replay(fragile_handlers(), history) == Ok(Nil)
   worker.stop(replacement)
+}
+
+/// Run `scenario` against a fresh worker in both cache modes.
+fn in_both_modes_with(
+  name: String,
+  client: Client,
+  scenario: fn(Env) -> Nil,
+) -> Nil {
+  use config <- support.in_both_modes(name, client, _, scenario)
+  config
+  |> worker.with_workflows(workflows())
+  |> worker.with_activities(activities("unversioned"))
+}
+
+fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
+  in_both_modes_with(name, support.local_client(), scenario)
 }

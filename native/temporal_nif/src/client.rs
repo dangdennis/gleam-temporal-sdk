@@ -210,7 +210,7 @@ fn start_workflow<'a>(
             }
         }
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(run_id) => ok(env, run_id.encode(env)),
         Err(s) => rpc_err(env, &s),
     });
@@ -302,7 +302,7 @@ fn update_workflow<'a>(
             }
         }
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok((run_id, update_id, outcome)) => ok(
             env,
             (run_id, update_id, encode_update_outcome(env, outcome)).encode(env),
@@ -315,7 +315,6 @@ fn update_workflow<'a>(
 /// Wait for an update to complete.
 #[rustler::nif]
 fn poll_update<'a>(
-    env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
@@ -351,7 +350,7 @@ fn poll_update<'a>(
             }
         }
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(outcome) => ok(env, encode_update_outcome(env, outcome)),
         Err(s) => rpc_err(env, &s),
     });
@@ -392,7 +391,6 @@ fn encode_execution<'a>(env: Env<'a>, info: WorkflowExecutionInfo) -> Term<'a> {
 
 #[rustler::nif]
 fn describe_workflow<'a>(
-    env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
@@ -410,7 +408,7 @@ fn describe_workflow<'a>(
             .await
             .map(|r| r.into_inner().workflow_execution_info.unwrap_or_default())
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(info) => ok(env, encode_execution(env, info)),
         Err(s) => rpc_err(env, &s),
     });
@@ -420,7 +418,6 @@ fn describe_workflow<'a>(
 /// List up to `limit` executions matching a visibility query.
 #[rustler::nif]
 fn list_workflows<'a>(
-    env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
@@ -451,7 +448,7 @@ fn list_workflows<'a>(
             }
         }
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(found) => {
             let terms: Vec<Term> = found
                 .into_iter()
@@ -466,7 +463,6 @@ fn list_workflows<'a>(
 
 #[rustler::nif]
 fn count_workflows<'a>(
-    env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
@@ -483,7 +479,7 @@ fn count_workflows<'a>(
             .await
             .map(|r| r.into_inner().count)
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(count) => ok(env, count.encode(env)),
         Err(s) => rpc_err(env, &s),
     });
@@ -521,7 +517,7 @@ fn signal_workflow<'a>(
             .await
             .map(|_| ())
     };
-    spawn_reply(env, pid, reference, fut, unit_reply);
+    spawn_reply(pid, reference, fut, unit_reply);
     atoms::ok().encode(env)
 }
 
@@ -557,7 +553,7 @@ fn query_workflow<'a>(
             .await
             .map(|r| r.into_inner().query_result.unwrap_or_default().payloads)
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(payloads) => {
             let terms: Vec<Term> = payloads.iter().map(|p| encode_payload(env, p)).collect();
             ok(env, terms.encode(env))
@@ -569,7 +565,6 @@ fn query_workflow<'a>(
 
 #[rustler::nif]
 fn cancel_workflow<'a>(
-    env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
@@ -590,13 +585,12 @@ fn cancel_workflow<'a>(
             .await
             .map(|_| ())
     };
-    spawn_reply(env, pid, reference, fut, unit_reply);
+    spawn_reply(pid, reference, fut, unit_reply);
     atoms::ok()
 }
 
 #[rustler::nif]
 fn terminate_workflow<'a>(
-    env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
@@ -618,7 +612,7 @@ fn terminate_workflow<'a>(
             .await
             .map(|_| ())
     };
-    spawn_reply(env, pid, reference, fut, unit_reply);
+    spawn_reply(pid, reference, fut, unit_reply);
     atoms::ok()
 }
 
@@ -703,7 +697,6 @@ async fn close_event(
 /// Wait for the workflow chain starting at `run_id` to finish, following successor runs.
 #[rustler::nif]
 fn workflow_result<'a>(
-    env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
@@ -720,7 +713,7 @@ fn workflow_result<'a>(
             run_id = next;
         }
     };
-    spawn_reply(env, pid, reference, fut, |env, r| {
+    spawn_reply(pid, reference, fut, |env, r| {
         let tag = |name: &str| Atom::from_str(env, name).unwrap();
         match r {
             Ok(Outcome::Completed(payloads)) => {
@@ -744,7 +737,6 @@ fn workflow_result<'a>(
 /// Fetch a run's complete history as an encoded `temporal.api.history.v1.History`.
 #[rustler::nif]
 fn fetch_history<'a>(
-    env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
@@ -774,7 +766,7 @@ fn fetch_history<'a>(
             }
         }
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(bytes) => ok(env, bin(env, &bytes)),
         Err(s) => rpc_err(env, &s),
     });

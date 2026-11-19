@@ -5,6 +5,7 @@ import gleam/dict.{type Dict}
 import gleam/json
 import temporal/codec.{type Payload, Payload}
 
+/// A search attribute's value, tagged with the type it was registered as.
 pub type Value {
   Keyword(String)
   Text(String)

@@ -71,6 +71,7 @@ pub fn start_local_with(executable executable: String) -> Result(Env, String) {
   start(bridge.Dev, Some(executable))
 }
 
+/// A client connected to the test server.
 pub fn client(env: Env) -> Client {
   env.client
 }

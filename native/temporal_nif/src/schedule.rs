@@ -347,14 +347,13 @@ fn schedule_put<'a>(
                 .map(|_| ()),
         }
     };
-    spawn_reply(env, pid, reference, fut, unit);
+    spawn_reply(pid, reference, fut, unit);
     atoms::ok().encode(env)
 }
 
 /// Answers `{Schedule, ScheduleInfo, ConflictToken}`.
 #[rustler::nif]
 fn schedule_describe<'a>(
-    env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
@@ -373,7 +372,7 @@ fn schedule_describe<'a>(
             .await
             .map(|r| r.into_inner())
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(d) => ok(
             env,
             (
@@ -390,7 +389,6 @@ fn schedule_describe<'a>(
 
 #[rustler::nif]
 fn schedule_delete<'a>(
-    env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
@@ -410,7 +408,7 @@ fn schedule_delete<'a>(
             .await
             .map(|_| ())
     };
-    spawn_reply(env, pid, reference, fut, unit);
+    spawn_reply(pid, reference, fut, unit);
     atoms::ok()
 }
 
@@ -465,18 +463,13 @@ fn schedule_patch<'a>(
             .await
             .map(|_| ())
     };
-    spawn_reply(env, pid, reference, fut, unit);
+    spawn_reply(pid, reference, fut, unit);
     atoms::ok().encode(env)
 }
 
 /// Every schedule in the namespace as `{Id, WorkflowType, Paused, Note}`.
 #[rustler::nif]
-fn schedule_list<'a>(
-    env: Env<'a>,
-    pid: LocalPid,
-    reference: Term<'a>,
-    conn: ResourceArc<ConnectionRes>,
-) -> Atom {
+fn schedule_list<'a>(pid: LocalPid, reference: Term<'a>, conn: ResourceArc<ConnectionRes>) -> Atom {
     let fut = async move {
         let mut found = vec![];
         let mut next_page_token = vec![];
@@ -502,7 +495,7 @@ fn schedule_list<'a>(
             }
         }
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(found) => {
             let terms: Vec<Term> = found
                 .into_iter()

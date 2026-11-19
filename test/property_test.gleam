@@ -10,6 +10,8 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleam/list
+import gleam/result
+import support.{unique}
 import temporal/activity
 import temporal/client
 import temporal/codec
@@ -17,9 +19,6 @@ import temporal/failure.{type Failure}
 import temporal/replayer
 import temporal/worker
 import temporal/workflow.{type Context}
-
-@external(erlang, "temporal_test_ffi", "unique")
-fn unique() -> String
 
 type Step {
   Sleep(ms: Int)
@@ -117,7 +116,7 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
         Ok([0])
       }
       Double(n) -> {
-        use doubled <- try(workflow.execute_activity(
+        use doubled <- result.try(workflow.execute_activity(
           ctx,
           double(),
           n,
@@ -129,7 +128,7 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
         let results =
           list.map(ns, workflow.start_activity(ctx, double(), _, options()))
           |> workflow.await_all
-        use doubled <- try(list.try_map(results, fn(r) { r }))
+        use doubled <- result.try(list.try_map(results, fn(r) { r }))
         Ok([int.sum(doubled)])
       }
       Race(n, ms) -> {
@@ -153,11 +152,16 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
       }
       Child(n) -> {
         let child = workflow.child_options(workflow_id: workflow.uuid4(ctx))
-        use doubled <- try(workflow.execute_child(ctx, double_child(), n, child))
+        use doubled <- result.try(workflow.execute_child(
+          ctx,
+          double_child(),
+          n,
+          child,
+        ))
         Ok([doubled])
       }
       Deadline(n) -> {
-        use doubled <- try(
+        use doubled <- result.try(
           workflow.with_timeout(ctx, 600_000, fn(scope) {
             workflow.execute_activity(scope, double(), n, options())
           }),
@@ -202,21 +206,7 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
       }
     }
   })
-  |> map(list.flatten)
-}
-
-fn try(result: Result(a, e), next: fn(a) -> Result(b, e)) -> Result(b, e) {
-  case result {
-    Ok(value) -> next(value)
-    Error(error) -> Error(error)
-  }
-}
-
-fn map(result: Result(a, e), with: fn(a) -> b) -> Result(b, e) {
-  case result {
-    Ok(value) -> Ok(with(value))
-    Error(error) -> Error(error)
-  }
+  |> result.map(list.flatten)
 }
 
 fn workflows() -> List(workflow.Handler) {

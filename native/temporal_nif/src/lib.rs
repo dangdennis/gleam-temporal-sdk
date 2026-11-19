@@ -68,13 +68,12 @@ pub fn runtime() -> &'static CoreRuntime {
 
 /// Run `fut` on the core runtime, then send `{temporal_nif, Ref, reply}` to `pid`. `reply`
 /// builds the term on a Tokio thread, which is the only place an `OwnedEnv` may send from.
-pub fn spawn_reply<F, T, R>(env: Env, pid: LocalPid, reference: Term, fut: F, reply: R)
+pub fn spawn_reply<F, T, R>(pid: LocalPid, reference: Term, fut: F, reply: R)
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
     R: for<'a> FnOnce(Env<'a>, T) -> Term<'a> + Send + 'static,
 {
-    let _ = env;
     let mut owned = OwnedEnv::new();
     let saved = owned.save(reference);
     runtime().tokio_handle().spawn(async move {
@@ -132,7 +131,7 @@ fn connect<'a>(
             identity,
         })
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(res) => ok(env, ResourceArc::new(res).encode(env)),
         Err(e) => err(env, e),
     });
@@ -285,7 +284,7 @@ fn worker_new<'a>(
             namespace: conn.namespace.clone(),
         })
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(res) => ok(env, ResourceArc::new(res).encode(env)),
         Err(e) => err(env, e),
     });
@@ -344,14 +343,9 @@ fn poll_error<'a>(env: Env<'a>, e: PollError) -> Term<'a> {
 }
 
 #[rustler::nif]
-fn worker_poll_workflow<'a>(
-    env: Env<'a>,
-    pid: LocalPid,
-    reference: Term<'a>,
-    w: ResourceArc<WorkerRes>,
-) -> Atom {
+fn worker_poll_workflow<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<WorkerRes>) -> Atom {
     let fut = async move { w.worker.poll_workflow_activation().await };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(activation) => ok(env, encode_activation(env, activation)),
         Err(e) => poll_error(env, e),
     });
@@ -371,19 +365,14 @@ fn worker_complete_workflow<'a>(
         Err(e) => return err(env, format!("invalid completion: {e}")),
     };
     let fut = async move { w.worker.complete_workflow_activation(completion).await };
-    spawn_reply(env, pid, reference, fut, unit_result);
+    spawn_reply(pid, reference, fut, unit_result);
     atoms::ok().encode(env)
 }
 
 #[rustler::nif]
-fn worker_poll_activity<'a>(
-    env: Env<'a>,
-    pid: LocalPid,
-    reference: Term<'a>,
-    w: ResourceArc<WorkerRes>,
-) -> Atom {
+fn worker_poll_activity<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<WorkerRes>) -> Atom {
     let fut = async move { w.worker.poll_activity_task().await };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(task) => ok(env, encode_activity_task(env, task)),
         Err(e) => poll_error(env, e),
     });
@@ -408,7 +397,7 @@ fn worker_complete_activity<'a>(
         result: Some(result),
     };
     let fut = async move { w.worker.complete_activity_task(completion).await };
-    spawn_reply(env, pid, reference, fut, unit_result);
+    spawn_reply(pid, reference, fut, unit_result);
     atoms::ok().encode(env)
 }
 
@@ -429,14 +418,9 @@ fn worker_heartbeat<'a>(
 }
 
 #[rustler::nif]
-fn worker_poll_nexus<'a>(
-    env: Env<'a>,
-    pid: LocalPid,
-    reference: Term<'a>,
-    w: ResourceArc<WorkerRes>,
-) -> Atom {
+fn worker_poll_nexus<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<WorkerRes>) -> Atom {
     let fut = async move { w.worker.poll_nexus_task().await };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(task) => ok(env, encode_nexus_task(env, task)),
         Err(e) => poll_error(env, e),
     });
@@ -457,24 +441,19 @@ fn worker_complete_nexus<'a>(
         Err(e) => return err(env, format!("invalid nexus result: {e}")),
     };
     let fut = async move { w.worker.complete_nexus_task(completion).await };
-    spawn_reply(env, pid, reference, fut, unit_result);
+    spawn_reply(pid, reference, fut, unit_result);
     atoms::ok().encode(env)
 }
 
 /// Stop polling. Outstanding polls resolve with `{error, shutdown}` once in-flight tasks finish.
 #[rustler::nif]
-fn worker_shutdown<'a>(
-    env: Env<'a>,
-    pid: LocalPid,
-    reference: Term<'a>,
-    w: ResourceArc<WorkerRes>,
-) -> Atom {
+fn worker_shutdown<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<WorkerRes>) -> Atom {
     let fut = async move {
         w.worker.initiate_shutdown();
         // Bounded so a workflow that never answers its eviction cannot hang the caller.
         let _ = tokio::time::timeout(Duration::from_secs(10), w.worker.shutdown()).await;
     };
-    spawn_reply(env, pid, reference, fut, |env, ()| atoms::nil().encode(env));
+    spawn_reply(pid, reference, fut, |env, ()| atoms::nil().encode(env));
     atoms::ok()
 }
 

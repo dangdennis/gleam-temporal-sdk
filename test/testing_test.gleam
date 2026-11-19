@@ -2,6 +2,7 @@
 
 import gleam/option.{Some}
 import gleam/result
+import support.{unique}
 import temporal/activity
 import temporal/client
 import temporal/codec
@@ -9,9 +10,6 @@ import temporal/failure.{type Failure}
 import temporal/testing
 import temporal/worker
 import temporal/workflow.{type Context}
-
-@external(erlang, "temporal_test_ffi", "unique")
-fn unique() -> String
 
 @external(erlang, "temporal_test_ffi", "test_server_path")
 fn test_server_path() -> Result(String, Nil)

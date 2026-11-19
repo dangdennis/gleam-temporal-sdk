@@ -16,6 +16,7 @@ import temporal/middleware.{
 import temporal/nexus
 import temporal/workflow
 
+/// Everything a worker runs with. Build with `new` and the `with_` functions.
 pub type Config {
   Config(
     client: Client,
@@ -45,17 +46,21 @@ pub type Config {
 /// code share a build id; the server routes each workflow to the build it should run on.
 pub type Deployment {
   Deployment(
+    /// Shared by every build of the same service.
     name: String,
+    /// Names one build of its code.
     build_id: String,
     /// What workflows that do not declare a behaviour with `workflow.with_versioning` do.
     default_behavior: workflow.VersioningBehavior,
   )
 }
 
+/// A running worker.
 pub opaque type Worker {
   Worker(nif: bridge.NifWorker)
 }
 
+/// A worker for one task queue, with nothing registered yet.
 pub fn new(client: Client, task_queue: String) -> Config {
   Config(
     client:,
@@ -75,6 +80,8 @@ pub fn new(client: Client, task_queue: String) -> Config {
   )
 }
 
+/// Register workflows. A task for a workflow type the worker does not know fails and is
+/// retried, so the workflow waits for a worker that does.
 pub fn with_workflows(
   config: Config,
   workflows: List(workflow.Handler),
@@ -82,6 +89,7 @@ pub fn with_workflows(
   Config(..config, workflows: list.append(config.workflows, workflows))
 }
 
+/// Register activities.
 pub fn with_activities(
   config: Config,
   activities: List(activity.Handler),
@@ -89,10 +97,12 @@ pub fn with_activities(
   Config(..config, activities: list.append(config.activities, activities))
 }
 
+/// How many workflow runs to keep in memory between tasks. See `Config`.
 pub fn with_max_cached_workflows(config: Config, max: Int) -> Config {
   Config(..config, max_cached_workflows: max)
 }
 
+/// How many workflow tasks this worker processes at once.
 pub fn with_max_concurrent_workflow_tasks(config: Config, max: Int) -> Config {
   Config(..config, max_concurrent_workflow_tasks: max)
 }

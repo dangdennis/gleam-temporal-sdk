@@ -147,7 +147,8 @@ fn dispatch(
   }
 }
 
-/// Run activity tasks until the worker shuts down, each in its own process.
+/// Run activity tasks until the worker shuts down, each in its own process. Local
+/// activities arrive here too.
 pub fn activity_loop(
   worker: NifWorker,
   activities: Dict(String, activity.Handler),
@@ -165,11 +166,19 @@ fn do_activity_loop(
   running: Dict(BitArray, Pid),
 ) -> Nil {
   let running = dict.filter(running, fn(_, pid) { process.is_alive(pid) })
-  let task = case bridge.poll_activity(worker) {
+  let continue = fn(running) {
+    do_activity_loop(worker, activities, task_queue, codec, running)
+  }
+  case bridge.poll_activity(worker) {
+    Error(bridge.Shutdown) -> Nil
+    Error(bridge.PollFailed(message)) ->
+      io.println_error("temporal: activity polling failed: " <> message)
     Ok(bridge.ActivityStart(task_token:, ..) as task) ->
       case transcode.decode_activity_task(codec, task) {
-        Ok(task) -> Ok(task)
-        // Report the failure and wait for the next task.
+        Ok(task) -> {
+          let pid = run_activity(worker, activities, task_queue, codec, task)
+          continue(dict.insert(running, task_token, pid))
+        }
         Error(reason) -> {
           let _ =
             bridge.complete_activity(
@@ -179,105 +188,9 @@ fn do_activity_loop(
                 "payload codec could not decode the activity task: " <> reason,
               )),
             )
-          Ok(bridge.ActivityCancel(task_token, -1))
+          continue(running)
         }
       }
-    other -> other
-  }
-  case task {
-    Error(bridge.Shutdown) -> Nil
-    Error(bridge.PollFailed(message)) ->
-      io.println_error("temporal: activity polling failed: " <> message)
-    Ok(bridge.ActivityStart(
-      task_token:,
-      activity_type:,
-      activity_id:,
-      workflow_id:,
-      run_id:,
-      input:,
-      attempt:,
-      heartbeat_details:,
-      workflow_type:,
-      start_to_close_ms:,
-      heartbeat_timeout_ms:,
-      scheduled_time_ms:,
-      is_local:,
-    )) -> {
-      let ctx =
-        activity.Context(
-          info: activity.Info(
-            activity_id:,
-            activity_type:,
-            workflow_id:,
-            run_id:,
-            workflow_type:,
-            task_queue:,
-            attempt:,
-            heartbeat_details:,
-            start_to_close_ms:,
-            heartbeat_timeout_ms:,
-            scheduled_time_ms:,
-            is_local:,
-          ),
-          // A local activity has no heartbeat: the workflow task it runs in is its lease.
-          heartbeat: fn(details) {
-            case is_local {
-              True -> Nil
-              False ->
-                bridge.heartbeat(
-                  worker,
-                  task_token,
-                  transcode.encode_list(codec, details),
-                )
-            }
-          },
-          cancel_reason: fn() {
-            option.map(bridge.activity_cancel_reason(), cancel_reason)
-          },
-        )
-      let pid =
-        process.spawn_unlinked(fn() {
-          let result = case dict.get(activities, activity_type) {
-            Error(Nil) ->
-              bridge.ActivityFailed(
-                failure.new(
-                  "activity type \""
-                  <> activity_type
-                  <> "\" is not registered on this worker",
-                )
-                |> failure.with_type("NotFound"),
-              )
-            // Exits are caught too: this process must always report an outcome, or the
-            // activity would hang until its timeout.
-            Ok(handler) ->
-              case bridge.rescue_all(fn() { handler.run(ctx, input) }) {
-                Ok(Ok(payload)) -> bridge.ActivityCompleted(payload)
-                Ok(Error(
-                  failure.Failure(kind: failure.Cancelled, ..) as failure,
-                )) -> bridge.ActivityCancelled(failure)
-                Ok(Error(failure)) -> bridge.ActivityFailed(failure)
-                Error(crash) ->
-                  bridge.ActivityFailed(failure.new(
-                    "activity crashed: " <> crash,
-                  ))
-              }
-          }
-          let _ =
-            bridge.complete_activity(
-              worker,
-              task_token,
-              transcode.encode_activity_result(codec, result),
-            )
-          Nil
-        })
-      do_activity_loop(
-        worker,
-        activities,
-        task_queue,
-        codec,
-        dict.insert(running, task_token, pid),
-      )
-    }
     Ok(bridge.ActivityCancel(task_token:, reason:)) -> {
       // The activity decides how to stop: it sees the request through
       // `activity.is_cancelled` and reports its own outcome. An activity that has already
@@ -286,9 +199,97 @@ fn do_activity_loop(
         Ok(pid) -> bridge.send_activity_cancel(pid, reason)
         Error(Nil) -> Nil
       }
-      do_activity_loop(worker, activities, task_queue, codec, running)
+      continue(running)
     }
   }
+}
+
+/// Start the process that runs one activity and reports its outcome.
+fn run_activity(
+  worker: NifWorker,
+  activities: Dict(String, activity.Handler),
+  task_queue: String,
+  codec: Option(PayloadCodec),
+  task: bridge.ActivityTask,
+) -> Pid {
+  let assert bridge.ActivityStart(
+    task_token:,
+    activity_type:,
+    activity_id:,
+    workflow_id:,
+    run_id:,
+    input:,
+    attempt:,
+    heartbeat_details:,
+    workflow_type:,
+    start_to_close_ms:,
+    heartbeat_timeout_ms:,
+    scheduled_time_ms:,
+    is_local:,
+  ) = task
+  let ctx =
+    activity.Context(
+      info: activity.Info(
+        activity_id:,
+        activity_type:,
+        workflow_id:,
+        run_id:,
+        workflow_type:,
+        task_queue:,
+        attempt:,
+        heartbeat_details:,
+        start_to_close_ms:,
+        heartbeat_timeout_ms:,
+        scheduled_time_ms:,
+        is_local:,
+      ),
+      // A local activity has no heartbeat: the workflow task it runs in is its lease.
+      heartbeat: fn(details) {
+        case is_local {
+          True -> Nil
+          False ->
+            bridge.heartbeat(
+              worker,
+              task_token,
+              transcode.encode_list(codec, details),
+            )
+        }
+      },
+      cancel_reason: fn() {
+        option.map(bridge.activity_cancel_reason(), cancel_reason)
+      },
+    )
+  process.spawn_unlinked(fn() {
+    let result = case dict.get(activities, activity_type) {
+      Error(Nil) ->
+        bridge.ActivityFailed(
+          failure.new(
+            "activity type \""
+            <> activity_type
+            <> "\" is not registered on this worker",
+          )
+          |> failure.with_type("NotFound"),
+        )
+      // Exits are caught too: this process must always report an outcome, or the
+      // activity would hang until its timeout.
+      Ok(handler) ->
+        case bridge.rescue_all(fn() { handler.run(ctx, input) }) {
+          Ok(Ok(payload)) -> bridge.ActivityCompleted(payload)
+          Ok(Error(failure.Failure(kind: failure.Cancelled, ..) as failure)) ->
+            bridge.ActivityCancelled(failure)
+          Ok(Error(failure)) -> bridge.ActivityFailed(failure)
+          Error(crash) ->
+            bridge.ActivityFailed(failure.new("activity crashed: " <> crash))
+        }
+    }
+    let _ =
+      bridge.complete_activity(
+        worker,
+        task_token,
+        transcode.encode_activity_result(codec, result),
+      )
+    Nil
+  })
 }
 
 /// Core's `ActivityCancelReason` values.

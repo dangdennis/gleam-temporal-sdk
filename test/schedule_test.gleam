@@ -1,10 +1,10 @@
 //// Schedules against a real Temporal service.
 
 import gleam/dict
-import gleam/erlang/process
 import gleam/list
 import gleam/option.{Some}
 import gleam/string
+import support.{eventually, unique}
 import temporal/client
 import temporal/codec
 import temporal/schedule
@@ -12,26 +12,8 @@ import temporal/search_attributes
 import temporal/worker
 import temporal/workflow
 
-@external(erlang, "temporal_test_ffi", "unique")
-fn unique() -> String
-
-@external(erlang, "temporal_test_ffi", "cmd")
-fn cmd(command: String) -> String
-
 fn tick() {
   workflow.Definition("tick", codec.string(), codec.string())
-}
-
-fn eventually(check: fn() -> Bool) -> Bool {
-  list.any(list.repeat(Nil, 100), fn(_) {
-    case check() {
-      True -> True
-      False -> {
-        process.sleep(100)
-        False
-      }
-    }
-  })
 }
 
 pub fn a_schedule_round_trips_and_can_be_changed_test() {
@@ -145,10 +127,7 @@ pub fn a_cron_expression_becomes_a_calendar_test() {
 pub fn a_triggered_schedule_starts_its_workflow_test() {
   let assert Ok(client) = client.connect(client.local())
   let id = "triggered-" <> unique()
-  let _ =
-    cmd(
-      "temporal operator search-attribute create --name GleamTestKeyword --type Keyword 2>&1",
-    )
+  let attribute = support.register_search_attribute()
   let assert Ok(worker) =
     worker.new(client, id)
     |> worker.with_workflows([
@@ -164,10 +143,7 @@ pub fn a_triggered_schedule_starts_its_workflow_test() {
   let options =
     client.start_options(workflow_id: id <> "-run", task_queue: id)
     |> client.with_memo("origin", codec.string(), "schedule")
-    |> client.with_search_attribute(
-      "GleamTestKeyword",
-      search_attributes.Keyword(id),
-    )
+    |> client.with_search_attribute(attribute, search_attributes.Keyword(id))
   let assert Ok(Nil) =
     schedule.create(
       client,
@@ -187,10 +163,7 @@ pub fn a_triggered_schedule_starts_its_workflow_test() {
   let assert [action] = described.recent_actions
   // Each run's id is the action's id with the scheduled time appended.
   assert string.starts_with(action.workflow_id, id <> "-run-")
-  assert dict.has_key(
-    described.schedule.action.search_attributes,
-    "GleamTestKeyword",
-  )
+  assert dict.has_key(described.schedule.action.search_attributes, attribute)
   let run = client.handle(client, tick(), action.workflow_id)
   assert client.result(run) == Ok("triggered with memo schedule")
 

@@ -22,7 +22,7 @@ import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/json
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option
 import gleam/result
 import temporal/client.{type Client}
 import temporal/codec.{type Payload}
@@ -322,13 +322,5 @@ pub fn dispatcher(
         }
       }
     }
-  }
-}
-
-/// A handler's `Option` helper: the token of an operation that is still running.
-pub fn operation_token(started: Started) -> Option(String) {
-  case started {
-    Running(token) -> Some(token)
-    Finished(_) -> None
   }
 }

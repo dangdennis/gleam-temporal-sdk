@@ -17,6 +17,8 @@ pub type Payload {
   Payload(metadata: Dict(String, BitArray), data: BitArray)
 }
 
+/// How to turn a value of one type into a payload and back. Definitions carry one for
+/// each value they send, which is what makes a mismatch a compile error.
 pub type Codec(a) {
   Codec(encode: fn(a) -> Payload, decode: fn(Payload) -> Result(a, String))
 }
@@ -39,18 +41,22 @@ pub fn json(to_json: fn(a) -> Json, decoder: Decoder(a)) -> Codec(a) {
   )
 }
 
+/// A codec for a JSON string.
 pub fn string() -> Codec(String) {
   json(json.string, decode.string)
 }
 
+/// A codec for a JSON integer.
 pub fn int() -> Codec(Int) {
   json(json.int, decode.int)
 }
 
+/// A codec for a JSON number.
 pub fn float() -> Codec(Float) {
   json(json.float, decode.float)
 }
 
+/// A codec for a JSON boolean.
 pub fn bool() -> Codec(Bool) {
   json(json.bool, decode.bool)
 }

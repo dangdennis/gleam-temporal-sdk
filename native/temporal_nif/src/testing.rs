@@ -1,6 +1,6 @@
 //! Test servers: start and stop one, and control the time-skipping server's clock.
 
-use crate::{ConnectionRes, atoms, client::rpc_err, convert::*, err, ok, runtime, spawn_reply};
+use crate::{ConnectionRes, atoms, client::rpc_err, convert::*, err, ok, spawn_reply};
 use rustler::{Atom, Encoder, Env, LocalPid, ResourceArc, Term};
 use std::{process::Stdio, time::Duration};
 use temporalio_common::protos::temporal::api::testservice::v1::{
@@ -62,7 +62,7 @@ fn server_start<'a>(
         };
         started.map_err(|e| format!("could not start the server: {e}"))
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(server) => {
             let target = format!("http://{}", server.target);
             let resource = ResourceArc::new(ServerRes {
@@ -72,23 +72,17 @@ fn server_start<'a>(
         }
         Err(e) => err(env, e),
     });
-    let _ = runtime();
     atoms::ok()
 }
 
 #[rustler::nif]
-fn server_stop<'a>(
-    env: Env<'a>,
-    pid: LocalPid,
-    reference: Term<'a>,
-    server: ResourceArc<ServerRes>,
-) -> Atom {
+fn server_stop<'a>(pid: LocalPid, reference: Term<'a>, server: ResourceArc<ServerRes>) -> Atom {
     let fut = async move {
         if let Some(mut running) = server.server.lock().await.take() {
             let _ = running.shutdown().await;
         }
     };
-    spawn_reply(env, pid, reference, fut, |env, ()| atoms::nil().encode(env));
+    spawn_reply(pid, reference, fut, |env, ()| atoms::nil().encode(env));
     atoms::ok()
 }
 
@@ -146,7 +140,7 @@ fn time_control<'a>(
                 .map(|r| millis(r.into_inner().time)),
         }
     };
-    spawn_reply(env, pid, reference, fut, |env, r| match r {
+    spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(ms) => ok(env, ms.encode(env)),
         Err(s) => rpc_err(env, &s),
     });

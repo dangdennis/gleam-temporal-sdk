@@ -12,6 +12,7 @@ pub type Definition(input, output) {
   Definition(name: String, input: Codec(input), output: Codec(output))
 }
 
+/// What the worker knows about the task an activity is running for.
 pub type Info {
   Info(
     activity_id: String,
@@ -19,12 +20,15 @@ pub type Info {
     workflow_id: String,
     run_id: String,
     workflow_type: String,
+    /// The queue the worker running the activity polls.
     task_queue: String,
     /// Starts at 1 and grows with each retry.
     attempt: Int,
     /// What the previous attempt last passed to `heartbeat_with`.
     heartbeat_details: List(Payload),
+    /// Longest this attempt may run.
     start_to_close_ms: Option(Int),
+    /// The longest gap between heartbeats the workflow allows.
     heartbeat_timeout_ms: Option(Int),
     /// When the activity was first scheduled, in milliseconds since the Unix epoch.
     scheduled_time_ms: Int,
@@ -39,12 +43,18 @@ pub type CancelReason {
   CancelRequested
   /// The activity no longer exists on the server, usually because its workflow closed.
   NotFound
+  /// A timeout passed. Whatever the activity returns now is ignored.
   TimedOut
+  /// The worker is stopping.
   WorkerShutdown
+  /// An operator paused the activity.
   Paused
+  /// An operator reset the activity.
   Reset
 }
 
+/// Passed to every activity. Use the functions of this module on it rather than its
+/// fields, which exist so that tests can build one: see `testing.activity_env`.
 pub type Context {
   Context(
     info: Info,
@@ -53,6 +63,7 @@ pub type Context {
   )
 }
 
+/// What an activity produced, before its result is decoded: a payload, nothing, or a failure.
 pub type Outcome =
   Result(Option(Payload), Failure)
 
@@ -120,6 +131,7 @@ pub fn is_cancelled(ctx: Context) -> Bool {
   option.is_some(ctx.cancel_reason())
 }
 
+/// Why the activity was asked to stop, or `None` if it was not.
 pub fn cancel_reason(ctx: Context) -> Option(CancelReason) {
   ctx.cancel_reason()
 }

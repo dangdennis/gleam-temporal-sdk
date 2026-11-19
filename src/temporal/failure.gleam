@@ -3,12 +3,17 @@
 import gleam/option.{type Option, None, Some}
 import temporal/codec.{type Payload}
 
+/// What produced a failure.
 pub type Kind {
   /// Raised by workflow or activity code.
   Application
+  /// A Temporal timeout passed.
   Timeout
+  /// Cancellation was requested and accepted.
   Cancelled
+  /// The workflow was terminated from outside.
   Terminated
+  /// The Temporal service itself failed.
   Server
   /// Wraps the failure of an activity; the real error is in `cause`.
   Activity
@@ -18,16 +23,21 @@ pub type Kind {
   NexusOperation
   /// A Nexus handler could not process a request. `error_type` is the Nexus error type.
   NexusHandler
+  /// A kind this SDK does not know.
   Other
 }
 
+/// An error as Temporal records it. Workflow and activity functions return one to fail,
+/// and receive one when something they waited on failed.
 pub type Failure {
   Failure(
     message: String,
     kind: Kind,
     /// Application-defined category, matched by retry policies' non-retryable types.
     error_type: String,
+    /// Retry policies give up on the failure instead of retrying.
     non_retryable: Bool,
+    /// The failure this one wraps.
     cause: Option(Failure),
     /// Extra data attached by the code that raised an application failure.
     details: List(Payload),
@@ -39,6 +49,8 @@ pub fn new(message: String) -> Failure {
   Failure(message, Application, "", False, None, [])
 }
 
+/// Set the failure's category. Retry policies can name categories that should not be
+/// retried, and callers match on it to tell failures apart.
 pub fn with_type(failure: Failure, error_type: String) -> Failure {
   Failure(..failure, error_type:)
 }
