@@ -10,6 +10,7 @@
 mod client;
 mod convert;
 mod schedule;
+mod selftest;
 mod testing;
 
 use convert::*;
