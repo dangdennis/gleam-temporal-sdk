@@ -489,6 +489,27 @@ pub fn trigger(client: Client, schedule_id: String) -> Result(Nil, Error) {
   patch(client, schedule_id, bridge.Trigger(0))
 }
 
+/// Take the actions the timetable would have taken between `from` and `to`, now. For
+/// catching up after an outage, or filling in history for a schedule created late. Most
+/// backfills want `AllowAll`, so that the runs do not wait for one another.
+pub fn backfill(
+  client: Client,
+  schedule_id: String,
+  from from: Timestamp,
+  to to: Timestamp,
+  overlap overlap: OverlapPolicy,
+) -> Result(Nil, Error) {
+  patch(
+    client,
+    schedule_id,
+    bridge.Backfill(
+      time.timestamp_to_ms(from),
+      time.timestamp_to_ms(to),
+      overlap_value(overlap),
+    ),
+  )
+}
+
 /// Every schedule in the namespace. The list lags behind creation and deletion.
 pub fn list(client: Client) -> Result(List(Summary), Error) {
   bridge.schedule_list(client.connection(client))

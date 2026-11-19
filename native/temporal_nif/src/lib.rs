@@ -61,6 +61,8 @@ pub struct ConnectionRes {
 
 pub struct WorkerRes {
     pub worker: Arc<Worker>,
+    /// How long shutting down waits for tasks in flight.
+    pub shutdown_grace: Duration,
     /// The namespace commands that name another workflow are addressed to.
     pub namespace: String,
 }
@@ -295,6 +297,7 @@ struct WorkerOptions {
     worker_activities_per_second: Option<f64>,
     task_types: WorkerTaskTypes,
     versioning: WorkerVersioningStrategy,
+    shutdown_grace: Duration,
 }
 
 fn decode_worker_options(term: Term) -> DecodeResult<WorkerOptions> {
@@ -339,6 +342,7 @@ fn decode_worker_options(term: Term) -> DecodeResult<WorkerOptions> {
                 )
             }
         },
+        shutdown_grace: Duration::from_millis(get(&f, 9)?),
     })
 }
 
@@ -367,6 +371,7 @@ fn worker_config(
         .max_outstanding_local_activities(100usize)
         .max_outstanding_nexus_tasks(1usize)
         .versioning_strategy(options.versioning)
+        .graceful_shutdown_period(options.shutdown_grace)
         .build()
 }
 
@@ -384,6 +389,7 @@ fn worker_new<'a>(
         Err(e) => return err(env, format!("invalid worker options: {e}")),
     };
     let fut = async move {
+        let shutdown_grace = options.shutdown_grace;
         let config = worker_config(conn.namespace.clone(), task_queue, options)?;
         let conn = conn.clone();
         let worker = temporalio_sdk_core::init_worker(runtime(), config, conn.connection.clone())
@@ -394,6 +400,7 @@ fn worker_new<'a>(
             .map_err(|e| format!("worker validation failed: {e}"))?;
         Ok::<_, String>(WorkerRes {
             worker: Arc::new(worker),
+            shutdown_grace,
             namespace: conn.namespace.clone(),
         })
     };
@@ -432,6 +439,7 @@ fn replay_worker_new<'a>(
         worker_activities_per_second: None,
         task_types: WorkerTaskTypes::workflow_only(),
         versioning: unversioned(),
+        shutdown_grace: Duration::from_secs(1),
     };
     let config = match worker_config("replay".to_string(), task_queue, options) {
         Ok(c) => c,
@@ -446,6 +454,7 @@ fn replay_worker_new<'a>(
             env,
             ResourceArc::new(WorkerRes {
                 worker: Arc::new(worker),
+                shutdown_grace: Duration::from_secs(1),
                 namespace: "replay".to_string(),
             })
             .encode(env),
@@ -663,8 +672,10 @@ fn worker_complete_nexus<'a>(
 fn worker_shutdown<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<WorkerRes>) -> Atom {
     let fut = async move {
         w.worker.initiate_shutdown();
-        // Bounded so a workflow that never answers its eviction cannot hang the caller.
-        let _ = tokio::time::timeout(Duration::from_secs(10), w.worker.shutdown()).await;
+        // Bounded so a task that never finishes cannot hang the caller: the grace period
+        // activities are given, and a little more for core to wind down.
+        let limit = w.shutdown_grace + Duration::from_secs(5);
+        let _ = tokio::time::timeout(limit, w.worker.shutdown()).await;
     };
     spawn_reply(pid, reference, fut, |env, ()| atoms::nil().encode(env));
     atoms::ok()

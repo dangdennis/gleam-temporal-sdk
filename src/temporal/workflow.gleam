@@ -177,6 +177,9 @@ pub type ActivityOptions {
     task_queue: Option(String),
     /// What cancelling the activity's scope does.
     cancellation: ActivityCancellation,
+    /// The id the server knows the activity by. `None` numbers activities in the order
+    /// the workflow schedules them, as the TypeScript and Python SDKs do.
+    activity_id: Option(String),
   )
 }
 
@@ -611,6 +614,7 @@ pub fn activity_options(
     retry: None,
     task_queue: None,
     cancellation: TryCancel,
+    activity_id: None,
   )
 }
 
@@ -670,7 +674,7 @@ pub fn start_activity(
         ))
       runtime.push(bridge.ScheduleActivity(
         seq:,
-        activity_id: int.to_string(seq),
+        activity_id: option.unwrap(options.activity_id, int.to_string(seq)),
         activity_type: call.activity_type,
         task_queue: call.task_queue,
         arguments: call.arguments,

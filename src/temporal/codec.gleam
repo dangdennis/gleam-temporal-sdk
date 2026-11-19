@@ -199,6 +199,19 @@ pub fn bool() -> Codec(Bool) {
   json(json.bool, decode.bool)
 }
 
+/// A codec for raw bytes, as the `binary/plain` payloads the other SDKs use for them.
+pub fn bytes() -> Codec(BitArray) {
+  Codec(
+    encode: fn(value) {
+      Payload(
+        metadata: dict.from_list([#("encoding", <<"binary/plain":utf8>>)]),
+        data: value,
+      )
+    },
+    decode: fn(payload: Payload) { Ok(payload.data) },
+  )
+}
+
 /// A codec for `Nil`, encoded as Temporal's null payload. Any payload decodes to `Nil`.
 pub fn nil() -> Codec(Nil) {
   Codec(encode: fn(_) { null_payload() }, decode: fn(_) { Ok(Nil) })

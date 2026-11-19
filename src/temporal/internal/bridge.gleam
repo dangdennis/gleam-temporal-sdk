@@ -245,6 +245,7 @@ pub type WorkerOptions {
     enable_activities: Bool,
     enable_nexus: Bool,
     deployment: Option(Deployment),
+    shutdown_grace_ms: Int,
   )
 }
 
@@ -457,6 +458,7 @@ pub type SchedulePatch {
   Pause(note: String)
   Unpause(note: String)
   Trigger(overlap_policy: Int)
+  Backfill(from_ms: Int, to_ms: Int, overlap_policy: Int)
 }
 
 /// Create the schedule, or replace it when given the conflict token of a description.

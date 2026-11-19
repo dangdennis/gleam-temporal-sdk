@@ -44,6 +44,8 @@ pub type Config {
     /// How long a cancelled activity gets to stop by itself before its process is killed
     /// and it is reported as cancelled. `None` never kills.
     activity_cancellation_grace: Option(Duration),
+    /// How long stopping the worker waits for activities in flight.
+    shutdown_grace: Duration,
   )
 }
 
@@ -87,6 +89,7 @@ pub fn new(client: Client, task_queue: String) -> Config {
     nexus_handlers: [],
     deployment: None,
     activity_cancellation_grace: Some(duration.seconds(30)),
+    shutdown_grace: duration.seconds(10),
   )
 }
 
@@ -214,6 +217,14 @@ pub fn with_activity_cancellation_grace(
   Config(..config, activity_cancellation_grace: grace)
 }
 
+/// How long `stop` waits for activities in flight, ten seconds by default. When the
+/// worker is asked to stop, running activities see a `WorkerShutdown` cancellation at
+/// once, so that they can finish or checkpoint; whatever is still running when the time is
+/// up is abandoned, and the server gives it to another worker when its timeout passes.
+pub fn with_shutdown_grace(config: Config, grace: Duration) -> Config {
+  Config(..config, shutdown_grace: grace)
+}
+
 /// Start the worker, linked to the calling process. Returns once the server has accepted
 /// it. A worker with no workflows polls only for activities, and the other way round.
 ///
@@ -240,8 +251,10 @@ pub fn supervised(config: Config) -> supervision.ChildSpecification(Worker) {
       Error(error) -> Error(actor.InitFailed(string.inspect(error)))
     }
   })
-  // Stopping waits for tasks in flight, for longer than a supervisor waits by default.
-  |> supervision.timeout(15_000)
+  // Stopping waits for tasks in flight, which is longer than a supervisor waits by default.
+  |> supervision.timeout(
+    duration.to_milliseconds(config.shutdown_grace) + 10_000,
+  )
 }
 
 @internal
@@ -249,10 +262,11 @@ pub fn manager(worker: Worker) -> Pid {
   worker.manager
 }
 
-/// Stop polling and wait, up to ten seconds, for tasks in flight to finish.
+/// Stop polling and wait for tasks in flight to finish, for as long as the worker's
+/// shutdown grace allows.
 pub fn stop(worker: Worker) -> Nil {
   case process.is_alive(worker.manager) {
-    True -> process.call(worker.control, 20_000, Stop)
+    True -> process.call_forever(worker.control, Stop)
     False -> Nil
   }
 }
@@ -415,6 +429,7 @@ fn worker_options(config: Config) -> bridge.WorkerOptions {
         },
       )
     }),
+    shutdown_grace_ms: duration.to_milliseconds(config.shutdown_grace),
   )
 }
 

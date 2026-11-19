@@ -10,7 +10,7 @@ use rustler::{Atom, Encoder, Env, LocalPid, ResourceArc, Term};
 use temporalio_common::protos::temporal::api::{
     common::v1::{Payloads, WorkflowType},
     schedule::v1::{
-        IntervalSpec, Range, Schedule, ScheduleAction, ScheduleInfo, SchedulePatch,
+        BackfillRequest, IntervalSpec, Range, Schedule, ScheduleAction, ScheduleInfo, SchedulePatch,
         SchedulePolicies, ScheduleSpec, ScheduleState, StructuredCalendarSpec,
         TriggerImmediatelyRequest, schedule_action::Action,
     },
@@ -414,7 +414,8 @@ fn schedule_delete<'a>(
     atoms::ok()
 }
 
-/// `patch` is `{pause, Note}`, `{unpause, Note}` or `{trigger, OverlapPolicy}`.
+/// `patch` is `{pause, Note}`, `{unpause, Note}`, `{trigger, OverlapPolicy}` or
+/// `{backfill, FromMs, ToMs, OverlapPolicy}`.
 #[rustler::nif]
 fn schedule_patch<'a>(
     env: Env<'a>,
@@ -441,6 +442,22 @@ fn schedule_patch<'a>(
                 }),
                 ..Default::default()
             }),
+            "backfill" => (|| {
+                let from: i64 = get(&f, 0)?;
+                let to: i64 = get(&f, 1)?;
+                let timestamp = |ms: i64| prost_wkt_types::Timestamp {
+                    seconds: ms.div_euclid(1000),
+                    nanos: (ms.rem_euclid(1000) * 1_000_000) as i32,
+                };
+                Ok(SchedulePatch {
+                    backfill_request: vec![BackfillRequest {
+                        start_time: Some(timestamp(from)),
+                        end_time: Some(timestamp(to)),
+                        overlap_policy: get(&f, 2)?,
+                    }],
+                    ..Default::default()
+                })
+            })(),
             other => Err(format!("unknown patch {other}")),
         },
         Err(e) => Err(e),

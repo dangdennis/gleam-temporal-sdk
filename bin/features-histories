@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Convert the histories recorded by other SDKs in a checkout of
+# https://github.com/temporalio/features into build/features, where
+# test/features_repo_test.gleam replays them. Needs Node.js and the conformance harness's
+# dependencies (npm install in test/conformance/typescript).
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+features="${1:?usage: bin/features-histories <path to a checkout of temporalio/features>}"
+out="$root/build/features"
+mkdir -p "$out"
+cd "$root/test/conformance/typescript"
+history="$features/features/activity/retry_on_error/history"
+node convert.js "$history"/history.go.*.json "$out/retry_on_error.go.bin"
+node convert.js "$history"/history.java.*.json "$out/retry_on_error.java.bin"
