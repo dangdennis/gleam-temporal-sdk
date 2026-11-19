@@ -1,5 +1,5 @@
 -module(temporal_test_ffi).
--export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, log/2, write_file/2]).
+-export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1]).
 
 unique() ->
     integer_to_binary(erlang:system_time(microsecond)).
@@ -116,4 +116,28 @@ log(_, _) ->
 write_file(Path, Bytes) ->
     ok = filelib:ensure_dir(Path),
     ok = file:write_file(Path, Bytes),
+    nil.
+
+%% The processes linked to Pid, and the processes monitoring it.
+linked(Pid) ->
+    case erlang:process_info(Pid, links) of
+        {links, Links} -> [P || P <- Links, is_pid(P)];
+        undefined -> []
+    end.
+
+monitored_by(Pid) ->
+    case erlang:process_info(Pid, monitored_by) of
+        {monitored_by, Pids} -> [P || P <- Pids, is_pid(P)];
+        undefined -> []
+    end.
+
+%% Run Fun with the default log handler silenced, for tests that kill processes on purpose.
+quietly(Fun) ->
+    {ok, #{level := Level}} = logger:get_handler_config(default),
+    ok = logger:set_handler_config(default, level, none),
+    try Fun() after logger:set_handler_config(default, level, Level) end.
+
+%% Stop a supervisor the way its own supervisor would.
+shut_down(Pid) ->
+    exit(Pid, shutdown),
     nil.

@@ -2,7 +2,7 @@
 %% runtime needs that Gleam cannot express.
 -module(temporal_ffi).
 
--export([connect/5, update_workflow/4, poll_update/4, poll_nexus/1, complete_nexus/3, aes_gcm_encrypt/2, aes_gcm_decrypt/2, schedule_put/5, schedule_describe/2, schedule_delete/2,
+-export([connect/5, follow/1, new_cell/0, read_cell/1, write_cell/2, update_workflow/4, poll_update/4, poll_nexus/1, complete_nexus/3, aes_gcm_encrypt/2, aes_gcm_decrypt/2, schedule_put/5, schedule_describe/2, schedule_delete/2,
          schedule_patch/3, schedule_list/1, system_time_ms/0, server_start/2, server_stop/1, time_control/2, worker_new/3, replay_worker_new/2, poll_workflow/1, complete_workflow/2,
          poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/3, worker_shutdown/1,
          start_workflow/3, describe_workflow/3, list_workflows/3, count_workflows/2, signal_workflow/5, query_workflow/5, cancel_workflow/3,
@@ -154,8 +154,31 @@ send_activation(Pid, Activation) ->
     Pid ! {temporal_activation, Activation},
     nil.
 
+%% Cells live in the process dictionary of the workflow run that made them.
+new_cell() ->
+    {temporal_cell, make_ref()}.
+
+read_cell(Cell) ->
+    case erlang:get(Cell) of
+        undefined -> none;
+        {value, Value} -> {some, Value}
+    end.
+
+write_cell(Cell, Value) ->
+    erlang:put(Cell, {value, Value}),
+    nil.
+
+follow(Owner) ->
+    erlang:monitor(process, Owner),
+    nil.
+
+%% The only process a run monitors is the loop that feeds it; without it the run would
+%% wait for ever.
 receive_activation() ->
-    receive {temporal_activation, Activation} -> Activation end.
+    receive
+        {temporal_activation, Activation} -> Activation;
+        {'DOWN', _, process, _, _} -> exit(normal)
+    end.
 
 get_state() ->
     erlang:get(temporal_workflow_state).

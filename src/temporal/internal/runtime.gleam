@@ -14,6 +14,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/set.{type Set}
+import gleam/string
 import temporal/codec.{type Payload}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge.{type Activation, type Command, type Completion}
@@ -79,8 +80,14 @@ pub type Scope {
     cancelled: Option(String),
     /// Newest first.
     ops: List(Op),
+    /// How many operations were added since settled ones were last dropped from `ops`.
+    added: Int,
   )
 }
+
+/// How many operations a scope takes on before it drops the ones that have settled, so
+/// that a long-lived scope does not remember everything it ever started.
+const prune_every = 64
 
 /// The scope that workflow cancellation cancels.
 pub const root_scope = 0
@@ -120,6 +127,8 @@ pub type State {
     locals: Dict(Int, Local),
     /// Oldest first.
     updates: List(PendingUpdate),
+    /// Updates the workflow has taken and not yet answered, by protocol instance id.
+    open_updates: Set(String),
     /// The update names the workflow handles, each with the check an update must pass to
     /// be accepted.
     update_checks: Dict(String, fn(List(Payload)) -> Result(Nil, String)),
@@ -195,11 +204,14 @@ pub fn run(
     nexus_results: dict.new(),
     locals: dict.new(),
     updates: [],
+    open_updates: set.new(),
     update_checks: dict.new(),
     versioning_behavior: 0,
     fired_timers: set.new(),
     cancelled_timers: set.new(),
-    scopes: dict.from_list([#(root_scope, Scope(root_scope, False, None, []))]),
+    scopes: dict.from_list([
+      #(root_scope, Scope(root_scope, False, None, [], 0)),
+    ]),
     next_scope: 1,
     deadlines: dict.new(),
     outbound:,
@@ -217,6 +229,10 @@ pub fn run(
   apply(activation)
   let state = get()
   case dict.get(workflows, state.workflow_type) {
+    // The run was in core's cache but its process was not here: the loop that held it
+    // restarted. Failing the task makes core evict the run and replay it from the start.
+    Error(Nil) if state.workflow_type == "" ->
+      fail_task("workflow run is not in memory; replaying it")
     Error(Nil) ->
       fail_task(
         "workflow type \""
@@ -226,6 +242,7 @@ pub fn run(
     Ok(workflow) ->
       case bridge.rescue(fn() { workflow(state.arguments) }) {
         Ok(result) -> {
+          abandon_updates()
           push(terminal_command(result))
           serve()
         }
@@ -362,6 +379,43 @@ fn settle_update(update: PendingUpdate) -> Nil {
   }
 }
 
+/// Answer an update the workflow took. A second answer to the same update is ignored.
+pub fn answer_update(protocol_instance_id: String, answer: Command) -> Nil {
+  let state = get()
+  case set.contains(state.open_updates, protocol_instance_id) {
+    False -> Nil
+    True -> {
+      put(
+        State(
+          ..state,
+          open_updates: set.delete(state.open_updates, protocol_instance_id),
+        ),
+      )
+      push(answer)
+    }
+  }
+}
+
+/// The workflow is ending: fail every update it has not answered, so that no client is
+/// left waiting on a workflow that will never reply.
+pub fn abandon_updates() -> Nil {
+  let state = get()
+  let unanswered =
+    list.append(
+      list.sort(set.to_list(state.open_updates), string.compare),
+      list.map(state.updates, fn(update) { update.protocol_instance_id }),
+    )
+  put(State(..state, updates: [], open_updates: set.new()))
+  list.each(unanswered, fn(protocol_instance_id) {
+    push(bridge.UpdateRejected(
+      protocol_instance_id,
+      failure.new("the workflow finished before answering the update")
+        |> failure.with_type("WorkflowFinished")
+        |> failure.non_retryable,
+    ))
+  })
+}
+
 /// Take the oldest accepted update with this name, settling queued ones on the way.
 pub fn take_update(name: String) -> Option(PendingUpdate) {
   case list.find(get().updates, fn(update) { update.name == name }) {
@@ -386,6 +440,10 @@ pub fn take_update(name: String) -> Option(PendingUpdate) {
               updates: list.filter(state.updates, fn(other) {
                 other.protocol_instance_id != update.protocol_instance_id
               }),
+              open_updates: set.insert(
+                state.open_updates,
+                update.protocol_instance_id,
+              ),
             ),
           )
           Some(accepted)
@@ -701,7 +759,7 @@ pub fn open_scope(parent: Int, shielded: Bool) -> Int {
       scopes: dict.insert(
         state.scopes,
         id,
-        Scope(parent:, shielded:, cancelled:, ops: []),
+        Scope(parent:, shielded:, cancelled:, ops: [], added: 0),
       ),
     ),
   )
@@ -759,15 +817,21 @@ pub fn scope_cancelled(id: Int) -> Option(String) {
 pub fn register(scope_id: Int, op: Op) -> Nil {
   update(fn(state) {
     case dict.get(state.scopes, scope_id) {
-      Ok(scope) ->
+      Ok(scope) -> {
+        let scope = case scope.added >= prune_every {
+          True ->
+            Scope(..scope, ops: list.filter(scope.ops, is_pending), added: 0)
+          False -> scope
+        }
         State(
           ..state,
           scopes: dict.insert(
             state.scopes,
             scope_id,
-            Scope(..scope, ops: [op, ..scope.ops]),
+            Scope(..scope, ops: [op, ..scope.ops], added: scope.added + 1),
           ),
         )
+      }
       Error(Nil) -> state
     }
   })

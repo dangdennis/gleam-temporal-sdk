@@ -1,11 +1,12 @@
 //// Run workflows and activities by polling a task queue.
 
-import gleam/dict
-import gleam/erlang/process
-import gleam/io
+import gleam/dict.{type Dict}
+import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import gleam/result
+import gleam/otp/actor
+import gleam/otp/supervision
+import gleam/string
 import temporal/activity
 import temporal/client.{type Client}
 import temporal/internal/bridge
@@ -39,6 +40,9 @@ pub type Config {
     outbound: Outbound,
     nexus_handlers: List(nexus.Handler),
     deployment: Option(Deployment),
+    /// How long a cancelled activity gets to stop by itself before its process is killed
+    /// and it is reported as cancelled. `None` never kills.
+    activity_cancellation_grace_ms: Option(Int),
   )
 }
 
@@ -57,7 +61,11 @@ pub type Deployment {
 
 /// A running worker.
 pub opaque type Worker {
-  Worker(nif: bridge.NifWorker)
+  Worker(manager: Pid, control: Subject(Control))
+}
+
+type Control {
+  Stop(reply: Subject(Nil))
 }
 
 /// A worker for one task queue, with nothing registered yet.
@@ -77,6 +85,7 @@ pub fn new(client: Client, task_queue: String) -> Config {
     outbound: middleware.none(),
     nexus_handlers: [],
     deployment: None,
+    activity_cancellation_grace_ms: Some(30_000),
   )
 }
 
@@ -193,34 +202,224 @@ pub fn with_deployment(config: Config, deployment: Deployment) -> Config {
   Config(..config, deployment: Some(deployment))
 }
 
-/// Start polling in background processes. Returns once the worker is registered. A worker
-/// with no workflows polls only for activities, and the other way round.
+/// Kill an activity that is still running this long after it was asked to stop, and report
+/// it as cancelled. The default is thirty seconds. An activity that checks
+/// `activity.is_cancelled` stops well within that; the limit is for one that is stuck, which
+/// would otherwise hold its slot on the worker for good. `None` never kills.
+pub fn with_activity_cancellation_grace(
+  config: Config,
+  grace_ms: Option(Int),
+) -> Config {
+  Config(..config, activity_cancellation_grace_ms: grace_ms)
+}
+
+/// Start the worker, linked to the calling process. Returns once the server has accepted
+/// it. A worker with no workflows polls only for activities, and the other way round.
+///
+/// The worker restarts a polling loop that crashes. If loops keep crashing, more than five
+/// times in a minute, the worker gives up and exits abnormally, which takes the calling
+/// process with it unless it traps exits: a worker that cannot work should not look
+/// healthy. Under a supervisor, use `supervised` instead.
 pub fn start(config: Config) -> Result(Worker, String) {
-  use nif <- result.map(bridge.worker_new(
-    client.connection(config.client),
-    config.task_queue,
-    bridge.WorkerOptions(
-      max_cached_workflows: config.max_cached_workflows,
-      max_concurrent_workflow_tasks: config.max_concurrent_workflow_tasks,
-      max_concurrent_activities: config.max_concurrent_activities,
-      max_task_queue_activities_per_second: config.max_task_queue_activities_per_second,
-      max_activities_per_second: config.max_activities_per_second,
-      enable_workflows: config.workflows != [],
-      enable_activities: config.activities != [],
-      enable_nexus: config.nexus_handlers != [],
-      deployment: option.map(config.deployment, fn(deployment) {
-        bridge.Deployment(
-          name: deployment.name,
-          build_id: deployment.build_id,
-          use_versioning: True,
-          default_behavior: case deployment.default_behavior {
-            workflow.Pinned -> 1
-            workflow.AutoUpgrade -> 2
-          },
-        )
-      }),
-    ),
-  ))
+  let started = process.new_subject()
+  let parent = process.self()
+  let manager = process.spawn(fn() { manage(config, parent, started) })
+  case process.receive_forever(started) {
+    Ok(control) -> Ok(Worker(manager, control))
+    Error(reason) -> Error(reason)
+  }
+}
+
+/// A child specification for running the worker under a `gleam/otp` supervisor, which
+/// restarts it if it gives up.
+pub fn supervised(config: Config) -> supervision.ChildSpecification(Worker) {
+  supervision.worker(fn() {
+    case start(config) {
+      Ok(worker) -> Ok(actor.Started(worker.manager, worker))
+      Error(reason) -> Error(actor.InitFailed(reason))
+    }
+  })
+  // Stopping waits for tasks in flight, for longer than a supervisor waits by default.
+  |> supervision.timeout(15_000)
+}
+
+@internal
+pub fn manager(worker: Worker) -> Pid {
+  worker.manager
+}
+
+/// Stop polling and wait, up to ten seconds, for tasks in flight to finish.
+pub fn stop(worker: Worker) -> Nil {
+  case process.is_alive(worker.manager) {
+    True -> process.call(worker.control, 20_000, Stop)
+    False -> Nil
+  }
+}
+
+// ---- the manager process ----
+
+type Manager {
+  Manager(
+    nif: bridge.NifWorker,
+    /// What each running loop is, by its process.
+    loops: Dict(Pid, Loop),
+    /// When recent restarts happened, in milliseconds, newest first.
+    restarts: List(Int),
+  )
+}
+
+type Loop {
+  Loop(name: String, run: fn() -> Nil)
+}
+
+type Event {
+  Control(Control)
+  Exited(process.ExitMessage)
+}
+
+const max_restarts = 5
+
+const restart_window_ms = 60_000
+
+@external(erlang, "temporal_ffi", "system_time_ms")
+fn now_ms() -> Int
+
+fn manage(
+  config: Config,
+  parent: Pid,
+  started: Subject(Result(Subject(Control), String)),
+) -> Nil {
+  process.trap_exits(True)
+  case register(config, 30) {
+    Error(reason) -> process.send(started, Error(reason))
+    Ok(nif) -> {
+      let control = process.new_subject()
+      let loops =
+        loops(config, nif)
+        |> list.map(fn(loop) { #(process.spawn(loop.run), loop) })
+        |> dict.from_list
+      process.send(started, Ok(control))
+      let events =
+        process.new_selector()
+        |> process.select_map(control, Control)
+        |> process.select_trapped_exits(Exited)
+      supervise(Manager(nif, loops, []), parent, events)
+    }
+  }
+}
+
+/// Register with core. A worker that replaces one that just died may be refused while the
+/// old one is still letting go of the task queue, so that refusal alone is retried.
+fn register(config: Config, attempts: Int) -> Result(bridge.NifWorker, String) {
+  let registered =
+    bridge.worker_new(
+      client.connection(config.client),
+      config.task_queue,
+      worker_options(config),
+    )
+  case registered {
+    Error(reason) if attempts > 0 ->
+      case string.contains(reason, "overlapping worker task types") {
+        True -> {
+          process.sleep(500)
+          register(config, attempts - 1)
+        }
+        False -> registered
+      }
+    _ -> registered
+  }
+}
+
+fn supervise(
+  manager: Manager,
+  parent: Pid,
+  events: process.Selector(Event),
+) -> Nil {
+  case process.selector_receive_forever(events) {
+    Control(Stop(reply)) -> {
+      bridge.worker_shutdown(manager.nif)
+      process.send(reply, Nil)
+    }
+    Exited(process.ExitMessage(pid, reason)) ->
+      case dict.get(manager.loops, pid), reason {
+        // The process that started the worker, or its supervisor, is going away.
+        Error(Nil), _ if pid == parent -> bridge.worker_shutdown(manager.nif)
+        // Something else that was linked to this process.
+        Error(Nil), _ -> supervise(manager, parent, events)
+        // A loop ends normally only when the worker is shutting down.
+        Ok(_), process.Normal ->
+          supervise(
+            Manager(..manager, loops: dict.delete(manager.loops, pid)),
+            parent,
+            events,
+          )
+        Ok(loop), _ -> {
+          let now = now_ms()
+          let recent =
+            list.filter(manager.restarts, fn(at) {
+              now - at < restart_window_ms
+            })
+          report(config_error(
+            loop.name <> " loop crashed: " <> string.inspect(reason),
+          ))
+          case list.length(recent) >= max_restarts {
+            True -> {
+              bridge.worker_shutdown(manager.nif)
+              panic as "temporal worker gave up: its polling loops keep crashing"
+            }
+            False ->
+              supervise(
+                Manager(
+                  ..manager,
+                  loops: manager.loops
+                    |> dict.delete(pid)
+                    |> dict.insert(process.spawn(loop.run), loop),
+                  restarts: [now, ..recent],
+                ),
+                parent,
+                events,
+              )
+          }
+        }
+      }
+  }
+}
+
+fn config_error(message: String) -> String {
+  "temporal worker: " <> message
+}
+
+fn report(message: String) -> Nil {
+  bridge.log(bridge.Error, message, dict.new())
+}
+
+fn worker_options(config: Config) -> bridge.WorkerOptions {
+  bridge.WorkerOptions(
+    max_cached_workflows: config.max_cached_workflows,
+    max_concurrent_workflow_tasks: config.max_concurrent_workflow_tasks,
+    max_concurrent_activities: config.max_concurrent_activities,
+    max_task_queue_activities_per_second: config.max_task_queue_activities_per_second,
+    max_activities_per_second: config.max_activities_per_second,
+    enable_workflows: config.workflows != [],
+    enable_activities: config.activities != [],
+    enable_nexus: config.nexus_handlers != [],
+    deployment: option.map(config.deployment, fn(deployment) {
+      bridge.Deployment(
+        name: deployment.name,
+        build_id: deployment.build_id,
+        use_versioning: True,
+        default_behavior: case deployment.default_behavior {
+          workflow.Pinned -> 1
+          workflow.AutoUpgrade -> 2
+        },
+      )
+    }),
+  )
+}
+
+/// The polling loops this worker needs. Each returns when the worker shuts down and
+/// crashes if polling fails.
+fn loops(config: Config, nif: bridge.NifWorker) -> List(Loop) {
   let codec = client.payload_codec(config.client)
   let workflows =
     dict.from_list(
@@ -238,51 +437,50 @@ pub fn start(config: Config) -> Result(Worker, String) {
         #(wrapped.name, wrapped)
       }),
     )
-  case config.workflows {
-    [] -> Nil
-    _ -> {
-      process.spawn_unlinked(fn() {
-        case
-          poller.workflow_loop(
-            nif,
-            workflows,
-            config.task_queue,
-            config.outbound,
-            codec,
-            False,
-          )
-        {
-          Ok(_) -> Nil
-          Error(message) ->
-            io.println_error("temporal: workflow polling failed: " <> message)
-        }
-      })
+  let workflow_loop =
+    Loop("workflow", fn() {
+      let assert Ok(_) =
+        poller.workflow_loop(
+          nif,
+          workflows,
+          config.task_queue,
+          config.outbound,
+          codec,
+          False,
+        )
       Nil
-    }
-  }
+    })
   // The activity poller also delivers local activities, which core issues to any worker
   // that runs workflows.
-  case config.activities, config.workflows {
-    [], [] -> Nil
-    _, _ -> {
-      process.spawn_unlinked(fn() {
-        poller.activity_loop(nif, activities, config.task_queue, codec)
-      })
-      Nil
-    }
-  }
-  case config.nexus_handlers {
-    [] -> Nil
-    handlers -> {
-      let dispatch = nexus.dispatcher(handlers, config.client)
-      process.spawn_unlinked(fn() { poller.nexus_loop(nif, dispatch) })
-      Nil
-    }
-  }
-  Worker(nif)
-}
-
-/// Stop polling and wait, up to ten seconds, for tasks in flight to finish.
-pub fn stop(worker: Worker) -> Nil {
-  bridge.worker_shutdown(worker.nif)
+  let activity_loop =
+    Loop("activity", fn() {
+      poller.activity_loop(
+        nif,
+        activities,
+        config.task_queue,
+        codec,
+        config.activity_cancellation_grace_ms,
+      )
+    })
+  let nexus_loop =
+    Loop("nexus", fn() {
+      poller.nexus_loop(
+        nif,
+        nexus.dispatcher(config.nexus_handlers, config.client),
+      )
+    })
+  list.flatten([
+    case config.workflows {
+      [] -> []
+      _ -> [workflow_loop]
+    },
+    case config.activities, config.workflows {
+      [], [] -> []
+      _, _ -> [activity_loop]
+    },
+    case config.nexus_handlers {
+      [] -> []
+      _ -> [nexus_loop]
+    },
+  ])
 }

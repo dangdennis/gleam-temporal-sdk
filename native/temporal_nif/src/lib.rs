@@ -24,8 +24,17 @@ use std::{
 use temporalio_client::{ClientTlsOptions, Connection, ConnectionOptions, TlsOptions};
 use temporalio_common::{
     protos::{
-        coresdk::{ActivityHeartbeat, ActivityTaskCompletion},
-        temporal::api::history::v1::History,
+        coresdk::{
+            ActivityHeartbeat, ActivityTaskCompletion,
+            activity_result::{self, ActivityExecutionResult, activity_execution_result},
+            activity_task::activity_task,
+            nexus::{NexusTask, NexusTaskCompletion, nexus_task, nexus_task_completion},
+            workflow_activation::workflow_activation_job::Variant as Job,
+            workflow_completion::{
+                self, WorkflowActivationCompletion, workflow_activation_completion::Status,
+            },
+        },
+        temporal::api::{failure::v1::Failure, history::v1::History},
     },
     worker::{
         VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes,
@@ -56,7 +65,19 @@ pub struct WorkerRes {
 #[rustler::resource_impl]
 impl rustler::Resource for ConnectionRes {}
 #[rustler::resource_impl]
-impl rustler::Resource for WorkerRes {}
+impl rustler::Resource for WorkerRes {
+    const IMPLEMENTS_DOWN: bool = true;
+
+    /// The process that owns the worker died without stopping it. Shut the worker down, so
+    /// that its polls end and a replacement can register on the same task queue.
+    fn down<'a>(&'a self, _env: Env<'a>, _pid: LocalPid, _monitor: rustler::Monitor) {
+        let worker = self.worker.clone();
+        runtime().tokio_handle().spawn(async move {
+            worker.initiate_shutdown();
+            let _ = tokio::time::timeout(Duration::from_secs(10), worker.shutdown()).await;
+        });
+    }
+}
 
 pub fn runtime() -> &'static CoreRuntime {
     static RT: OnceLock<CoreRuntime> = OnceLock::new();
@@ -74,14 +95,49 @@ where
     T: Send + 'static,
     R: for<'a> FnOnce(Env<'a>, T) -> Term<'a> + Send + 'static,
 {
+    spawn_reply_or(pid, reference, fut, reply, |_| (), |()| async {});
+}
+
+/// Like `spawn_reply`, for results that must not be lost. If `pid` has died by the time the
+/// result is ready, `undelivered` runs on what `salvage` kept of it. A polling loop that
+/// crashes leaves its poll running, so without this the next task would vanish and the
+/// server would wait out its timeout.
+pub fn spawn_reply_or<F, T, R, S, K, U, UF>(
+    pid: LocalPid,
+    reference: Term,
+    fut: F,
+    reply: R,
+    salvage: S,
+    undelivered: U,
+) where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+    R: for<'a> FnOnce(Env<'a>, T) -> Term<'a> + Send + 'static,
+    S: FnOnce(&T) -> K + Send + 'static,
+    K: Send + 'static,
+    U: FnOnce(K) -> UF + Send + 'static,
+    UF: Future<Output = ()> + Send + 'static,
+{
     let mut owned = OwnedEnv::new();
     let saved = owned.save(reference);
     runtime().tokio_handle().spawn(async move {
         let out = fut.await;
-        let _ = owned.send_and_clear(&pid, |env| {
+        let kept = salvage(&out);
+        let sent = owned.send_and_clear(&pid, |env| {
             (atoms::temporal_nif(), saved.load(env), reply(env, out)).encode(env)
         });
+        if sent.is_err() {
+            undelivered(kept).await;
+        }
     });
+}
+
+fn lost_task_failure() -> Failure {
+    Failure {
+        message: "the worker process that asked for this task died before receiving it".to_string(),
+        source: "GleamSDK".to_string(),
+        ..Default::default()
+    }
 }
 
 pub fn ok<'a>(env: Env<'a>, t: Term<'a>) -> Term<'a> {
@@ -284,8 +340,14 @@ fn worker_new<'a>(
             namespace: conn.namespace.clone(),
         })
     };
-    spawn_reply(pid, reference, fut, |env, r| match r {
-        Ok(res) => ok(env, ResourceArc::new(res).encode(env)),
+    // The worker belongs to the process that asked for it and is shut down if that dies.
+    let owner = pid;
+    spawn_reply(pid, reference, fut, move |env, r| match r {
+        Ok(res) => {
+            let worker = ResourceArc::new(res);
+            worker.monitor(None, &owner);
+            ok(env, worker.encode(env))
+        }
         Err(e) => err(env, e),
     });
     atoms::ok().encode(env)
@@ -344,11 +406,50 @@ fn poll_error<'a>(env: Env<'a>, e: PollError) -> Term<'a> {
 
 #[rustler::nif]
 fn worker_poll_workflow<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<WorkerRes>) -> Atom {
-    let fut = async move { w.worker.poll_workflow_activation().await };
-    spawn_reply(pid, reference, fut, |env, r| match r {
-        Ok(activation) => ok(env, encode_activation(env, activation)),
-        Err(e) => poll_error(env, e),
-    });
+    let poller = w.clone();
+    let fut = async move { poller.worker.poll_workflow_activation().await };
+    spawn_reply_or(
+        pid,
+        reference,
+        fut,
+        |env, r| match r {
+            Ok(activation) => ok(env, encode_activation(env, activation)),
+            Err(e) => poll_error(env, e),
+        },
+        // The run id, and whether the activation only evicts the run.
+        |r| {
+            r.as_ref().ok().map(|a| {
+                let eviction = a
+                    .jobs
+                    .iter()
+                    .all(|j| matches!(j.variant, Some(Job::RemoveFromCache(_))));
+                (a.run_id.clone(), eviction)
+            })
+        },
+        |lost| async move {
+            let Some((run_id, eviction)) = lost else {
+                return;
+            };
+            // An eviction is acknowledged. Anything else fails the task, which makes core
+            // evict the run and the server send the task again.
+            let status = if eviction {
+                Status::Successful(Default::default())
+            } else {
+                Status::Failed(workflow_completion::Failure {
+                    failure: Some(lost_task_failure()),
+                    ..Default::default()
+                })
+            };
+            let _ = w
+                .worker
+                .complete_workflow_activation(WorkflowActivationCompletion {
+                    run_id,
+                    status: Some(status),
+                    ..Default::default()
+                })
+                .await;
+        },
+    );
     atoms::ok()
 }
 
@@ -371,11 +472,42 @@ fn worker_complete_workflow<'a>(
 
 #[rustler::nif]
 fn worker_poll_activity<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<WorkerRes>) -> Atom {
-    let fut = async move { w.worker.poll_activity_task().await };
-    spawn_reply(pid, reference, fut, |env, r| match r {
-        Ok(task) => ok(env, encode_activity_task(env, task)),
-        Err(e) => poll_error(env, e),
-    });
+    let poller = w.clone();
+    let fut = async move { poller.worker.poll_activity_task().await };
+    spawn_reply_or(
+        pid,
+        reference,
+        fut,
+        |env, r| match r {
+            Ok(task) => ok(env, encode_activity_task(env, task)),
+            Err(e) => poll_error(env, e),
+        },
+        // The token of a task that starts an activity.
+        |r| match r {
+            Ok(task) if matches!(task.variant, Some(activity_task::Variant::Start(_))) => {
+                Some(task.task_token.clone())
+            }
+            _ => None,
+        },
+        |lost| async move {
+            let Some(task_token) = lost else { return };
+            // Failed, not cancelled, so that the activity's retry policy applies.
+            let _ = w
+                .worker
+                .complete_activity_task(ActivityTaskCompletion {
+                    task_token,
+                    result: Some(ActivityExecutionResult {
+                        status: Some(activity_execution_result::Status::Failed(
+                            activity_result::Failure {
+                                failure: Some(lost_task_failure()),
+                                ..Default::default()
+                            },
+                        )),
+                    }),
+                })
+                .await;
+        },
+    );
     atoms::ok()
 }
 
@@ -419,11 +551,35 @@ fn worker_heartbeat<'a>(
 
 #[rustler::nif]
 fn worker_poll_nexus<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<WorkerRes>) -> Atom {
-    let fut = async move { w.worker.poll_nexus_task().await };
-    spawn_reply(pid, reference, fut, |env, r| match r {
-        Ok(task) => ok(env, encode_nexus_task(env, task)),
-        Err(e) => poll_error(env, e),
-    });
+    let poller = w.clone();
+    let fut = async move { poller.worker.poll_nexus_task().await };
+    spawn_reply_or(
+        pid,
+        reference,
+        fut,
+        |env, r| match r {
+            Ok(task) => ok(env, encode_nexus_task(env, task)),
+            Err(e) => poll_error(env, e),
+        },
+        |r| match r {
+            Ok(NexusTask {
+                variant: Some(nexus_task::Variant::Task(task)),
+                ..
+            }) => Some(task.task_token.clone()),
+            _ => None,
+        },
+        |lost| async move {
+            let Some(task_token) = lost else { return };
+            // The caller's server retries a request its handler could not take.
+            let _ = w
+                .worker
+                .complete_nexus_task(NexusTaskCompletion {
+                    task_token,
+                    status: Some(nexus_task_completion::Status::Failure(lost_task_failure())),
+                })
+                .await;
+        },
+    );
     atoms::ok()
 }
 

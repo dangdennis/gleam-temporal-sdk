@@ -690,6 +690,23 @@ pub fn receive_activation() -> Activation
 @external(erlang, "temporal_ffi", "rescue")
 pub fn rescue(body: fn() -> a) -> Result(a, String)
 
+/// A slot in the calling process that holds at most one value.
+pub type Cell(a)
+
+@external(erlang, "temporal_ffi", "new_cell")
+pub fn new_cell() -> Cell(a)
+
+@external(erlang, "temporal_ffi", "read_cell")
+pub fn read_cell(cell: Cell(a)) -> Option(a)
+
+@external(erlang, "temporal_ffi", "write_cell")
+pub fn write_cell(cell: Cell(a), value: a) -> Nil
+
+/// Make the calling workflow run process exit when `owner` does. Takes effect the next
+/// time the process waits for an activation.
+@external(erlang, "temporal_ffi", "follow")
+pub fn follow(owner: Pid) -> Nil
+
 @external(erlang, "temporal_ffi", "exit_normal")
 pub fn exit_normal() -> a
 

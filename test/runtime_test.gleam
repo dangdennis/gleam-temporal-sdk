@@ -4,6 +4,8 @@
 
 import gleam/dict
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/int
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import temporal/activity
@@ -1021,4 +1023,103 @@ pub fn a_workflow_reports_its_versioning_behaviour_test() {
   )
   let assert Ok(bridge.Success("run", [bridge.CompleteWorkflow(_)], 1)) =
     process.receive(run.1, 1000)
+}
+
+pub fn a_future_keeps_the_value_it_resolved_with_test() {
+  let run =
+    start(
+      int_workflow("twice", fn(ctx, _) {
+        let next = workflow.signal(ctx, added())
+        // Awaiting again must not take a second signal.
+        let first = workflow.await(next)
+        let again = workflow.await(next)
+        let other = workflow.receive_signal(ctx, added())
+        Ok(first * 100 + again * 10 + other)
+      }),
+    )
+  let signal = fn(n) { bridge.SignalWorkflow("added", [codec.int().encode(n)]) }
+  assert activate(run, [init("twice", 0), signal(1), signal(2)])
+    == [bridge.CompleteWorkflow(int_payload(112))]
+}
+
+pub fn a_workflow_that_ends_fails_the_updates_it_did_not_answer_test() {
+  let run =
+    start(
+      int_workflow("rude", fn(ctx, n) {
+        // Takes one update and answers neither it nor the one still queued.
+        let _ = workflow.receive_update(ctx, add())
+        Ok(n)
+      }),
+    )
+  // The first was taken, so it is accepted and then failed. The second was still waiting
+  // to be looked at, so it is refused outright and leaves no trace in history.
+  let assert [
+    bridge.UpdateAccepted("p1"),
+    bridge.UpdateRejected(
+      "p1",
+      failure.Failure(error_type: "WorkflowFinished", ..),
+    ),
+    bridge.UpdateRejected("p2", _),
+    bridge.CompleteWorkflow(_),
+  ] =
+    activate(run, [
+      init("rude", 1),
+      update_job("p1", 1, True),
+      update_job("p2", 2, True),
+    ])
+}
+
+pub fn only_the_first_answer_to_an_update_counts_test() {
+  let run =
+    start(
+      int_workflow("eager", fn(ctx, n) {
+        let update = workflow.receive_update(ctx, add())
+        workflow.complete_update(ctx, update, Ok(1))
+        workflow.complete_update(ctx, update, Ok(2))
+        Ok(n)
+      }),
+    )
+  assert activate(run, [init("eager", 7), update_job("p1", 1, True)])
+    == [
+      bridge.UpdateAccepted("p1"),
+      bridge.UpdateCompleted("p1", codec.int().encode(1)),
+      bridge.CompleteWorkflow(int_payload(7)),
+    ]
+}
+
+pub fn fail_on_crash_turns_a_crash_into_a_workflow_failure_test() {
+  let handler =
+    int_workflow("brittle", fn(_, _) { panic as "a bug" })
+    |> workflow.fail_on_crash
+  let assert [
+    bridge.FailWorkflow(failure.Failure(
+      error_type: "WorkflowCrashed",
+      non_retryable: True,
+      ..,
+    )),
+  ] = activate(start(handler), [init("brittle", 1)])
+}
+
+pub fn a_scope_forgets_operations_that_have_settled_test() {
+  let timers = 200
+  let run =
+    start(
+      int_workflow("busy", fn(ctx, _) {
+        int.range(from: 0, to: timers, with: Nil, run: fn(_, _) {
+          let assert Ok(Nil) = workflow.sleep(ctx, 1)
+          Nil
+        })
+        let assert Ok(root) = dict.get(runtime.get().scopes, runtime.root_scope)
+        Ok(list.length(root.ops))
+      }),
+    )
+  let _ = activate(run, [init("busy", 0)])
+  let remembered =
+    int.range(from: 1, to: timers + 1, with: [], run: fn(_, seq) {
+      activate(run, [bridge.FireTimer(seq)])
+    })
+  let assert [bridge.CompleteWorkflow(Some(remembered))] = remembered
+  let assert Ok(remembered) = codec.int().decode(remembered)
+  // Far fewer than the two hundred timers the workflow's scope has seen.
+  assert remembered <= 64
 }

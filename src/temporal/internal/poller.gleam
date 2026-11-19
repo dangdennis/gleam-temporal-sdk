@@ -2,7 +2,6 @@
 
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid}
-import gleam/io
 import gleam/list
 import gleam/option.{type Option}
 import temporal/activity
@@ -51,6 +50,7 @@ fn do_workflow_loop(
   runs: Dict(String, Pid),
   evictions: List(Eviction),
 ) -> Result(List(Eviction), String) {
+  let loop = process.self()
   case bridge.poll_workflow(worker) {
     Error(bridge.Shutdown) -> Ok(evictions)
     Error(bridge.PollFailed(message)) -> Error(message)
@@ -68,8 +68,10 @@ fn do_workflow_loop(
         case bridge.complete_workflow(worker, completion) {
           Ok(Nil) -> Nil
           Error(reason) ->
-            io.println_error(
+            bridge.log(
+              bridge.Error,
               "temporal: workflow completion rejected: " <> reason,
+              dict.new(),
             )
         }
       }
@@ -85,6 +87,8 @@ fn do_workflow_loop(
       let runs = case decoded {
         Ok(activation) ->
           dispatch(activation, existing, eviction, runs, complete, fn() {
+            // A run belongs to the loop that feeds it: if the loop dies, so does the run.
+            bridge.follow(loop)
             runtime.run(workflows, task_queue, outbound, complete)
           })
         // Core evicts the run after a failed task and replays it, so the run's process,
@@ -154,8 +158,16 @@ pub fn activity_loop(
   activities: Dict(String, activity.Handler),
   task_queue: String,
   codec: Option(PayloadCodec),
+  cancellation_grace_ms: Option(Int),
 ) -> Nil {
-  do_activity_loop(worker, activities, task_queue, codec, dict.new())
+  do_activity_loop(
+    worker,
+    activities,
+    task_queue,
+    codec,
+    cancellation_grace_ms,
+    dict.new(),
+  )
 }
 
 fn do_activity_loop(
@@ -163,16 +175,25 @@ fn do_activity_loop(
   activities: Dict(String, activity.Handler),
   task_queue: String,
   codec: Option(PayloadCodec),
+  cancellation_grace_ms: Option(Int),
   running: Dict(BitArray, Pid),
 ) -> Nil {
   let running = dict.filter(running, fn(_, pid) { process.is_alive(pid) })
   let continue = fn(running) {
-    do_activity_loop(worker, activities, task_queue, codec, running)
+    do_activity_loop(
+      worker,
+      activities,
+      task_queue,
+      codec,
+      cancellation_grace_ms,
+      running,
+    )
   }
   case bridge.poll_activity(worker) {
     Error(bridge.Shutdown) -> Nil
+    // Crash, so that the worker's manager sees it and restarts the loop.
     Error(bridge.PollFailed(message)) ->
-      io.println_error("temporal: activity polling failed: " <> message)
+      panic as { "activity polling failed: " <> message }
     Ok(bridge.ActivityStart(task_token:, ..) as task) ->
       case transcode.decode_activity_task(codec, task) {
         Ok(task) -> {
@@ -196,10 +217,45 @@ fn do_activity_loop(
       // `activity.is_cancelled` and reports its own outcome. An activity that has already
       // finished needs nothing.
       case dict.get(running, task_token) {
-        Ok(pid) -> bridge.send_activity_cancel(pid, reason)
+        Ok(pid) -> {
+          bridge.send_activity_cancel(pid, reason)
+          enforce_grace(worker, task_token, pid, cancellation_grace_ms)
+        }
         Error(Nil) -> Nil
       }
       continue(running)
+    }
+  }
+}
+
+/// Kill a cancelled activity that outstays its grace period and report it as cancelled, so
+/// that a stuck activity cannot hold its slot on the worker for good.
+fn enforce_grace(
+  worker: NifWorker,
+  task_token: BitArray,
+  pid: Pid,
+  grace_ms: Option(Int),
+) -> Nil {
+  case grace_ms {
+    option.None -> Nil
+    option.Some(grace_ms) -> {
+      process.spawn_unlinked(fn() {
+        process.sleep(grace_ms)
+        case process.is_alive(pid) {
+          False -> Nil
+          True -> {
+            bridge.kill(pid)
+            let _ =
+              bridge.complete_activity(
+                worker,
+                task_token,
+                bridge.ActivityCancelled(failure.cancelled()),
+              )
+            Nil
+          }
+        }
+      })
+      Nil
     }
   }
 }
@@ -313,7 +369,7 @@ pub fn nexus_loop(
   case bridge.poll_nexus(worker) {
     Error(bridge.Shutdown) -> Nil
     Error(bridge.PollFailed(message)) ->
-      io.println_error("temporal: nexus polling failed: " <> message)
+      panic as { "nexus polling failed: " <> message }
     Ok(task) -> {
       process.spawn_unlinked(fn() {
         let _ = bridge.complete_nexus(worker, task.task_token, handle(task))

@@ -261,6 +261,27 @@ pub fn handler(
   })
 }
 
+/// Make a crash in this workflow's code fail the workflow, with a non-retryable
+/// `WorkflowCrashed` failure, instead of failing the workflow task.
+///
+/// By default a crash, such as a failed `let assert`, fails only the task, and the server
+/// retries it for as long as it takes: the workflow resumes once fixed code is deployed.
+/// That is the safer default for a bug. Use this for workflows where failing fast and
+/// letting the caller react is better than waiting for a fix.
+pub fn fail_on_crash(handler: Handler) -> Handler {
+  Handler(handler.name, fn(arguments) {
+    case bridge.rescue(fn() { handler.run(arguments) }) {
+      Ok(outcome) -> outcome
+      Error(crash) ->
+        Error(
+          failure.new("workflow code crashed: " <> crash)
+          |> failure.with_type("WorkflowCrashed")
+          |> failure.non_retryable,
+        )
+    }
+  })
+}
+
 /// Run `middleware` around the handler. The first middleware applied is the innermost.
 pub fn wrap(handler: Handler, middleware: Middleware) -> Handler {
   Handler(handler.name, fn(arguments) {
@@ -401,7 +422,27 @@ pub fn await(future: Future(a)) -> a {
 
 /// A future of `transform` applied to the value of `future`.
 pub fn map(future: Future(a), with transform: fn(a) -> b) -> Future(b) {
-  Future(fn() { option.map(future.poll(), transform) })
+  once(fn() { option.map(future.poll(), transform) })
+}
+
+/// A future that keeps its value once it has one, however often it is asked. Without
+/// this, a future that takes something when it resolves, such as the next signal, would
+/// take another each time it was awaited.
+fn once(poll: fn() -> Option(a)) -> Future(a) {
+  let cell = bridge.new_cell()
+  Future(fn() {
+    case bridge.read_cell(cell) {
+      Some(value) -> Some(value)
+      None -> {
+        let value = poll()
+        case value {
+          Some(value) -> bridge.write_cell(cell, value)
+          None -> Nil
+        }
+        value
+      }
+    }
+  })
 }
 
 /// A future that already has its value.
@@ -412,7 +453,7 @@ pub fn ready(value: a) -> Future(a) {
 /// A future that has a value once `check` returns one. `check` runs each time the workflow
 /// makes progress, so it must be cheap and must only read workflow state.
 pub fn poll(check: fn() -> Option(a)) -> Future(a) {
-  Future(check)
+  once(check)
 }
 
 /// Wait for every future and return their values in the order given. The futures make
@@ -424,7 +465,7 @@ pub fn await_all(futures: List(Future(a))) -> List(a) {
 /// A future of the first value to become available. Earlier futures in the list win ties,
 /// so the choice is deterministic.
 pub fn race(futures: List(Future(a))) -> Future(a) {
-  Future(fn() {
+  once(fn() {
     list.find_map(futures, fn(future) { option.to_result(future.poll(), Nil) })
     |> option.from_result
   })
@@ -858,7 +899,7 @@ pub fn execute_child(
 /// A future of the next signal of this kind. Signals that arrived before anyone asked are
 /// buffered and delivered in order. A signal whose payload does not decode is dropped.
 pub fn signal(_ctx: Context, definition: SignalDefinition(a)) -> Future(a) {
-  Future(fn() { next_signal(definition) })
+  once(fn() { next_signal(definition) })
 }
 
 fn next_signal(definition: SignalDefinition(a)) -> Option(a) {
@@ -913,6 +954,7 @@ pub fn continue_as_new(
   definition: Definition(input, output),
   input: input,
 ) -> Result(output, Failure) {
+  runtime.abandon_updates()
   runtime.push(
     bridge.ContinueAsNew(definition.name, runtime.get().task_queue, [
       definition.input.encode(input),
@@ -1094,7 +1136,7 @@ pub fn update(
   definition: UpdateDefinition(argument, result),
 ) -> Future(Update(argument, result)) {
   runtime.register_update(definition.name, decodes(definition), False)
-  Future(fn() { next_update(definition) })
+  once(fn() { next_update(definition) })
 }
 
 fn next_update(
@@ -1113,10 +1155,13 @@ fn next_update(
           ))
         // Only on replay of an update accepted by different code: fail it and move on.
         Error(reason) -> {
-          runtime.push(bridge.UpdateRejected(
+          runtime.answer_update(
             pending.protocol_instance_id,
-            failure.new("invalid update argument: " <> reason),
-          ))
+            bridge.UpdateRejected(
+              pending.protocol_instance_id,
+              failure.new("invalid update argument: " <> reason),
+            ),
+          )
           next_update(definition)
         }
       }
@@ -1133,10 +1178,11 @@ pub fn receive_update(
 
 /// The next accepted update of this kind if one is waiting. Does not wait.
 pub fn try_receive_update(
-  ctx: Context,
+  _ctx: Context,
   definition: UpdateDefinition(argument, result),
 ) -> Option(Update(argument, result)) {
-  update(ctx, definition).poll()
+  runtime.register_update(definition.name, decodes(definition), False)
+  next_update(definition)
 }
 
 /// The value the client sent with the update.
@@ -1149,14 +1195,15 @@ pub fn update_id(update: Update(argument, result)) -> String {
   update.id
 }
 
-/// Answer an update. The client's call returns the value, or fails with the failure.
-/// Answer each update exactly once.
+/// Answer an update. The client's call returns the value, or fails with the failure. Only
+/// the first answer counts. An update still unanswered when the workflow ends fails with a
+/// `WorkflowFinished` failure.
 pub fn complete_update(
   _ctx: Context,
   update: Update(argument, result),
   outcome: Result(result, Failure),
 ) -> Nil {
-  runtime.push(case outcome {
+  runtime.answer_update(update.protocol_instance_id, case outcome {
     Ok(value) ->
       bridge.UpdateCompleted(
         update.protocol_instance_id,
