@@ -1,5 +1,5 @@
 -module(temporal_test_ffi).
--export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1]).
+-export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1, memory_mb/0, env_int/2]).
 
 unique() ->
     integer_to_binary(erlang:system_time(microsecond)).
@@ -141,3 +141,12 @@ quietly(Fun) ->
 shut_down(Pid) ->
     exit(Pid, shutdown),
     nil.
+
+memory_mb() ->
+    erlang:memory(total) div (1024 * 1024).
+
+env_int(Name, Default) ->
+    case os:getenv(binary_to_list(Name)) of
+        false -> Default;
+        Value -> list_to_integer(Value)
+    end.

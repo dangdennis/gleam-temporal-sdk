@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Run the load test: thousands of workflows on several workers while workers are killed and
+# replaced. Needs a Temporal service on localhost:7233. Tune with LOAD_WORKFLOWS,
+# LOAD_WORKERS and LOAD_KILL_EVERY_MS.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+bin/build-nif
+gleam build
+erl -noshell -pa build/dev/erlang/*/ebin -eval '
+  logger:set_handler_config(default, level, none),
+  try load:main(), halt(0) catch _:Reason -> io:format("~p~n", [Reason]), halt(1) end.'
