@@ -5,6 +5,7 @@ import gleam/erlang/process.{type Pid}
 import gleam/list
 import gleam/option.{Some}
 import gleam/otp/static_supervisor
+import gleam/time/duration
 import support.{eventually, unique}
 import temporal/activity
 import temporal/client
@@ -45,7 +46,7 @@ fn waiter_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
     ctx,
     double(),
     n,
-    workflow.activity_options(start_to_close_ms: 10_000),
+    workflow.activity_options(start_to_close: duration.milliseconds(10_000)),
   )
 }
 
@@ -131,12 +132,12 @@ fn impatient() {
 fn impatient_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   let options =
     workflow.ActivityOptions(
-      ..workflow.activity_options(start_to_close_ms: 120_000),
-      heartbeat_timeout_ms: Some(1000),
+      ..workflow.activity_options(start_to_close: duration.milliseconds(120_000)),
+      heartbeat_timeout: Some(duration.milliseconds(1000)),
       cancellation: workflow.WaitCancellationCompleted,
     )
   let outcome =
-    workflow.with_timeout(ctx, 300, fn(scope) {
+    workflow.with_timeout(ctx, duration.milliseconds(300), fn(scope) {
       workflow.execute_activity(scope, deaf(), Nil, options)
     })
   case outcome {
@@ -156,7 +157,7 @@ pub fn an_activity_that_ignores_cancellation_is_killed_after_its_grace_test() {
     worker.new(client, task_queue)
     |> worker.with_workflows([workflow.handler(impatient(), impatient_workflow)])
     |> worker.with_activities([activity.handler(deaf(), deaf_activity)])
-    |> worker.with_activity_cancellation_grace(Some(500))
+    |> worker.with_activity_cancellation_grace(Some(duration.milliseconds(500)))
     |> worker.start
   // Without the grace period the activity would run for its full two minutes.
   assert client.execute(

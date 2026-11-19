@@ -11,6 +11,7 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import gleam/time/duration
 import support.{
   type Env, cmd, eventually, read_file, start_options, unique, write_file,
 }
@@ -59,7 +60,7 @@ fn activities(build: String) -> List(activity.Handler) {
 }
 
 fn options() {
-  workflow.activity_options(start_to_close_ms: 10_000)
+  workflow.activity_options(start_to_close: duration.milliseconds(10_000))
 }
 
 // ---- updates ----
@@ -147,17 +148,19 @@ fn hasty() {
 fn hasty_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   let retrying =
     workflow.LocalActivityOptions(
-      ..workflow.local_activity_options(start_to_close_ms: 5000),
+      ..workflow.local_activity_options(start_to_close: duration.milliseconds(
+        5000,
+      )),
       retry: Some(
         workflow.RetryPolicy(
           ..workflow.retry_policy(maximum_attempts: 5),
-          initial_interval_ms: 60_000,
+          initial_interval: duration.milliseconds(60_000),
         ),
       ),
-      local_retry_threshold_ms: Some(1000),
+      local_retry_threshold: Some(duration.milliseconds(1000)),
     )
   let outcome =
-    workflow.with_timeout(ctx, 1500, fn(scope) {
+    workflow.with_timeout(ctx, duration.milliseconds(1500), fn(scope) {
       workflow.execute_local_activity(scope, stubborn(), 2, retrying)
     })
   case outcome {
@@ -175,7 +178,7 @@ fn annotating() {
 
 fn annotating_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   workflow.upsert_memo(ctx, "stage", codec.string(), "started")
-  let assert Ok(Nil) = workflow.sleep(ctx, 10)
+  let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10))
   workflow.upsert_memo(ctx, "stage", codec.string(), "finished")
   Ok(option.unwrap(workflow.memo(ctx, "stage", codec.string()), "none"))
 }
@@ -637,7 +640,9 @@ fn fragile_handlers() -> List(workflow.Handler) {
         ctx,
         hang_once(),
         Nil,
-        workflow.local_activity_options(start_to_close_ms: 60_000),
+        workflow.local_activity_options(start_to_close: duration.milliseconds(
+          60_000,
+        )),
       )
     }),
   ]
@@ -678,7 +683,7 @@ pub fn a_local_activity_runs_again_after_its_worker_is_killed_test() {
   let options =
     client.StartOptions(
       ..client.start_options(workflow_id: task_queue, task_queue:),
-      task_timeout_ms: Some(2000),
+      task_timeout: Some(duration.milliseconds(2000)),
     )
   let assert Ok(handle) = client.start(client, fragile(), Nil, options)
   assert eventually(fn() { runs_so_far(task_queue) == 1 })

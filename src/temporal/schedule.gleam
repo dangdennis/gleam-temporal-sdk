@@ -4,7 +4,7 @@
 //// ```gleam
 //// let nightly =
 ////   schedule.new(
-////     schedule.every(ms: 86_400_000),
+////     schedule.every(duration.hours(24)),
 ////     schedule.action(
 ////       cleanup(),
 ////       Nil,
@@ -18,9 +18,12 @@ import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{type Option, None}
 import gleam/result
+import gleam/time/duration.{type Duration}
+import gleam/time/timestamp.{type Timestamp}
 import temporal/client.{type Client, type Error}
 import temporal/codec.{type Payload}
 import temporal/internal/bridge
+import temporal/internal/time
 import temporal/internal/transcode
 import temporal/workflow
 
@@ -35,14 +38,14 @@ pub type Spec {
     /// An IANA time zone name for calendars and cron expressions. `None` is UTC.
     timezone: Option(String),
     /// Delay each action by a random amount up to this, to spread load.
-    jitter_ms: Option(Int),
+    jitter: Option(Duration),
   )
 }
 
-/// Fire every `every_ms`, at times that are `offset_ms` past a multiple of `every_ms`
-/// since the Unix epoch.
+/// Fire once every `every`, at times that are `offset` past a multiple of `every` since
+/// the Unix epoch.
 pub type Interval {
-  Interval(every_ms: Int, offset_ms: Int)
+  Interval(every: Duration, offset: Duration)
 }
 
 /// Fire when the time matches every field. An empty `year` matches every year.
@@ -87,9 +90,9 @@ pub type Action {
     workflow_id: String,
     task_queue: String,
     arguments: List(Payload),
-    execution_timeout_ms: Option(Int),
-    run_timeout_ms: Option(Int),
-    task_timeout_ms: Option(Int),
+    execution_timeout: Option(Duration),
+    run_timeout: Option(Duration),
+    task_timeout: Option(Duration),
     retry: Option(workflow.RetryPolicy),
     memo: Dict(String, Payload),
     search_attributes: Dict(String, Payload),
@@ -105,7 +108,7 @@ pub type Schedule {
     overlap: OverlapPolicy,
     /// How far back to make up for actions missed while the server was down. `None` uses
     /// the server's default of one year.
-    catchup_window_ms: Option(Int),
+    catchup_window: Option(Duration),
     /// Pause the schedule when a workflow it started fails.
     pause_on_failure: Bool,
     paused: Bool,
@@ -122,15 +125,15 @@ pub type Description {
     action_count: Int,
     /// The most recent actions, oldest first.
     recent_actions: List(RecentAction),
-    /// When the next few actions are due, in milliseconds since the Unix epoch.
-    next_action_times_ms: List(Int),
+    /// When the next few actions are due.
+    next_action_times: List(Timestamp),
     running_workflows: Int,
   )
 }
 
 /// One time the schedule started its workflow.
 pub type RecentAction {
-  RecentAction(scheduled_time_ms: Int, workflow_id: String)
+  RecentAction(scheduled_time: Timestamp, workflow_id: String)
 }
 
 /// A schedule as it appears in a listing.
@@ -152,19 +155,19 @@ fn empty() -> Spec {
     calendars: [],
     cron_expressions: [],
     timezone: None,
-    jitter_ms: None,
+    jitter: None,
   )
 }
 
-/// A spec that fires every `ms`, aligned to the Unix epoch.
-pub fn every(ms ms: Int) -> Spec {
-  every_offset(ms:, offset_ms: 0)
+/// A spec that fires once every `interval`, aligned to the Unix epoch.
+pub fn every(interval: Duration) -> Spec {
+  every_offset(interval, offset: duration.seconds(0))
 }
 
 /// A spec that fires every `ms`, `offset_ms` after the epoch-aligned times. Give schedules
 /// with the same interval different offsets so they do not all fire together.
-pub fn every_offset(ms ms: Int, offset_ms offset_ms: Int) -> Spec {
-  Spec(..empty(), intervals: [Interval(every_ms: ms, offset_ms:)])
+pub fn every_offset(interval: Duration, offset offset: Duration) -> Spec {
+  Spec(..empty(), intervals: [Interval(every: interval, offset:)])
 }
 
 /// A spec that fires when the calendar matches.
@@ -233,7 +236,7 @@ pub fn new(spec: Spec, action: Action) -> Schedule {
     spec:,
     action:,
     overlap: Skip,
-    catchup_window_ms: None,
+    catchup_window: None,
     pause_on_failure: False,
     paused: False,
     note: "",
@@ -259,9 +262,9 @@ fn from_request(request: bridge.StartRequest) -> Action {
     workflow_id: request.workflow_id,
     task_queue: request.task_queue,
     arguments: request.input,
-    execution_timeout_ms: request.execution_timeout_ms,
-    run_timeout_ms: request.run_timeout_ms,
-    task_timeout_ms: request.task_timeout_ms,
+    execution_timeout: time.option_from_ms(request.execution_timeout_ms),
+    run_timeout: time.option_from_ms(request.run_timeout_ms),
+    task_timeout: time.option_from_ms(request.task_timeout_ms),
     retry: option.map(request.retry, workflow.from_bridge_retry),
     memo: request.memo,
     search_attributes: request.search_attributes,
@@ -276,9 +279,9 @@ fn to_request(action: Action) -> bridge.StartRequest {
     input: action.arguments,
     id_reuse_policy: 0,
     id_conflict_policy: 0,
-    execution_timeout_ms: action.execution_timeout_ms,
-    run_timeout_ms: action.run_timeout_ms,
-    task_timeout_ms: action.task_timeout_ms,
+    execution_timeout_ms: time.option_to_ms(action.execution_timeout),
+    run_timeout_ms: time.option_to_ms(action.run_timeout),
+    task_timeout_ms: time.option_to_ms(action.task_timeout),
     retry: option.map(action.retry, workflow.to_bridge_retry),
     memo: action.memo,
     search_attributes: action.search_attributes,
@@ -302,7 +305,7 @@ fn to_bridge(client: Client, schedule: Schedule) -> bridge.Schedule {
   bridge.Schedule(
     spec: bridge.ScheduleSpec(
       intervals: list.map(spec.intervals, fn(interval) {
-        #(interval.every_ms, interval.offset_ms)
+        #(time.to_ms(interval.every), time.to_ms(interval.offset))
       }),
       calendars: list.map(spec.calendars, fn(calendar) {
         bridge.ScheduleCalendar(
@@ -318,11 +321,11 @@ fn to_bridge(client: Client, schedule: Schedule) -> bridge.Schedule {
       }),
       cron_expressions: spec.cron_expressions,
       timezone: option.unwrap(spec.timezone, ""),
-      jitter_ms: spec.jitter_ms,
+      jitter_ms: time.option_to_ms(spec.jitter),
     ),
     action: client.encode_request(client, to_request(schedule.action)),
     overlap_policy: overlap_value(schedule.overlap),
-    catchup_window_ms: schedule.catchup_window_ms,
+    catchup_window_ms: time.option_to_ms(schedule.catchup_window),
     pause_on_failure: schedule.pause_on_failure,
     paused: schedule.paused,
     note: schedule.note,
@@ -344,7 +347,10 @@ fn from_bridge(client: Client, schedule: bridge.Schedule) -> Schedule {
   Schedule(
     spec: Spec(
       intervals: list.map(spec.intervals, fn(interval) {
-        Interval(every_ms: interval.0, offset_ms: interval.1)
+        Interval(
+          every: time.from_ms(interval.0),
+          offset: time.from_ms(interval.1),
+        )
       }),
       calendars: list.map(spec.calendars, fn(calendar) {
         Calendar(
@@ -363,7 +369,7 @@ fn from_bridge(client: Client, schedule: bridge.Schedule) -> Schedule {
         "" -> None
         name -> option.Some(name)
       },
-      jitter_ms: spec.jitter_ms,
+      jitter: time.option_from_ms(spec.jitter_ms),
     ),
     action: from_request(action),
     overlap: case schedule.overlap_policy {
@@ -374,7 +380,7 @@ fn from_bridge(client: Client, schedule: bridge.Schedule) -> Schedule {
       6 -> AllowAll
       _ -> Skip
     },
-    catchup_window_ms: schedule.catchup_window_ms,
+    catchup_window: time.option_from_ms(schedule.catchup_window_ms),
     pause_on_failure: schedule.pause_on_failure,
     paused: schedule.paused,
     note: schedule.note,
@@ -412,9 +418,12 @@ pub fn describe(
     schedule: from_bridge(client, schedule),
     action_count: info.action_count,
     recent_actions: list.map(info.recent_actions, fn(action) {
-      RecentAction(scheduled_time_ms: action.0, workflow_id: action.1)
+      RecentAction(
+        scheduled_time: time.timestamp(action.0),
+        workflow_id: action.1,
+      )
     }),
-    next_action_times_ms: info.next_action_times_ms,
+    next_action_times: list.map(info.next_action_times_ms, time.timestamp),
     running_workflows: info.running_workflows,
   )
 }

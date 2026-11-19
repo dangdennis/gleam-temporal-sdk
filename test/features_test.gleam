@@ -9,6 +9,7 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import gleam/time/duration
 import support.{type Env, eventually, record, recorded, start_options, unique}
 import temporal/activity
 import temporal/client
@@ -88,7 +89,10 @@ fn activities() -> List(activity.Handler) {
           info.workflow_type,
           info.activity_id,
           int.to_string(info.attempt),
-          string.inspect(info.start_to_close_ms),
+          string.inspect(option.map(
+            info.start_to_close,
+            duration.to_milliseconds,
+          )),
           string.inspect(info.task_queue == ""),
         ],
         "/",
@@ -111,13 +115,13 @@ fn activities() -> List(activity.Handler) {
 }
 
 fn options() {
-  workflow.activity_options(start_to_close_ms: 30_000)
+  workflow.activity_options(start_to_close: duration.milliseconds(30_000))
 }
 
 fn heartbeating() {
   workflow.ActivityOptions(
     ..options(),
-    heartbeat_timeout_ms: Some(1000),
+    heartbeat_timeout: Some(duration.milliseconds(1000)),
     cancellation: workflow.WaitCancellationCompleted,
   )
 }
@@ -134,14 +138,14 @@ fn scoped_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
     workflow.with_scope(ctx, fn(scope) {
       let pending =
         workflow.start_activity(scope, patient(), 60_000, heartbeating())
-      let assert Ok(Nil) = workflow.sleep(ctx, 300)
+      let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(300))
       workflow.cancel(scope)
       workflow.await(pending)
     })
   let assert Error(failure) = outcome
   assert failure.is_cancellation(failure)
   assert !workflow.is_cancelled(ctx)
-  let assert Ok(Nil) = workflow.sleep(ctx, 10)
+  let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10))
   Ok("carried on")
 }
 
@@ -156,7 +160,8 @@ fn tidy_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
     Error(cancelled) -> {
       let assert Ok(Nil) =
         workflow.non_cancellable(ctx, fn(shielded) {
-          let assert Ok(Nil) = workflow.sleep(shielded, 10)
+          let assert Ok(Nil) =
+            workflow.sleep(shielded, duration.milliseconds(10))
           workflow.execute_activity(shielded, note(), "cleaned up", options())
         })
       Error(cancelled)
@@ -170,7 +175,7 @@ fn deadline() {
 
 fn deadline_workflow(ctx: Context, ms: Int) -> Result(String, Failure) {
   let outcome =
-    workflow.with_timeout(ctx, ms, fn(scope) {
+    workflow.with_timeout(ctx, duration.milliseconds(ms), fn(scope) {
       workflow.execute_activity(scope, patient(), 4000, heartbeating())
     })
   case outcome {
@@ -189,7 +194,13 @@ fn waiting() {
 }
 
 fn waiting_workflow(ctx: Context, ms: Int) -> Result(String, Failure) {
-  case workflow.await_timeout(ctx, workflow.signal(ctx, nudge()), ms) {
+  case
+    workflow.await_timeout(
+      ctx,
+      workflow.signal(ctx, nudge()),
+      duration.milliseconds(ms),
+    )
+  {
     Ok(text) -> Ok("nudged: " <> text)
     Error(failure.Failure(kind: failure.Timeout, ..)) -> Ok("nobody nudged")
     Error(other) -> Error(other)
@@ -204,7 +215,7 @@ fn resuming_workflow(ctx: Context, _: Nil) -> Result(Int, Failure) {
   let retry =
     workflow.RetryPolicy(
       ..workflow.retry_policy(maximum_attempts: 3),
-      initial_interval_ms: 10,
+      initial_interval: duration.milliseconds(10),
     )
   workflow.execute_activity(
     ctx,
@@ -219,7 +230,7 @@ fn slow_child() {
 }
 
 fn slow_child_workflow(ctx: Context, name: String) -> Result(String, Failure) {
-  use _ <- result.map(workflow.sleep(ctx, 300))
+  use _ <- result.map(workflow.sleep(ctx, duration.milliseconds(300)))
   "child of " <> name
 }
 
@@ -256,7 +267,7 @@ fn supervising_workflow(
   child_id: String,
 ) -> Result(String, Failure) {
   let outcome =
-    workflow.with_timeout(ctx, 200, fn(scope) {
+    workflow.with_timeout(ctx, duration.milliseconds(200), fn(scope) {
       workflow.execute_child(
         scope,
         waiting(),
@@ -496,7 +507,7 @@ pub fn memo_reaches_the_workflow_and_the_description_test() {
   assert description.status == client.Completed
   assert description.workflow_type == "remembering"
   assert description.task_queue == env.task_queue
-  assert option.is_some(description.close_time_ms)
+  assert option.is_some(description.close_time)
   let assert Ok(payload) = dict.get(description.memo, "origin")
   assert codec.string().decode(payload) == Ok("checkout")
   assert_replays(handle)
@@ -563,7 +574,10 @@ pub fn a_closed_workflow_id_can_be_refused_test() {
 pub fn a_run_timeout_ends_the_workflow_test() {
   use env <- in_both_modes("run-timeout")
   let options =
-    client.StartOptions(..start_options(env), run_timeout_ms: Some(1000))
+    client.StartOptions(
+      ..start_options(env),
+      run_timeout: Some(duration.milliseconds(1000)),
+    )
   let assert Ok(handle) = client.start(env.client, waiting(), 60_000, options)
   assert client.result(handle) == Error(client.TimedOut)
 }

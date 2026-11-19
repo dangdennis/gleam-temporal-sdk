@@ -14,6 +14,7 @@ production and has had no load testing.
 ## Example
 
 ```gleam
+import gleam/time/duration
 import temporal/activity
 import temporal/client
 import temporal/codec
@@ -32,7 +33,7 @@ pub fn greet() {
 }
 
 fn greet_workflow(ctx: workflow.Context, name: String) -> Result(String, Failure) {
-  let options = workflow.activity_options(start_to_close_ms: 10_000)
+  let options = workflow.activity_options(start_to_close: duration.seconds(10))
   workflow.execute_activity(ctx, say_hello(), name, options)
 }
 
@@ -53,6 +54,8 @@ pub fn main() {
 ```
 
 Passing the wrong input type to `execute_activity` or `client.execute` is a compile error.
+So is passing a bare number where a length of time is wanted: every timeout and delay is a
+`gleam/time/duration.Duration`, and every point in time a `timestamp.Timestamp`.
 
 ## What works
 
@@ -106,6 +109,31 @@ These are handed to the server or to core unchanged, and no test checks their ef
 - Worker limits: they are accepted, but no test measures that they limit anything
 - Versioning: ramping versions and unversioned workers
 
+## Running in production
+
+A worker is a small tree of processes. `worker.start` links it to the caller;
+`worker.supervised` gives a child specification for a `gleam/otp` supervisor:
+
+```gleam
+static_supervisor.new(static_supervisor.OneForOne)
+|> static_supervisor.add(worker.supervised(config))
+|> static_supervisor.start
+```
+
+What it does when things go wrong, without configuration:
+
+| Fault | What happens |
+|---|---|
+| A polling loop crashes | The worker restarts it. The task it was waiting for is handed back to the server at once, not lost. |
+| Loops keep crashing (more than five times a minute) | The worker gives up and exits abnormally, so its supervisor or caller sees it. |
+| A workflow run's process dies | The task fails, core drops the run, and the server replays it from history. |
+| Workflow code crashes | The workflow task fails and is retried until fixed code is deployed. `workflow.fail_on_crash` makes it fail the workflow instead. |
+| An activity crashes or exits | It is reported as failed and its retry policy applies. |
+| A cancelled activity will not stop | It is killed thirty seconds after being asked, and reported as cancelled. Change with `worker.with_activity_cancellation_grace`. |
+| The worker's owner dies without stopping it | The worker is shut down, so a replacement can take over its task queue. |
+| A workflow ends without answering an update | The update fails with `WorkflowFinished`; the client is not left waiting. |
+| The worker process is killed outright | The server times the tasks out and gives them to another worker. |
+
 ## Writing workflows
 
 Workflow code runs more than once: Temporal replays it against recorded history to rebuild
@@ -137,7 +165,7 @@ given, so `sleep`, `execute_activity` and `execute_child` all return a `Result`:
 fn order_workflow(ctx: workflow.Context, order: Order) -> Result(Receipt, Failure) {
   // Give the payment five minutes; the activity is cancelled if it overruns.
   let paid =
-    workflow.with_timeout(ctx, 300_000, fn(scope) {
+    workflow.with_timeout(ctx, duration.minutes(5), fn(scope) {
       workflow.execute_activity(scope, charge(), order, options())
     })
   case paid {
@@ -163,7 +191,7 @@ and returns `Error(failure.cancelled())` to accept; it is never killed.
 To wait for a signal with a deadline, the equivalent of TypeScript's `condition(fn, timeout)`:
 
 ```gleam
-case workflow.await_timeout(ctx, workflow.signal(ctx, approved()), 86_400_000) {
+case workflow.await_timeout(ctx, workflow.signal(ctx, approved()), duration.hours(24)) {
   Ok(approval) -> ...
   Error(_) -> ...  // timed out, or the workflow was cancelled
 }
@@ -342,6 +370,7 @@ bin/conformance # bin/test, then replay this SDK's histories on the TypeScript S
 | Cross-SDK conformance | Every feature is a workflow written in Gleam and in TypeScript; histories replay in both directions | `test/conformance_test.gleam`, `bin/conformance` |
 | Wire format | The Temporal CLI can start a Gleam workflow and read its result | `test/integration_test.gleam` |
 | Worker loss | A worker killed in the middle of a local activity is replaced and the workflow completes | `test/advanced_test.gleam` |
+| Faults inside a worker | Killed polling loops are restarted without losing a task, killed workflow runs are replayed, an activity that ignores cancellation is killed after its grace period, and a supervisor restarts a worker that dies | `test/resilience_test.gleam` |
 | Time skipping | A week-long sleep finishes at once on the test server | `test/testing_test.gleam` |
 | TLS | Workflows run through a proxy that requires mutual TLS; untrusted and certificate-less connections are refused | `test/tls_test.gleam` |
 
@@ -387,5 +416,10 @@ order and identity; it does not compare payload contents or timing between the S
   arrives and queues the accepted ones for the workflow to take.
 - **A payload codec runs at the edge.** The pollers and the client apply it as payloads
   enter and leave, so workflow code and the runtime only ever see plain payloads.
+- **A worker is a manager process and its polling loops.** The manager owns the
+  connection to core, restarts loops, and stops everything when it or its owner dies.
+  Workflow runs watch the loop that feeds them and exit with it.
+- **A future resolves once.** Asking it again returns the same value, which matters for
+  the ones that take something when they resolve, such as the next signal.
 - **A crash in workflow code fails the workflow task, not the workflow.** The server retries
   the task, so deploying a fix lets the workflow continue.

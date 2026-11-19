@@ -18,10 +18,13 @@ import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/time/duration.{type Duration}
+import gleam/time/timestamp.{type Timestamp}
 import temporal/activity
 import temporal/client.{type Client}
 import temporal/codec.{type Payload}
 import temporal/internal/bridge
+import temporal/internal/time
 import temporal/workflow
 
 /// A server started for a test, and a client connected to it.
@@ -116,7 +119,8 @@ pub fn execute(
 
 /// Let `ms` pass. A time-skipping server jumps its clock forward, firing the timers that
 /// fall due; a local server makes the caller wait.
-pub fn sleep(env: Env, ms: Int) -> Nil {
+pub fn sleep(env: Env, lasting: Duration) -> Nil {
+  let ms = time.to_ms(lasting)
   case env.time_skipping {
     False -> process.sleep(ms)
     True -> {
@@ -127,19 +131,17 @@ pub fn sleep(env: Env, ms: Int) -> Nil {
   }
 }
 
-/// The server's current time in milliseconds since the Unix epoch. On a time-skipping
-/// server this runs ahead of the real clock by however much time was skipped.
-pub fn now(env: Env) -> Int {
+/// The server's current time. On a time-skipping server this runs ahead of the real clock
+/// by however much time was skipped.
+pub fn now(env: Env) -> Timestamp {
   case env.time_skipping {
-    False -> system_time_ms()
+    False -> timestamp.system_time()
     True ->
       bridge.time_control(client.connection(env.client), bridge.Now)
-      |> result.unwrap(system_time_ms())
+      |> result.map(time.timestamp)
+      |> result.unwrap(timestamp.system_time())
   }
 }
-
-@external(erlang, "temporal_ffi", "system_time_ms")
-fn system_time_ms() -> Int
 
 // ---- activities without a server ----
 
@@ -164,9 +166,9 @@ pub fn activity_info() -> activity.Info {
     task_queue: "test",
     attempt: 1,
     heartbeat_details: [],
-    start_to_close_ms: None,
-    heartbeat_timeout_ms: None,
-    scheduled_time_ms: 0,
+    start_to_close: None,
+    heartbeat_timeout: None,
+    scheduled_time: time.timestamp(0),
     is_local: False,
   )
 }

@@ -8,6 +8,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
+import gleam/time/duration
 import temporal/activity
 import temporal/codec
 import temporal/failure
@@ -82,7 +83,7 @@ pub fn timer_then_complete_test() {
   let run =
     start(
       int_workflow("sleeper", fn(ctx, n) {
-        let assert Ok(Nil) = workflow.sleep(ctx, 500)
+        let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(500))
         Ok(n + 1)
       }),
     )
@@ -92,7 +93,8 @@ pub fn timer_then_complete_test() {
 }
 
 pub fn activities_are_scheduled_together_test() {
-  let options = workflow.activity_options(start_to_close_ms: 5000)
+  let options =
+    workflow.activity_options(start_to_close: duration.milliseconds(5000))
   let run =
     start(
       int_workflow("fan_out", fn(ctx, n) {
@@ -125,7 +127,7 @@ pub fn activity_failure_reaches_the_workflow_test() {
           ctx,
           double(),
           n,
-          workflow.activity_options(start_to_close_ms: 5000),
+          workflow.activity_options(start_to_close: duration.milliseconds(5000)),
         )
       }),
     )
@@ -179,8 +181,12 @@ pub fn race_prefers_the_earlier_future_test() {
   let run =
     start(
       int_workflow("racer", fn(ctx, _) {
-        let slow = workflow.timer(ctx, 1000) |> workflow.map(fn(_) { 1 })
-        let fast = workflow.timer(ctx, 10) |> workflow.map(fn(_) { 2 })
+        let slow =
+          workflow.timer(ctx, duration.milliseconds(1000))
+          |> workflow.map(fn(_) { 1 })
+        let fast =
+          workflow.timer(ctx, duration.milliseconds(10))
+          |> workflow.map(fn(_) { 2 })
         Ok(workflow.await(workflow.race([slow, fast])))
       }),
     )
@@ -194,7 +200,7 @@ pub fn workflow_cancellation_cancels_a_pending_timer_test() {
   let run =
     start(
       int_workflow("cancellable", fn(ctx, _) {
-        use _ <- result.map(workflow.sleep(ctx, 60_000))
+        use _ <- result.map(workflow.sleep(ctx, duration.milliseconds(60_000)))
         1
       }),
     )
@@ -253,7 +259,7 @@ pub fn non_cancellable_cleanup_runs_after_cancellation_test() {
   let run =
     start(
       int_workflow("cleanup", fn(ctx, n) {
-        case workflow.sleep(ctx, 60_000) {
+        case workflow.sleep(ctx, duration.milliseconds(60_000)) {
           Ok(Nil) -> Ok(n)
           Error(cancelled) -> {
             let assert Ok(_) =
@@ -282,11 +288,12 @@ pub fn nothing_is_scheduled_in_a_cancelled_scope_test() {
           workflow.with_scope(ctx, fn(scope) {
             workflow.cancel(scope)
             assert workflow.is_cancelled(scope)
-            let assert Error(_) = workflow.sleep(scope, 10)
+            let assert Error(_) =
+              workflow.sleep(scope, duration.milliseconds(10))
             workflow.execute_activity(scope, double(), n, options())
           })
         // The skipped timer and activity still used sequence number 1.
-        let assert Ok(Nil) = workflow.sleep(ctx, 10)
+        let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10))
         workflow.execute_activity(ctx, double(), n, options())
       }),
     )
@@ -299,7 +306,7 @@ pub fn with_timeout_cancels_the_body_when_the_deadline_passes_test() {
   let run =
     start(
       int_workflow("deadline", fn(ctx, n) {
-        workflow.with_timeout(ctx, 5000, fn(scope) {
+        workflow.with_timeout(ctx, duration.milliseconds(5000), fn(scope) {
           workflow.execute_activity(scope, double(), n, options())
         })
       }),
@@ -321,7 +328,7 @@ pub fn with_timeout_cancels_its_timer_when_the_body_finishes_test() {
   let run =
     start(
       int_workflow("deadline", fn(ctx, n) {
-        workflow.with_timeout(ctx, 5000, fn(scope) {
+        workflow.with_timeout(ctx, duration.milliseconds(5000), fn(scope) {
           workflow.execute_activity(scope, double(), n, options())
         })
       }),
@@ -337,7 +344,13 @@ pub fn await_timeout_returns_the_signal_or_times_out_test() {
   let waiter = fn() {
     start(
       int_workflow("waiter", fn(ctx, _) {
-        case workflow.await_timeout(ctx, workflow.signal(ctx, added()), 5000) {
+        case
+          workflow.await_timeout(
+            ctx,
+            workflow.signal(ctx, added()),
+            duration.milliseconds(5000),
+          )
+        {
           Ok(value) -> Ok(value)
           Error(failure.Failure(kind: failure.Timeout, ..)) -> Ok(-1)
           Error(other) -> Error(other)
@@ -368,11 +381,11 @@ pub fn cancelling_a_scope_reaches_nested_scopes_but_not_shielded_ones_test() {
     start(
       int_workflow("nested", fn(ctx, _) {
         workflow.with_scope(ctx, fn(outer) {
-          let a = workflow.timer(outer, 100)
+          let a = workflow.timer(outer, duration.milliseconds(100))
           workflow.with_scope(outer, fn(inner) {
-            let b = workflow.timer(inner, 200)
+            let b = workflow.timer(inner, duration.milliseconds(200))
             workflow.non_cancellable(inner, fn(shielded) {
-              let c = workflow.timer(shielded, 300)
+              let c = workflow.timer(shielded, duration.milliseconds(300))
               workflow.cancel(outer)
               let assert Error(_) = workflow.await(a)
               let assert Error(_) = workflow.await(b)
@@ -405,7 +418,7 @@ pub fn child_is_started_before_its_result_is_awaited_test() {
             ..workflow.child_options(workflow_id: "kid"),
             parent_close_policy: workflow.AbandonChild,
             id_reuse_policy: workflow.RejectDuplicate,
-            run_timeout_ms: Some(9000),
+            run_timeout: Some(duration.seconds(9)),
           )
         use started <- result.try(workflow.start_child(ctx, child, n, options))
         assert workflow.child_run_id(started) == "child-run"
@@ -582,7 +595,7 @@ pub fn workflow_middleware_wraps_the_workflow_test() {
 }
 
 fn options() {
-  workflow.activity_options(start_to_close_ms: 5000)
+  workflow.activity_options(start_to_close: duration.milliseconds(5000))
 }
 
 pub fn continue_as_new_test() {
@@ -744,7 +757,7 @@ pub fn workflow_logs_once_and_not_on_replay_test() {
     start(
       int_workflow("chatty", fn(ctx, n) {
         workflow.log_info(ctx, "starting")
-        let assert Ok(Nil) = workflow.sleep(ctx, 10)
+        let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10))
         workflow.log_warning(ctx, "slept")
         Ok(n)
       }),
@@ -847,7 +860,7 @@ pub fn an_update_for_an_unknown_name_is_rejected_once_the_workflow_waits_test() 
   let run =
     start(
       int_workflow("deaf", fn(ctx, n) {
-        use _ <- result.map(workflow.sleep(ctx, 1000))
+        use _ <- result.map(workflow.sleep(ctx, duration.milliseconds(1000)))
         n
       }),
     )
@@ -875,7 +888,9 @@ pub fn a_local_activity_retries_after_the_backoff_core_asks_for_test() {
           ctx,
           double(),
           n,
-          workflow.local_activity_options(start_to_close_ms: 1000),
+          workflow.local_activity_options(start_to_close: duration.milliseconds(
+            1000,
+          )),
         )
       }),
     )
@@ -909,7 +924,9 @@ pub fn cancelling_a_local_activity_depends_on_what_it_is_waiting_for_test() {
           ctx,
           double(),
           n,
-          workflow.local_activity_options(start_to_close_ms: 1000),
+          workflow.local_activity_options(start_to_close: duration.milliseconds(
+            1000,
+          )),
         )
       }),
     )
@@ -1106,7 +1123,7 @@ pub fn a_scope_forgets_operations_that_have_settled_test() {
     start(
       int_workflow("busy", fn(ctx, _) {
         int.range(from: 0, to: timers, with: Nil, run: fn(_, _) {
-          let assert Ok(Nil) = workflow.sleep(ctx, 1)
+          let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(1))
           Nil
         })
         let assert Ok(root) = dict.get(runtime.get().scopes, runtime.root_scope)

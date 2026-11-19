@@ -10,6 +10,8 @@ import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
+import gleam/time/duration
+import gleam/time/timestamp
 import support.{type Env, cmd, start_options, unique}
 import temporal/activity
 import temporal/client
@@ -48,7 +50,7 @@ fn activities() -> List(activity.Handler) {
 }
 
 fn options() -> workflow.ActivityOptions {
-  workflow.activity_options(start_to_close_ms: 10_000)
+  workflow.activity_options(start_to_close: duration.milliseconds(10_000))
 }
 
 fn quick_retry(maximum_attempts: Int) -> workflow.ActivityOptions {
@@ -56,7 +58,7 @@ fn quick_retry(maximum_attempts: Int) -> workflow.ActivityOptions {
     options(),
     workflow.RetryPolicy(
       ..workflow.retry_policy(maximum_attempts:),
-      initial_interval_ms: 10,
+      initial_interval: duration.milliseconds(10),
       backoff_coefficient: 1.0,
     ),
   )
@@ -79,9 +81,12 @@ fn timers() {
 /// Sleeps and returns how much workflow time passed.
 fn timers_workflow(ctx: Context, ms: Int) -> Result(Int, Failure) {
   let before = workflow.now(ctx)
-  let assert Ok(Nil) = workflow.sleep(ctx, ms)
-  let assert Ok(Nil) = workflow.sleep(ctx, ms)
-  Ok(workflow.now(ctx) - before)
+  let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(ms))
+  let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(ms))
+  Ok(
+    timestamp.difference(before, workflow.now(ctx))
+    |> duration.to_milliseconds,
+  )
 }
 
 fn fan_out() {
@@ -149,7 +154,7 @@ fn cancellable() {
 }
 
 fn cancellable_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
-  use _ <- result.map(workflow.sleep(ctx, 600_000))
+  use _ <- result.map(workflow.sleep(ctx, duration.milliseconds(600_000)))
   "finished"
 }
 
@@ -158,7 +163,7 @@ fn countdown() {
 }
 
 fn countdown_workflow(ctx: Context, remaining: Int) -> Result(String, Failure) {
-  let assert Ok(Nil) = workflow.sleep(ctx, 10)
+  let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10))
   case remaining {
     0 -> Ok("lift-off on attempt " <> int.to_string(workflow.info(ctx).attempt))
     _ -> workflow.continue_as_new(ctx, countdown(), remaining - 1)
@@ -186,9 +191,13 @@ fn randomness() {
 /// sequence or drew differently would schedule a different timer and be caught by core.
 fn randomness_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   let first = workflow.random_int(ctx, 50)
-  let assert Ok(Nil) = workflow.sleep(ctx, 10 + first)
+  let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10 + first))
   let id = workflow.uuid4(ctx)
-  let assert Ok(Nil) = workflow.sleep(ctx, 10 + workflow.random_int(ctx, 50))
+  let assert Ok(Nil) =
+    workflow.sleep(
+      ctx,
+      duration.milliseconds(10 + workflow.random_int(ctx, 50)),
+    )
   Ok(int.to_string(first) <> ":" <> id)
 }
 
@@ -197,7 +206,7 @@ fn patching() {
 }
 
 fn patching_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
-  let assert Ok(Nil) = workflow.sleep(ctx, 10)
+  let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10))
   case workflow.patched(ctx, "double-it") {
     True -> workflow.execute_activity(ctx, double(), n, options())
     False -> Ok(n)
@@ -212,7 +221,7 @@ fn replay_probe() {
 /// result, a replay.
 fn replay_probe_workflow(ctx: Context, _: Nil) -> Result(Bool, Failure) {
   let replaying = workflow.is_replaying(ctx)
-  let assert Ok(Nil) = workflow.sleep(ctx, 10)
+  let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10))
   Ok(replaying)
 }
 
@@ -407,13 +416,13 @@ pub fn replay_detects_reordered_commands_test() {
   let task_queue = "reordered-" <> unique()
   let original =
     workflow.handler(reordered(), fn(ctx, n) {
-      let assert Ok(Nil) = workflow.sleep(ctx, 10)
+      let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10))
       workflow.execute_activity(ctx, double(), n, options())
     })
   let changed =
     workflow.handler(reordered(), fn(ctx, n) {
       let doubled = workflow.execute_activity(ctx, double(), n, options())
-      let assert Ok(Nil) = workflow.sleep(ctx, 10)
+      let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10))
       doubled
     })
   let assert Ok(worker) =

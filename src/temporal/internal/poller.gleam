@@ -9,6 +9,7 @@ import temporal/codec.{type PayloadCodec}
 import temporal/failure
 import temporal/internal/bridge.{type NifWorker}
 import temporal/internal/runtime
+import temporal/internal/time
 import temporal/internal/transcode
 import temporal/middleware.{type Outbound}
 
@@ -294,9 +295,9 @@ fn run_activity(
         task_queue:,
         attempt:,
         heartbeat_details:,
-        start_to_close_ms:,
-        heartbeat_timeout_ms:,
-        scheduled_time_ms:,
+        start_to_close: time.option_from_ms(start_to_close_ms),
+        heartbeat_timeout: time.option_from_ms(heartbeat_timeout_ms),
+        scheduled_time: time.timestamp(scheduled_time_ms),
         is_local:,
       ),
       // A local activity has no heartbeat: the workflow task it runs in is its lease.

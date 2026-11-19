@@ -4,6 +4,7 @@
 import gleam/int
 import gleam/option.{None, Some}
 import gleam/string
+import gleam/time/duration
 import support.{cmd, read_file, unique}
 import temporal/activity
 import temporal/client
@@ -87,7 +88,9 @@ pub fn workflows_run_over_mutual_tls_test() {
           ctx,
           shout(),
           text,
-          workflow.activity_options(start_to_close_ms: 10_000),
+          workflow.activity_options(start_to_close: duration.milliseconds(
+            10_000,
+          )),
         )
       }),
     ])

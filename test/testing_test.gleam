@@ -1,7 +1,10 @@
 //// The test helpers themselves: a time-skipping server and server-less activity contexts.
 
 import gleam/option.{Some}
+import gleam/order
 import gleam/result
+import gleam/time/duration
+import gleam/time/timestamp
 import support.{unique}
 import temporal/activity
 import temporal/client
@@ -14,7 +17,9 @@ import temporal/workflow.{type Context}
 @external(erlang, "temporal_test_ffi", "test_server_path")
 fn test_server_path() -> Result(String, Nil)
 
-const week = 604_800_000
+fn week() {
+  duration.hours(7 * 24)
+}
 
 fn patient() {
   workflow.Definition("patient", codec.nil(), codec.int())
@@ -23,8 +28,8 @@ fn patient() {
 /// Sleeps for a week and reports how much workflow time passed.
 fn patient_workflow(ctx: Context, _: Nil) -> Result(Int, Failure) {
   let started = workflow.now(ctx)
-  use _ <- result.map(workflow.sleep(ctx, week))
-  workflow.now(ctx) - started
+  use _ <- result.map(workflow.sleep(ctx, week()))
+  timestamp.difference(started, workflow.now(ctx)) |> duration.to_milliseconds
 }
 
 fn reminded() {
@@ -36,7 +41,7 @@ fn reminder() {
 }
 
 fn reminder_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
-  case workflow.await_timeout(ctx, workflow.signal(ctx, reminded()), week) {
+  case workflow.await_timeout(ctx, workflow.signal(ctx, reminded()), week()) {
     Ok(Nil) -> Ok("reminded in time")
     Error(_) -> Ok("gave up after a week")
   }
@@ -66,8 +71,12 @@ pub fn a_week_long_sleep_finishes_at_once_test() {
 
   let before = testing.now(env)
   let assert Ok(elapsed) = testing.execute(env, patient(), Nil, options())
-  assert elapsed >= week
-  assert testing.now(env) - before >= week
+  assert elapsed >= duration.to_milliseconds(week())
+  assert duration.compare(
+      timestamp.difference(before, testing.now(env)),
+      week(),
+    )
+    != order.Lt
 
   // Time stands still between calls, so a signal sent now arrives before the deadline.
   let assert Ok(handle) =
@@ -78,7 +87,7 @@ pub fn a_week_long_sleep_finishes_at_once_test() {
   // `sleep` moves the clock past the deadline without anyone waiting for a result.
   let assert Ok(handle) =
     client.start(testing.client(env), reminder(), Nil, options())
-  testing.sleep(env, week + 1000)
+  testing.sleep(env, duration.add(week(), duration.seconds(1)))
   assert testing.result(env, handle) == Ok("gave up after a week")
 
   worker.stop(worker)

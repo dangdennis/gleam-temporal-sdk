@@ -4,9 +4,12 @@ import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/time/duration.{type Duration}
+import gleam/time/timestamp.{type Timestamp}
 import temporal/codec.{type Codec, type Payload, type PayloadCodec}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
+import temporal/internal/time
 import temporal/internal/transcode
 import temporal/search_attributes
 import temporal/workflow
@@ -81,11 +84,11 @@ pub type StartOptions {
     /// What to do if a workflow with the id is still running.
     id_conflict_policy: IdConflictPolicy,
     /// Longest the workflow may take across retries and continue-as-new.
-    execution_timeout_ms: Option(Int),
+    execution_timeout: Option(Duration),
     /// Longest a single run may take.
-    run_timeout_ms: Option(Int),
+    run_timeout: Option(Duration),
     /// Longest one workflow task may take. `None` is ten seconds.
-    task_timeout_ms: Option(Int),
+    task_timeout: Option(Duration),
     /// `None` does not retry a failed workflow.
     retry: Option(workflow.RetryPolicy),
     /// Unindexed data readable by the workflow and by `describe`.
@@ -93,7 +96,7 @@ pub type StartOptions {
     /// Indexed values, for finding the workflow with `list`.
     search_attributes: Dict(String, search_attributes.Value),
     /// Wait this long before the first workflow task.
-    start_delay_ms: Option(Int),
+    start_delay: Option(Duration),
     /// Run again on this cron timetable. Prefer `temporal/schedule`.
     cron_schedule: Option(String),
   )
@@ -156,10 +159,9 @@ pub type Description {
     workflow_type: String,
     task_queue: String,
     status: Status,
-    /// Milliseconds since the Unix epoch.
-    start_time_ms: Int,
+    start_time: Timestamp,
     /// `None` while the run is open.
-    close_time_ms: Option(Int),
+    close_time: Option(Timestamp),
     history_length: Int,
     memo: Dict(String, Payload),
     /// The raw payloads; their `data` is JSON.
@@ -246,13 +248,13 @@ pub fn start_options(
     task_queue:,
     id_reuse_policy: workflow.AllowDuplicate,
     id_conflict_policy: FailIfRunning,
-    execution_timeout_ms: None,
-    run_timeout_ms: None,
-    task_timeout_ms: None,
+    execution_timeout: None,
+    run_timeout: None,
+    task_timeout: None,
     retry: None,
     memo: dict.new(),
     search_attributes: dict.new(),
-    start_delay_ms: None,
+    start_delay: None,
     cron_schedule: None,
   )
 }
@@ -304,13 +306,13 @@ pub fn start_request(
       UseExisting -> 2
       TerminateExisting -> 3
     },
-    execution_timeout_ms: options.execution_timeout_ms,
-    run_timeout_ms: options.run_timeout_ms,
-    task_timeout_ms: options.task_timeout_ms,
+    execution_timeout_ms: time.option_to_ms(options.execution_timeout),
+    run_timeout_ms: time.option_to_ms(options.run_timeout),
+    task_timeout_ms: time.option_to_ms(options.task_timeout),
     retry: option.map(options.retry, workflow.to_bridge_retry),
     memo: options.memo,
     search_attributes: search_attributes.encode(options.search_attributes),
-    start_delay_ms: options.start_delay_ms,
+    start_delay_ms: time.option_to_ms(options.start_delay),
     cron_schedule: option.unwrap(options.cron_schedule, ""),
     request_id: "",
     callbacks: [],
@@ -585,8 +587,8 @@ fn description(client: Client, execution: bridge.Execution) -> Description {
       7 -> WorkflowTimedOut
       _ -> UnknownStatus
     },
-    start_time_ms: execution.start_time_ms,
-    close_time_ms: execution.close_time_ms,
+    start_time: time.timestamp(execution.start_time_ms),
+    close_time: option.map(execution.close_time_ms, time.timestamp),
     history_length: execution.history_length,
     // A memo written without this client's codec is returned as stored.
     memo: transcode.decode_map(client.codec, execution.memo)

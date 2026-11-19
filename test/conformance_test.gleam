@@ -21,6 +21,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam/time/duration
 import support.{type Env, Env, cmd, read_file, unique, write_file}
 import temporal/activity
 import temporal/client
@@ -65,7 +66,7 @@ fn activities() -> List(activity.Handler) {
 }
 
 fn options() {
-  workflow.activity_options(start_to_close_ms: 10_000)
+  workflow.activity_options(start_to_close: duration.milliseconds(10_000))
 }
 
 // ---- twins ----
@@ -84,7 +85,7 @@ fn double_child() {
 
 /// Timers, activities in sequence and in parallel, a signal, a child workflow.
 fn basics_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
-  use _ <- result.try(workflow.sleep(ctx, 10))
+  use _ <- result.try(workflow.sleep(ctx, duration.milliseconds(10)))
   use a <- result.try(workflow.execute_activity(ctx, double(), n, options()))
   let assert [Ok(b), Ok(c)] =
     workflow.await_all([
@@ -117,24 +118,24 @@ fn scopes() {
 /// shielded cleanup after the workflow itself is cancelled.
 fn scopes_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
   let _ =
-    workflow.with_timeout(ctx, 200, fn(scope) {
+    workflow.with_timeout(ctx, duration.milliseconds(200), fn(scope) {
       workflow.execute_activity(
         scope,
         slow(),
         2000,
-        workflow.activity_options(start_to_close_ms: 30_000),
+        workflow.activity_options(start_to_close: duration.milliseconds(30_000)),
       )
     })
   use _ <- result.try(
     workflow.with_scope(ctx, fn(scope) {
-      let pending = workflow.timer(scope, 60_000)
-      use _ <- result.try(workflow.sleep(ctx, 10))
+      let pending = workflow.timer(scope, duration.milliseconds(60_000))
+      use _ <- result.try(workflow.sleep(ctx, duration.milliseconds(10)))
       workflow.cancel(scope)
       let _ = workflow.await(pending)
       Ok(Nil)
     }),
   )
-  case workflow.sleep(ctx, 60_000) {
+  case workflow.sleep(ctx, duration.milliseconds(60_000)) {
     Ok(Nil) -> Ok(n)
     Error(cancelled) -> {
       let _ =
@@ -157,7 +158,11 @@ fn deadline() {
 /// Waiting with a deadline: once for a signal that arrives, once for one that does not.
 fn deadline_workflow(ctx: Context, n: Int) -> Result(String, Failure) {
   let wait = fn(ms) {
-    workflow.await_timeout(ctx, workflow.signal(ctx, nudge()), ms)
+    workflow.await_timeout(
+      ctx,
+      workflow.signal(ctx, nudge()),
+      duration.milliseconds(ms),
+    )
     |> result.is_ok
     |> string.inspect
     |> string.lowercase
@@ -288,18 +293,19 @@ fn local() {
 /// Local activities: one that succeeds at once, and one whose retries are far enough apart
 /// that the wait becomes a timer in history.
 fn local_workflow(ctx: Context, attempts: Int) -> Result(String, Failure) {
-  let once = workflow.local_activity_options(start_to_close_ms: 5000)
+  let once =
+    workflow.local_activity_options(start_to_close: duration.milliseconds(5000))
   let retrying =
     workflow.LocalActivityOptions(
       ..once,
       retry: Some(
         workflow.RetryPolicy(
           ..workflow.retry_policy(maximum_attempts: 5),
-          initial_interval_ms: 1500,
+          initial_interval: duration.milliseconds(1500),
           backoff_coefficient: 1.0,
         ),
       ),
-      local_retry_threshold_ms: Some(1000),
+      local_retry_threshold: Some(duration.milliseconds(1000)),
     )
   use doubled <- result.try(workflow.execute_local_activity(
     ctx,
@@ -332,10 +338,10 @@ fn lifecycle_workflow(ctx: Context, remaining: Int) -> Result(String, Failure) {
     True ->
       workflow.execute_activity(ctx, double(), remaining, options())
       |> result.replace(Nil)
-    False -> workflow.sleep(ctx, 5)
+    False -> workflow.sleep(ctx, duration.milliseconds(5))
   })
   workflow.deprecate_patch(ctx, "retired")
-  use _ <- result.try(workflow.sleep(ctx, 10))
+  use _ <- result.try(workflow.sleep(ctx, duration.milliseconds(10)))
   case remaining > 0 {
     True -> workflow.continue_as_new(ctx, lifecycle(), remaining - 1)
     False -> Ok("done")

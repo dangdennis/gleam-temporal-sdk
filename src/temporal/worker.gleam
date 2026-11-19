@@ -7,6 +7,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/string
+import gleam/time/duration.{type Duration}
 import temporal/activity
 import temporal/client.{type Client}
 import temporal/internal/bridge
@@ -42,7 +43,7 @@ pub type Config {
     deployment: Option(Deployment),
     /// How long a cancelled activity gets to stop by itself before its process is killed
     /// and it is reported as cancelled. `None` never kills.
-    activity_cancellation_grace_ms: Option(Int),
+    activity_cancellation_grace: Option(Duration),
   )
 }
 
@@ -85,7 +86,7 @@ pub fn new(client: Client, task_queue: String) -> Config {
     outbound: middleware.none(),
     nexus_handlers: [],
     deployment: None,
-    activity_cancellation_grace_ms: Some(30_000),
+    activity_cancellation_grace: Some(duration.seconds(30)),
   )
 }
 
@@ -208,9 +209,9 @@ pub fn with_deployment(config: Config, deployment: Deployment) -> Config {
 /// would otherwise hold its slot on the worker for good. `None` never kills.
 pub fn with_activity_cancellation_grace(
   config: Config,
-  grace_ms: Option(Int),
+  grace: Option(Duration),
 ) -> Config {
-  Config(..config, activity_cancellation_grace_ms: grace_ms)
+  Config(..config, activity_cancellation_grace: grace)
 }
 
 /// Start the worker, linked to the calling process. Returns once the server has accepted
@@ -459,7 +460,7 @@ fn loops(config: Config, nif: bridge.NifWorker) -> List(Loop) {
         activities,
         config.task_queue,
         codec,
-        config.activity_cancellation_grace_ms,
+        option.map(config.activity_cancellation_grace, duration.to_milliseconds),
       )
     })
   let nexus_loop =

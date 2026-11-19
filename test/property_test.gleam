@@ -11,6 +11,7 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/result
+import gleam/time/duration
 import support.{unique}
 import temporal/activity
 import temporal/client
@@ -105,14 +106,14 @@ fn interpreter() {
 }
 
 fn options() {
-  workflow.activity_options(start_to_close_ms: 10_000)
+  workflow.activity_options(start_to_close: duration.milliseconds(10_000))
 }
 
 fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
   list.try_map(program(seed), fn(step) {
     case step {
       Sleep(ms) -> {
-        let assert Ok(Nil) = workflow.sleep(ctx, ms)
+        let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(ms))
         Ok([0])
       }
       Double(n) -> {
@@ -135,11 +136,13 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
         let activity =
           workflow.start_activity(ctx, double(), n, options())
           |> workflow.map(fn(_) { True })
-        let timer = workflow.timer(ctx, ms) |> workflow.map(fn(_) { False })
+        let timer =
+          workflow.timer(ctx, duration.milliseconds(ms))
+          |> workflow.map(fn(_) { False })
         case workflow.await(workflow.race([activity, timer])) {
           True -> Nil
           False -> {
-            let assert Ok(Nil) = workflow.sleep(ctx, 1)
+            let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(1))
             Nil
           }
         }
@@ -147,7 +150,10 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
       }
       RandomSleep -> {
         let assert Ok(Nil) =
-          workflow.sleep(ctx, 1 + workflow.random_int(ctx, 10))
+          workflow.sleep(
+            ctx,
+            duration.milliseconds(1 + workflow.random_int(ctx, 10)),
+          )
         Ok([])
       }
       Child(n) -> {
@@ -162,7 +168,7 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
       }
       Deadline(n) -> {
         use doubled <- result.try(
-          workflow.with_timeout(ctx, 600_000, fn(scope) {
+          workflow.with_timeout(ctx, duration.milliseconds(600_000), fn(scope) {
             workflow.execute_activity(scope, double(), n, options())
           }),
         )
@@ -170,7 +176,7 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
       }
       CancelledTimer ->
         workflow.with_scope(ctx, fn(scope) {
-          let pending = workflow.timer(scope, 600_000)
+          let pending = workflow.timer(scope, duration.milliseconds(600_000))
           workflow.cancel(scope)
           case workflow.await(pending) {
             Error(_) -> Ok([-1])
@@ -181,7 +187,7 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
         use work <- workflow.with_scope(ctx)
         use wait <- workflow.with_scope(ctx)
         let activity = workflow.start_activity(work, double(), n, options())
-        let timer = workflow.timer(wait, ms)
+        let timer = workflow.timer(wait, duration.milliseconds(ms))
         let activity_won =
           workflow.await(
             workflow.race([

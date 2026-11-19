@@ -11,7 +11,7 @@
 //// }
 ////
 //// pub fn greet_workflow(ctx: workflow.Context, name: String) {
-////   let options = workflow.activity_options(start_to_close_ms: 10_000)
+////   let options = workflow.activity_options(start_to_close: duration.seconds(10))
 ////   workflow.execute_activity(ctx, say_hello(), name, options)
 //// }
 //// ```
@@ -31,11 +31,14 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set
 import gleam/string
+import gleam/time/duration.{type Duration}
+import gleam/time/timestamp.{type Timestamp}
 import temporal/activity
 import temporal/codec.{type Codec, type Payload}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
 import temporal/internal/runtime.{State}
+import temporal/internal/time
 import temporal/middleware
 import temporal/search_attributes
 
@@ -129,16 +132,16 @@ pub type Info {
   )
 }
 
-/// How failures are retried. The wait before attempt `n` is `initial_interval_ms` times
-/// `backoff_coefficient` to the power `n - 1`, capped at `maximum_interval_ms`.
+/// How failures are retried. The wait before attempt `n` is `initial_interval` times
+/// `backoff_coefficient` to the power `n - 1`, capped at `maximum_interval`.
 pub type RetryPolicy {
   RetryPolicy(
     /// The wait before the second attempt.
-    initial_interval_ms: Int,
+    initial_interval: Duration,
     /// What the wait is multiplied by after each attempt.
     backoff_coefficient: Float,
     /// The longest wait. `None` is one hundred times the initial interval.
-    maximum_interval_ms: Option(Int),
+    maximum_interval: Option(Duration),
     /// Zero means unlimited.
     maximum_attempts: Int,
     /// Failures whose `error_type` is listed here are not retried.
@@ -160,14 +163,14 @@ pub type ActivityCancellation {
 pub type ActivityOptions {
   ActivityOptions(
     /// Longest a single attempt may run.
-    start_to_close_ms: Int,
+    start_to_close: Duration,
     /// Longest the activity may take across all retries.
-    schedule_to_close_ms: Option(Int),
+    schedule_to_close: Option(Duration),
     /// Longest the activity may wait for a worker to pick it up.
-    schedule_to_start_ms: Option(Int),
+    schedule_to_start: Option(Duration),
     /// The longest gap between heartbeats before the attempt is failed. `None` never fails
     /// an attempt for silence.
-    heartbeat_timeout_ms: Option(Int),
+    heartbeat_timeout: Option(Duration),
     /// `None` uses the server's default policy, which retries without limit.
     retry: Option(RetryPolicy),
     /// `None` runs the activity on the workflow's own task queue.
@@ -219,11 +222,11 @@ pub type ChildOptions {
     parent_close_policy: ParentClosePolicy,
     id_reuse_policy: IdReusePolicy,
     /// Longest the child may take across retries and continue-as-new.
-    execution_timeout_ms: Option(Int),
+    execution_timeout: Option(Duration),
     /// Longest a single run of the child may take.
-    run_timeout_ms: Option(Int),
+    run_timeout: Option(Duration),
     /// Longest one workflow task may take. `None` is ten seconds.
-    task_timeout_ms: Option(Int),
+    task_timeout: Option(Duration),
     /// `None` does not retry a failed child.
     retry: Option(RetryPolicy),
     memo: Dict(String, Payload),
@@ -319,8 +322,8 @@ pub fn memo(_ctx: Context, key: String, codec: Codec(a)) -> Option(a) {
 
 /// The workflow's current time in milliseconds since the Unix epoch. It is the time of the
 /// workflow task being processed, so it is the same on replay.
-pub fn now(_ctx: Context) -> Int {
-  runtime.get().now_ms
+pub fn now(_ctx: Context) -> Timestamp {
+  time.timestamp(runtime.get().now_ms)
 }
 
 /// A deterministic random integer in `0..max` (exclusive). `max` must be positive.
@@ -477,16 +480,14 @@ pub fn race(futures: List(Future(a))) -> Future(a) {
 pub fn await_timeout(
   ctx: Context,
   future: Future(a),
-  ms: Int,
+  within: Duration,
 ) -> Result(a, Failure) {
   with_scope(ctx, fn(inner) {
     let deadline =
-      map(timer(inner, ms), fn(fired) {
+      map(timer(inner, within), fn(fired) {
         case fired {
           Ok(Nil) ->
-            Error(failure.timeout(
-              "timed out after " <> int.to_string(ms) <> "ms",
-            ))
+            Error(failure.timeout("timed out after " <> time.describe(within)))
           Error(cancelled) -> Error(cancelled)
         }
       })
@@ -533,7 +534,7 @@ pub fn non_cancellable(ctx: Context, body: fn(Context) -> a) -> a {
 /// `Timeout` failure whose cause is the failure `body` returned.
 pub fn with_timeout(
   ctx: Context,
-  ms: Int,
+  within: Duration,
   body: fn(Context) -> Result(a, Failure),
 ) -> Result(a, Failure) {
   let scope = runtime.open_scope(ctx.scope, False)
@@ -542,7 +543,7 @@ pub fn with_timeout(
   case runtime.scope_cancelled(scope) {
     Some(_) -> Nil
     None -> {
-      runtime.push(bridge.StartTimer(seq, int.max(ms, 1)))
+      runtime.push(bridge.StartTimer(seq, timer_ms(within)))
       runtime.register(scope, runtime.TimerOp(seq))
       runtime.set_deadline(seq, scope)
     }
@@ -558,7 +559,7 @@ pub fn with_timeout(
     Error(cause), True ->
       Error(
         failure.Failure(
-          ..failure.timeout("timed out after " <> int.to_string(ms) <> "ms"),
+          ..failure.timeout("timed out after " <> time.describe(within)),
           cause: Some(cause),
         ),
       )
@@ -588,14 +589,14 @@ pub fn cancellation(ctx: Context) -> Future(String) {
 
 /// A durable timer. It keeps counting while no worker is running. Fails with a cancellation
 /// if the context is cancelled first.
-pub fn timer(ctx: Context, ms: Int) -> Future(Result(Nil, Failure)) {
+pub fn timer(ctx: Context, lasting: Duration) -> Future(Result(Nil, Failure)) {
   // A sequence number is used even when nothing is scheduled, as the other SDKs do, so
   // that later timers are numbered the same.
   let seq = runtime.next_timer()
   case runtime.scope_cancelled(ctx.scope) {
     Some(_) -> ready(Error(failure.cancelled()))
     None -> {
-      runtime.push(bridge.StartTimer(seq, int.max(ms, 1)))
+      runtime.push(bridge.StartTimer(seq, timer_ms(lasting)))
       runtime.register(ctx.scope, runtime.TimerOp(seq))
       Future(fn() {
         let state = runtime.get()
@@ -614,21 +615,26 @@ pub fn timer(ctx: Context, ms: Int) -> Future(Result(Nil, Failure)) {
 
 /// Wait `ms` with a durable timer. Fails with a cancellation if the context is cancelled
 /// first.
-pub fn sleep(ctx: Context, ms: Int) -> Result(Nil, Failure) {
-  await(timer(ctx, ms))
+/// The server's timers are no finer than a millisecond.
+fn timer_ms(lasting: Duration) -> Int {
+  int.max(time.to_ms(lasting), 1)
+}
+
+pub fn sleep(ctx: Context, lasting: Duration) -> Result(Nil, Failure) {
+  await(timer(ctx, lasting))
 }
 
 // ---- activities ----
 
 /// Options with only the per-attempt timeout set: default retries, the workflow's task queue.
 pub fn activity_options(
-  start_to_close_ms start_to_close_ms: Int,
+  start_to_close start_to_close: Duration,
 ) -> ActivityOptions {
   ActivityOptions(
-    start_to_close_ms:,
-    schedule_to_close_ms: None,
-    schedule_to_start_ms: None,
-    heartbeat_timeout_ms: None,
+    start_to_close:,
+    schedule_to_close: None,
+    schedule_to_start: None,
+    heartbeat_timeout: None,
     retry: None,
     task_queue: None,
     cancellation: TryCancel,
@@ -647,9 +653,9 @@ pub fn with_retry(
 /// and doubling.
 pub fn retry_policy(maximum_attempts maximum_attempts: Int) -> RetryPolicy {
   RetryPolicy(
-    initial_interval_ms: 1000,
+    initial_interval: duration.seconds(1),
     backoff_coefficient: 2.0,
-    maximum_interval_ms: None,
+    maximum_interval: None,
     maximum_attempts:,
     non_retryable_error_types: [],
   )
@@ -658,9 +664,9 @@ pub fn retry_policy(maximum_attempts maximum_attempts: Int) -> RetryPolicy {
 @internal
 pub fn to_bridge_retry(retry: RetryPolicy) -> bridge.RetryPolicy {
   bridge.RetryPolicy(
-    initial_interval_ms: retry.initial_interval_ms,
+    initial_interval_ms: time.to_ms(retry.initial_interval),
     backoff_coefficient: retry.backoff_coefficient,
-    maximum_interval_ms: retry.maximum_interval_ms,
+    maximum_interval_ms: time.option_to_ms(retry.maximum_interval),
     maximum_attempts: retry.maximum_attempts,
     non_retryable_error_types: retry.non_retryable_error_types,
   )
@@ -669,9 +675,9 @@ pub fn to_bridge_retry(retry: RetryPolicy) -> bridge.RetryPolicy {
 @internal
 pub fn from_bridge_retry(retry: bridge.RetryPolicy) -> RetryPolicy {
   RetryPolicy(
-    initial_interval_ms: retry.initial_interval_ms,
+    initial_interval: time.from_ms(retry.initial_interval_ms),
     backoff_coefficient: retry.backoff_coefficient,
-    maximum_interval_ms: retry.maximum_interval_ms,
+    maximum_interval: time.option_from_ms(retry.maximum_interval_ms),
     maximum_attempts: retry.maximum_attempts,
     non_retryable_error_types: retry.non_retryable_error_types,
   )
@@ -705,11 +711,11 @@ pub fn start_activity(
           activity_type: call.activity_type,
           task_queue: call.task_queue,
           arguments: call.arguments,
-          schedule_to_close_ms: options.schedule_to_close_ms,
-          start_to_close_ms: Some(options.start_to_close_ms),
-          heartbeat_timeout_ms: options.heartbeat_timeout_ms,
+          schedule_to_close_ms: time.option_to_ms(options.schedule_to_close),
+          start_to_close_ms: Some(time.to_ms(options.start_to_close)),
+          heartbeat_timeout_ms: time.option_to_ms(options.heartbeat_timeout),
           retry: option.map(options.retry, to_bridge_retry),
-          schedule_to_start_ms: options.schedule_to_start_ms,
+          schedule_to_start_ms: time.option_to_ms(options.schedule_to_start),
           cancellation_type: case options.cancellation {
             TryCancel -> 0
             WaitCancellationCompleted -> 1
@@ -770,9 +776,9 @@ pub fn child_options(workflow_id workflow_id: String) -> ChildOptions {
     task_queue: None,
     parent_close_policy: TerminateChild,
     id_reuse_policy: AllowDuplicate,
-    execution_timeout_ms: None,
-    run_timeout_ms: None,
-    task_timeout_ms: None,
+    execution_timeout: None,
+    run_timeout: None,
+    task_timeout: None,
     retry: None,
     memo: dict.new(),
     cancellation: WaitChildCancelled,
@@ -809,9 +815,9 @@ pub fn start_child(
         task_queue: call.task_queue,
         input: call.arguments,
         options: bridge.ChildStartOptions(
-          execution_timeout_ms: options.execution_timeout_ms,
-          run_timeout_ms: options.run_timeout_ms,
-          task_timeout_ms: options.task_timeout_ms,
+          execution_timeout_ms: time.option_to_ms(options.execution_timeout),
+          run_timeout_ms: time.option_to_ms(options.run_timeout),
+          task_timeout_ms: time.option_to_ms(options.task_timeout),
           parent_close_policy: case options.parent_close_policy {
             TerminateChild -> 1
             AbandonChild -> 2
@@ -990,15 +996,15 @@ pub fn deprecate_patch(_ctx: Context, patch_id: String) -> Nil {
 pub type LocalActivityOptions {
   LocalActivityOptions(
     /// Longest a single attempt may run.
-    start_to_close_ms: Int,
+    start_to_close: Duration,
     /// Longest the activity may take across all retries.
-    schedule_to_close_ms: Option(Int),
+    schedule_to_close: Option(Duration),
     /// `None` retries without limit, one second apart at first and doubling.
     retry: Option(RetryPolicy),
     /// A retry that would wait longer than this is not waited for inside the workflow
     /// task: the workflow starts a durable timer and tries again when it fires. `None`
     /// uses core's default of one minute.
-    local_retry_threshold_ms: Option(Int),
+    local_retry_threshold: Option(Duration),
     /// What cancelling the activity's scope does.
     cancellation: ActivityCancellation,
   )
@@ -1006,13 +1012,13 @@ pub type LocalActivityOptions {
 
 /// Options with only the per-attempt timeout set, and default retries.
 pub fn local_activity_options(
-  start_to_close_ms start_to_close_ms: Int,
+  start_to_close start_to_close: Duration,
 ) -> LocalActivityOptions {
   LocalActivityOptions(
-    start_to_close_ms:,
-    schedule_to_close_ms: None,
+    start_to_close:,
+    schedule_to_close: None,
     retry: None,
-    local_retry_threshold_ms: None,
+    local_retry_threshold: None,
     cancellation: TryCancel,
   )
 }
@@ -1050,11 +1056,13 @@ pub fn start_local_activity(
             attempt: 1,
             original_schedule_time_ms: None,
             arguments: call.arguments,
-            schedule_to_close_ms: options.schedule_to_close_ms,
+            schedule_to_close_ms: time.option_to_ms(options.schedule_to_close),
             schedule_to_start_ms: None,
-            start_to_close_ms: Some(options.start_to_close_ms),
+            start_to_close_ms: Some(time.to_ms(options.start_to_close)),
             retry: option.map(options.retry, to_bridge_retry),
-            local_retry_threshold_ms: options.local_retry_threshold_ms,
+            local_retry_threshold_ms: time.option_to_ms(
+              options.local_retry_threshold,
+            ),
             cancellation_type: case options.cancellation {
               TryCancel -> 0
               WaitCancellationCompleted -> 1
@@ -1309,7 +1317,7 @@ pub type NexusCancellation {
 pub type NexusOptions {
   NexusOptions(
     /// Longest the operation may take, retries included. `None` leaves it to the server.
-    schedule_to_close_ms: Option(Int),
+    schedule_to_close: Option(Duration),
     /// What cancelling the operation's scope does.
     cancellation: NexusCancellation,
   )
@@ -1317,7 +1325,7 @@ pub type NexusOptions {
 
 /// No deadline of its own; cancellation waits for the operation to end.
 pub fn nexus_options() -> NexusOptions {
-  NexusOptions(schedule_to_close_ms: None, cancellation: WaitNexusCancelled)
+  NexusOptions(schedule_to_close: None, cancellation: WaitNexusCancelled)
 }
 
 /// A Nexus operation that has started.
@@ -1349,7 +1357,7 @@ pub fn start_nexus_operation(
           service: operation.service,
           operation: operation.name,
           input: operation.input.encode(input),
-          schedule_to_close_ms: options.schedule_to_close_ms,
+          schedule_to_close_ms: time.option_to_ms(options.schedule_to_close),
           cancellation_type: case options.cancellation {
             WaitNexusCancelled -> 0
             AbandonNexus -> 1

@@ -3,6 +3,8 @@
 
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/time/duration.{type Duration}
+import gleam/time/timestamp.{type Timestamp}
 import temporal/codec.{type Codec, type Payload}
 import temporal/failure.{type Failure}
 
@@ -27,11 +29,11 @@ pub type Info {
     /// What the previous attempt last passed to `heartbeat_with`.
     heartbeat_details: List(Payload),
     /// Longest this attempt may run.
-    start_to_close_ms: Option(Int),
+    start_to_close: Option(Duration),
     /// The longest gap between heartbeats the workflow allows.
-    heartbeat_timeout_ms: Option(Int),
-    /// When the activity was first scheduled, in milliseconds since the Unix epoch.
-    scheduled_time_ms: Int,
+    heartbeat_timeout: Option(Duration),
+    /// When the activity was first scheduled.
+    scheduled_time: Timestamp,
     /// Whether the workflow started this as a local activity.
     is_local: Bool,
   )

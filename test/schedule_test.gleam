@@ -4,6 +4,8 @@ import gleam/dict
 import gleam/list
 import gleam/option.{Some}
 import gleam/string
+import gleam/time/duration
+import gleam/time/timestamp
 import support.{eventually, unique}
 import temporal/client
 import temporal/codec
@@ -22,14 +24,14 @@ pub fn a_schedule_round_trips_and_can_be_changed_test() {
   let options =
     client.StartOptions(
       ..client.start_options(workflow_id: id <> "-run", task_queue: id),
-      run_timeout_ms: Some(60_000),
-      task_timeout_ms: Some(10_000),
+      run_timeout: Some(duration.milliseconds(60_000)),
+      task_timeout: Some(duration.milliseconds(10_000)),
     )
     |> client.with_memo("origin", codec.string(), "schedule")
   let created =
     schedule.Schedule(
       ..schedule.new(
-        schedule.every_offset(ms: 3_600_000, offset_ms: 420_000),
+        schedule.every_offset(duration.hours(1), offset: duration.minutes(7)),
         schedule.action(tick(), "hourly", options),
       ),
       overlap: schedule.BufferOne,
@@ -43,12 +45,16 @@ pub fn a_schedule_round_trips_and_can_be_changed_test() {
   let assert Ok(described) = schedule.describe(client, id)
   // The server fills in its default catch-up window of a year.
   assert described.schedule
-    == schedule.Schedule(..created, catchup_window_ms: Some(31_536_000_000))
+    == schedule.Schedule(
+      ..created,
+      catchup_window: Some(duration.hours(365 * 24)),
+    )
   assert described.action_count == 0
   // Every upcoming action is seven minutes past the hour, as the offset asks.
-  assert described.next_action_times_ms != []
-  assert list.all(described.next_action_times_ms, fn(time) {
-    time % 3_600_000 == 420_000
+  assert described.next_action_times != []
+  assert list.all(described.next_action_times, fn(time) {
+    let #(seconds, _) = timestamp.to_unix_seconds_and_nanoseconds(time)
+    seconds % 3600 == 420
   })
 
   // An update keeps what it does not touch.
@@ -84,7 +90,7 @@ pub fn a_schedule_round_trips_and_can_be_changed_test() {
   let assert Ok(described) = schedule.describe(client, id)
   assert !described.schedule.paused
   assert described.schedule.note == "go"
-  assert described.next_action_times_ms != []
+  assert described.next_action_times != []
   let assert Ok(Nil) = schedule.pause(client, id, note: "stop")
   let assert Ok(described) = schedule.describe(client, id)
   assert described.schedule.paused
@@ -149,7 +155,7 @@ pub fn a_triggered_schedule_starts_its_workflow_test() {
       client,
       id,
       schedule.new(
-        schedule.every(ms: 86_400_000),
+        schedule.every(duration.hours(24)),
         schedule.action(tick(), "triggered", options),
       ),
     )
