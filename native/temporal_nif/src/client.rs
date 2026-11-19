@@ -5,8 +5,8 @@ use rustler::{Atom, Encoder, Env, LocalPid, ResourceArc, Term};
 use std::{collections::HashMap, time::Duration};
 use temporalio_common::protos::temporal::api::{
     common::v1::{
-        Callback, Header, Memo, Payload, Payloads, RetryPolicy, SearchAttributes, WorkflowExecution,
-        WorkflowType, callback,
+        Callback, Header, Memo, Payload, Payloads, RetryPolicy, SearchAttributes,
+        WorkflowExecution, WorkflowType, callback,
     },
     enums::v1::HistoryEventFilterType,
     failure::v1::Failure,

@@ -4,4 +4,10 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cargo build --release --manifest-path "$root/native/temporal_nif/Cargo.toml"
 mkdir -p "$root/priv"
-cp "$root/native/temporal_nif/target/release/libtemporal_nif.so" "$root/priv/libtemporal_nif.so"
+built="$root/native/temporal_nif/target/release/libtemporal_nif"
+# Erlang loads a NIF from a .so file on macOS too, where cargo writes a .dylib.
+if [ -f "$built.dylib" ]; then
+  cp "$built.dylib" "$root/priv/libtemporal_nif.so"
+else
+  cp "$built.so" "$root/priv/libtemporal_nif.so"
+fi

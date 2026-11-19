@@ -10,8 +10,8 @@ use rustler::{Atom, Encoder, Env, LocalPid, ResourceArc, Term};
 use temporalio_common::protos::temporal::api::{
     common::v1::{Payloads, WorkflowType},
     schedule::v1::{
-        BackfillRequest, IntervalSpec, Range, Schedule, ScheduleAction, ScheduleInfo, SchedulePatch,
-        SchedulePolicies, ScheduleSpec, ScheduleState, StructuredCalendarSpec,
+        BackfillRequest, IntervalSpec, Range, Schedule, ScheduleAction, ScheduleInfo,
+        SchedulePatch, SchedulePolicies, ScheduleSpec, ScheduleState, StructuredCalendarSpec,
         TriggerImmediatelyRequest, schedule_action::Action,
     },
     taskqueue::v1::TaskQueue,

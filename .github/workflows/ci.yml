@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27"
+          gleam-version: "1.19.2"
+          rebar3-version: "3"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/temporal_nif
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: temporalio/setup-temporal@v0
+
+      - name: Check formatting
+        run: |
+          gleam format --check src test
+          cargo fmt --check --manifest-path native/temporal_nif/Cargo.toml
+
+      - name: Lint the NIF
+        run: cargo clippy --release --manifest-path native/temporal_nif/Cargo.toml -- -D warnings
+
+      # Builds the NIF, starts a dev server, runs every test, then replays this SDK's
+      # histories on the TypeScript SDK.
+      - name: Test and check conformance
+        run: bin/conformance
+
+      - name: Load test
+        run: LOAD_WORKFLOWS=500 bin/load

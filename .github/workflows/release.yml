@@ -1,0 +1,44 @@
+name: Release
+
+# Builds the NIF for each supported machine and attaches the files to the release, for
+# bin/fetch-nif to download.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  nif:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            built: libtemporal_nif.so
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            built: libtemporal_nif.so
+          - os: macos-14
+            target: aarch64-apple-darwin
+            built: libtemporal_nif.dylib
+          - os: macos-13
+            target: x86_64-apple-darwin
+            built: libtemporal_nif.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/temporal_nif
+      - name: Build
+        run: cargo build --release --manifest-path native/temporal_nif/Cargo.toml
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "native/temporal_nif/target/release/${{ matrix.built }}" "libtemporal_nif-${{ matrix.target }}.so"
+          gh release upload "${{ github.event.release.tag_name }}" "libtemporal_nif-${{ matrix.target }}.so" --clobber

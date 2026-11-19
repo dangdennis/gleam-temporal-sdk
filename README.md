@@ -11,6 +11,8 @@ Status: experimental. The features under "What works" are tested against a real 
 server, apart from the options listed under "Passed through, not tested". It has not run in
 production and has had no load testing.
 
+New here? Start with the [guide](docs/guide.md).
+
 ## Example
 
 ```gleam
@@ -79,98 +81,49 @@ So is passing a bare number where a length of time is wanted: every timeout and 
 
 | Area | Supported |
 |---|---|
-| Workflows | Activities, local activities, durable timers, signals, queries, updates, child workflows, continue-as-new, patching and `deprecate_patch`, memo and search attribute changes, deterministic `now` / `random_int` / `uuid4`, logging that is silent on replay |
+| Workflows | Activities, local activities, durable timers, signals, queries, updates, child workflows, continue-as-new, patching and `deprecate_patch`, memo and search attribute changes, headers, deterministic `now` / `random_int` / `uuid4`, logging that is silent on replay |
 | Cancellation | Scopes carried by the `Context`: `with_scope`, `with_timeout`, `non_cancellable`, `cancel`; cancelling a scope cancels its timers, activities, local activities, child workflows, Nexus operations and pending signals |
 | Concurrency | `Future` values with `map`, `race`, `await`, `await_all`, `await_timeout`, `await_cancellable` |
-| Activities | Typed handlers, retry policies, all four timeouts, heartbeats with details, cancellation delivered to the activity, activity info, failure details |
+| Activities | Typed handlers, retry policies, all four timeouts, heartbeats with details, cancellation delivered to the activity, activity info, failure details, completion from outside by task token |
 | Child workflows | Start and await separately, signal, parent close policy, id reuse policy, timeouts, retries, memo, cancellation type |
 | Other workflows | Signal and request cancellation of any workflow by id from workflow code |
 | Nexus | Call operations from workflows; serve operations from a worker, answered directly or backed by a workflow |
-| Client | Start with options (memo, search attributes, id reuse and conflict policies, timeouts, retries, start delay, cron), signal-with-start, execute, result, signal, query, update, cancel, terminate, describe, list, count, fetch history; typed errors |
-| Schedules | Create, describe, update, pause, unpause, trigger, delete, list; intervals with offsets, calendars, cron expressions, time zones, overlap policies |
-| Workers | Concurrency limits, activity rate limits, workflow-only and activity-only workers, workflow and activity middleware, outbound rewriting, worker deployment versioning with pinned and auto-upgrading workflows |
-| Data | JSON payloads (`json/plain`), compatible with the Temporal CLI and other SDKs; payload codecs, with an AES-256-GCM encryption codec included |
+| Client | Start with options (memo, search attributes, id reuse and conflict policies, timeouts, retries, start delay, cron), signal-with-start, update-with-start, execute, result, signal, query, update, cancel, terminate, describe, list, count, fetch history; typed errors |
+| Schedules | Create, describe, update, pause, unpause, trigger, backfill, delete, list; intervals with offsets, calendars, cron expressions, time zones, overlap policies |
+| Workers | Concurrency limits, activity rate limits, workflow-only and activity-only workers, workflow and activity middleware, outbound rewriting, worker deployment versioning with pinned and auto-upgrading workflows, graceful shutdown, Prometheus metrics |
+| Data | JSON and binary payloads (`json/plain`, `binary/plain`), compatible with the Temporal CLI and other SDKs; payload codecs, with an AES-256-GCM encryption codec included |
 | Connection | Plaintext, TLS, mutual TLS, API keys |
 | Testing | `replayer.replay` for recorded histories; `temporal/testing` for a time-skipping server, a local dev server, and activity contexts that need no server |
 
 ## Not built
 
-- Headers, so middleware cannot pass context from a client to a workflow or activity
-- Update-with-start, and updates sent to a workflow before its first task has run are
-  only accepted if the workflow asks for them before it first waits
-- Asynchronous activity completion (finishing an activity from another process by token)
+- Headers on signals, queries and updates (workflow starts, activities and child workflows
+  carry them)
 - Nexus operation links in the UI, and Nexus handlers other than "answer directly" and
   "run a workflow"
-- Metrics and tracing export
-- Schedule backfill, and memo or search attributes on the schedule itself (they can be set
-  on the workflows it starts)
+- Tracing export, and metrics defined by your own code
+- Memo or search attributes on a schedule itself (they can be set on the workflows it
+  starts)
 - Client calls to manage worker deployments: use the Temporal CLI or UI
+- Protobuf payloads, HTTP proxies, standalone activities
 - Enforcement of determinism: nothing stops workflow code from calling a clock or spawning a
   process. Replay tests are how such mistakes are found.
-- Packaging: the NIF is built from source with `bin/build-nif`; there are no precompiled
-  binaries, and only Linux has been tried.
+- A Hex release. Prebuilt NIFs are built by the release workflow for Linux and macOS on
+  x86-64 and ARM, but only Linux x86-64 has been run.
 
 ## Passed through, not tested
 
 These are handed to the server or to core unchanged, and no test checks their effect:
 
 - API keys, and any connection to Temporal Cloud. TLS and mutual TLS are tested locally.
-- Start options: retry policy, start delay, cron schedule, execution timeout,
-  `TerminateExisting`
-- Child options: retry policy, memo, timeouts other than the run timeout, every
-  cancellation type but the default
-- Activity options: schedule-to-start and schedule-to-close timeouts, `AbandonActivity`
-- Nexus options: the schedule-to-close timeout, every cancellation type but the default,
-  and cancelling a running operation end to end
-- Search attribute changes from inside a workflow
+- Start options: cron schedule
+- Child options: memo, timeouts other than the run timeout, every cancellation type but
+  the default
+- Activity options: the schedule-to-start timeout, `AbandonActivity`, `activity_id`
+- Nexus options: the schedule-to-close timeout, every cancellation type but the default
 - Schedules: jitter, catch-up window, pause on failure, every overlap policy's effect
 - Worker limits: they are accepted, but no test measures that they limit anything
 - Versioning: ramping versions and unversioned workers
-
-## Running in production
-
-A worker is a small tree of processes. `worker.start` links it to the caller;
-`worker.supervised` gives a child specification for a `gleam/otp` supervisor:
-
-```gleam
-static_supervisor.new(static_supervisor.OneForOne)
-|> static_supervisor.add(worker.supervised(config))
-|> static_supervisor.start
-```
-
-What it does when things go wrong, without configuration:
-
-| Fault | What happens |
-|---|---|
-| A polling loop crashes | The worker restarts it. The task it was waiting for is handed back to the server at once, not lost. |
-| Loops keep crashing (more than five times a minute) | The worker gives up and exits abnormally, so its supervisor or caller sees it. |
-| A workflow run's process dies | The task fails, core drops the run, and the server replays it from history. |
-| Workflow code crashes | The workflow task fails and is retried until fixed code is deployed. `workflow.fail_on_crash` makes it fail the workflow instead. |
-| An activity crashes or exits | It is reported as failed and its retry policy applies. |
-| A cancelled activity will not stop | It is killed thirty seconds after being asked, and reported as cancelled. Change with `worker.with_activity_cancellation_grace`. |
-| The worker's owner dies without stopping it | The worker is shut down, so a replacement can take over its task queue. |
-| A workflow ends without answering an update | The update fails with `WorkflowFinished`; the client is not left waiting. |
-| The worker process is killed outright | The server times the tasks out and gives them to another worker. |
-
-## Writing workflows
-
-Workflow code runs more than once: Temporal replays it against recorded history to rebuild
-its state. It must therefore issue the same commands in the same order every time. Take time,
-randomness and anything else that varies from the `temporal/workflow` module, and do all IO in
-activities.
-
-Workflow state lives in ordinary local variables. A query handler is a closure over them, so
-register it again whenever the answer should change:
-
-```gleam
-fn accumulator_workflow(ctx: workflow.Context, sum: Int) -> Result(Int, Failure) {
-  workflow.set_query_handler(ctx, total(), fn(_) { sum })
-  case workflow.receive_signal(ctx, added()) {
-    0 -> Ok(sum)
-    n -> accumulator_workflow(ctx, sum + n)
-  }
-}
-```
 
 ## Arguments, results and errors
 
@@ -337,6 +290,23 @@ without `patched`. An auto-upgrading one moves to the current build at its next 
 build is current is set outside the SDK, with `temporal worker deployment
 set-current-version` or the UI; a versioned worker receives nothing until then.
 
+## Headers and metrics
+
+Headers are context that travels beside the arguments: a trace id, a tenant. Set them when
+starting a workflow; the workflow passes them on to the activities and child workflows it
+starts unless outbound middleware changes them.
+
+```gleam
+client.StartOptions(..options, headers: dict.from_list([#("trace", codec.encode(codec.string(), trace_id))]))
+
+workflow.headers(ctx)              // in the workflow
+activity.info(ctx).headers         // in an activity
+```
+
+`telemetry.serve_prometheus("0.0.0.0:9464")` serves the worker's and client's metrics, the
+same ones Temporal's other SDKs report, for Prometheus to scrape. Call it before the first
+`client.connect`.
+
 ## Middleware
 
 Middleware is a function. Inbound middleware wraps every workflow or activity on a worker;
@@ -399,6 +369,8 @@ you start yourself needs Nexus and worker deployments enabled, as in `bin/test`.
 bin/build-nif   # compile the Rust NIF into priv/
 bin/test        # build, start a dev server if none is running, run every test
 bin/conformance # bin/test, then replay this SDK's histories on the TypeScript SDK
+bin/load        # thousands of workflows while workers are killed
+bin/fetch-nif   # download a prebuilt NIF for a released version instead of building
 ```
 
 ## How correctness is checked
@@ -416,6 +388,9 @@ bin/conformance # bin/test, then replay this SDK's histories on the TypeScript S
 | Worker loss | A worker killed in the middle of a local activity is replaced and the workflow completes | `test/advanced_test.gleam` |
 | Faults inside a worker | Killed polling loops are restarted without losing a task, killed workflow runs are replayed, an activity that ignores cancellation is killed after its grace period, and a supervisor restarts a worker that dies | `test/resilience_test.gleam` |
 | Time skipping | A week-long sleep finishes at once on the test server | `test/testing_test.gleam` |
+| Options | Retry policies, start delay, timeouts, conflict policies and Nexus cancellation each have their effect | `test/options_test.gleam` |
+| Temporal's features repository | The scenarios the suite did not already cover, and the Go and Java SDKs' recorded histories replayed | `test/features_repo_test.gleam` |
+| Load with faults | Thousands of workflows across several workers while workers are killed and replaced: every result correct, no processes left behind | `bin/load` |
 | TLS | Workflows run through a proxy that requires mutual TLS; untrusted and certificate-less connections are refused | `test/tls_test.gleam` |
 
 ### The conformance harness
@@ -437,9 +412,10 @@ Adding a feature means adding its twin to both `test/conformance_test.gleam` and
 `test/conformance/typescript/workflows.js`, a driver to `harness.js`, and re-recording with
 `npm run record`.
 
-Not yet done: Temporal's cross-SDK [features](https://github.com/temporalio/features) suite,
-load and chaos testing with [omes](https://github.com/temporalio/omes), and fault injection
-on the NIF boundary. The conformance harness checks replay compatibility, which is command
+Not yet done: running under Temporal's own [features](https://github.com/temporalio/features)
+harness (its scenarios are ported by hand here), load testing with
+[omes](https://github.com/temporalio/omes), and anything at production scale. `bin/load`
+has been run with 2,000 workflows against a local development server, which is small. The conformance harness checks replay compatibility, which is command
 order and identity; it does not compare payload contents or timing between the SDKs.
 
 ## Design

@@ -2,6 +2,9 @@ name = "temporal_gleam"
 version = "0.1.0"
 description = "A Temporal SDK for Gleam on the BEAM, built on Temporal's sdk-core"
 target = "erlang"
+licences = ["MIT"]
+repository = { type = "github", user = "dangdennis", repo = "gleam-temporal-sdk" }
+internal_modules = ["temporal/internal", "temporal/internal/*"]
 
 [dependencies]
 gleam_stdlib = ">= 0.60.0 and < 2.0.0"
