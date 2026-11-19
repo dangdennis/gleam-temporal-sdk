@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Run the cross-SDK conformance harness and print its table: every feature's TypeScript
+# history replayed through this SDK, and this SDK's history replayed through the official
+# TypeScript SDK. Needs Node.js as well as everything bin/test needs.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+rm -rf build/conformance
+bin/test
+cd test/conformance/typescript
+[ -d node_modules ] || npm install --no-audit --no-fund
+# Core logs the divergence the control run provokes; it is expected.
+node harness.js replay "$root/build/conformance" 2>/dev/null | sed '/WARN/d'

@@ -627,9 +627,12 @@ fn retry_local_after(timer: Int) -> Nil {
       let seq = next_activity()
       let command = case command {
         bridge.ScheduleLocalActivity(..) ->
+          // Each attempt after a backoff is a new activity as far as ids go, numbered
+          // like the other SDKs number it: the recorded marker carries this id.
           bridge.ScheduleLocalActivity(
             ..command,
             seq:,
+            activity_id: int.to_string(seq),
             attempt:,
             original_schedule_time_ms: Some(original),
           )

@@ -2,3 +2,4 @@
 /native/temporal_nif/target
 /priv/*.so
 erl_crash.dump
+node_modules

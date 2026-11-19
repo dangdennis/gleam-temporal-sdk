@@ -773,3 +773,109 @@ fn eventually(check: fn() -> Bool) -> Bool {
     }
   })
 }
+
+// ---- losing a worker in the middle of a local activity ----
+
+@external(erlang, "temporal_test_ffi", "read_file")
+fn read_file(path: String) -> Result(BitArray, String)
+
+@external(erlang, "temporal_test_ffi", "write_file")
+fn write_file(path: String, bytes: BitArray) -> Nil
+
+fn fragile() {
+  workflow.Definition("fragile", codec.nil(), codec.string())
+}
+
+/// Hangs the first time it runs for a workflow, as if its worker had frozen. Runs are
+/// counted in a file, because the two runs happen in different operating system processes.
+fn hang_once() {
+  activity.Definition("hang_once", codec.nil(), codec.string())
+}
+
+fn runs_file(workflow_id: String) -> String {
+  "build/scratch/" <> workflow_id <> ".runs"
+}
+
+fn runs_so_far(workflow_id: String) -> Int {
+  case read_file(runs_file(workflow_id)) {
+    Ok(bytes) -> bit_array.byte_size(bytes)
+    Error(_) -> 0
+  }
+}
+
+fn hang_once_activity(ctx: activity.Context, _: Nil) {
+  let runs = runs_so_far(ctx.info.workflow_id) + 1
+  write_file(
+    runs_file(ctx.info.workflow_id),
+    bit_array.concat(list.repeat(<<"x":utf8>>, runs)),
+  )
+  case runs {
+    1 -> {
+      process.sleep(600_000)
+      Ok("the first run should have been lost")
+    }
+    _ -> Ok("finished on run " <> int.to_string(runs))
+  }
+}
+
+fn fragile_handlers() -> List(workflow.Handler) {
+  [
+    workflow.handler(fragile(), fn(ctx, _) {
+      workflow.execute_local_activity(
+        ctx,
+        hang_once(),
+        Nil,
+        workflow.local_activity_options(start_to_close_ms: 60_000),
+      )
+    }),
+  ]
+}
+
+fn fragile_worker(task_queue: String) -> worker.Worker {
+  let assert Ok(client) = client.connect(client.local())
+  let assert Ok(worker) =
+    worker.new(client, task_queue)
+    |> worker.with_workflows(fragile_handlers())
+    |> worker.with_activities([
+      activity.handler(hang_once(), hang_once_activity),
+    ])
+    |> worker.start
+  worker
+}
+
+/// Entry point of the operating system process the test starts and then kills.
+pub fn doomed_worker(task_queue: String) -> Nil {
+  let _ = fragile_worker(task_queue)
+  process.sleep_forever()
+}
+
+/// A local activity is not recorded until it finishes. If the worker running it dies, the
+/// workflow task times out, another worker replays the workflow and runs the activity
+/// again from the start: at least once, never zero times, and the workflow is not harmed.
+pub fn a_local_activity_runs_again_after_its_worker_is_killed_test() {
+  let task_queue = "fragile-" <> unique()
+  let assert Ok(client) = client.connect(client.local())
+  // A worker in a process of its own, so that it can be killed outright.
+  let os_pid =
+    cmd(
+      "erl -noshell -pa build/dev/erlang/*/ebin -eval 'advanced_test:doomed_worker(<<\""
+      <> task_queue
+      <> "\">>)' >/dev/null 2>&1 & echo $!",
+    )
+    |> string.trim
+  let options =
+    client.StartOptions(
+      ..client.start_options(workflow_id: task_queue, task_queue:),
+      task_timeout_ms: Some(2000),
+    )
+  let assert Ok(handle) = client.start(client, fragile(), Nil, options)
+  assert eventually(fn() { runs_so_far(task_queue) == 1 })
+
+  let _ = cmd("kill -9 " <> os_pid)
+  let replacement = fragile_worker(task_queue)
+  assert client.result(handle) == Ok("finished on run 2")
+  assert runs_so_far(task_queue) == 2
+  let assert Ok(history) = client.history(handle)
+  assert replayer.replay(fragile_handlers(), history) == Ok(Nil)
+  worker.stop(replacement)
+}

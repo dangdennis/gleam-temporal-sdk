@@ -1,5 +1,5 @@
 -module(temporal_test_ffi).
--export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, log/2]).
+-export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, log/2, write_file/2]).
 
 unique() ->
     integer_to_binary(erlang:system_time(microsecond)).
@@ -112,3 +112,8 @@ log(#{level := Level, msg := {Format, Args}, meta := #{domain := [temporal]} = M
     ok;
 log(_, _) ->
     ok.
+
+write_file(Path, Bytes) ->
+    ok = filelib:ensure_dir(Path),
+    ok = file:write_file(Path, Bytes),
+    nil.

@@ -1,0 +1,18 @@
+{
+  "name": "temporal-gleam-conformance",
+  "private": true,
+  "description": "The TypeScript half of the conformance harness in test/conformance_test.gleam",
+  "scripts": {
+    "record": "node harness.js record ../../fixtures/conformance",
+    "replay": "node harness.js replay ../../../build/conformance"
+  },
+  "dependencies": {
+    "@temporalio/activity": "1.26.0",
+    "@temporalio/client": "1.26.0",
+    "@temporalio/proto": "1.26.0",
+    "@temporalio/worker": "1.26.0",
+    "@temporalio/workflow": "1.26.0",
+    "@temporalio/nexus": "1.26.0",
+    "nexus-rpc": "0.0.3"
+  }
+}

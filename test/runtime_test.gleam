@@ -769,3 +769,256 @@ pub fn workflow_logs_once_and_not_on_replay_test() {
     })
     == [#(bridge.Warning, "slept", "wf")]
 }
+
+fn add() {
+  workflow.UpdateDefinition("add", codec.int(), codec.int())
+}
+
+fn update_job(protocol_id: String, amount: Int, validate: Bool) -> bridge.Job {
+  bridge.DoUpdate(
+    id: "update-" <> protocol_id,
+    protocol_instance_id: protocol_id,
+    name: "add",
+    input: [codec.int().encode(amount)],
+    run_validator: validate,
+  )
+}
+
+fn adder() {
+  start(
+    int_workflow("adder", fn(ctx, total) {
+      workflow.set_update_validator(ctx, add(), fn(amount) {
+        case amount < 0 {
+          True -> Error("negative")
+          False -> Ok(Nil)
+        }
+      })
+      let update = workflow.receive_update(ctx, add())
+      let amount = workflow.update_argument(update)
+      use doubled <- result.try(workflow.execute_activity(
+        ctx,
+        double(),
+        amount,
+        options(),
+      ))
+      workflow.complete_update(ctx, update, Ok(total + doubled))
+      Ok(total + doubled)
+    }),
+  )
+}
+
+pub fn an_update_is_accepted_then_completed_after_its_work_test() {
+  let run = adder()
+  assert activate(run, [init("adder", 1)]) == []
+  // Accepted as the job is applied, before the workflow's own commands.
+  let assert [bridge.UpdateAccepted("p1"), bridge.ScheduleActivity(seq: 1, ..)] =
+    activate(run, [update_job("p1", 5, True)])
+  assert activate(run, [
+      bridge.ResolveActivity(1, bridge.Completed(int_payload(10))),
+    ])
+    == [
+      bridge.UpdateCompleted("p1", codec.int().encode(11)),
+      bridge.CompleteWorkflow(int_payload(11)),
+    ]
+}
+
+pub fn a_validator_rejects_an_update_without_waking_the_workflow_test() {
+  let run = adder()
+  let _ = activate(run, [init("adder", 1)])
+  let assert [
+    bridge.UpdateRejected("p1", failure.Failure(message: "negative", ..)),
+  ] = activate(run, [update_job("p1", -1, True)])
+  // The workflow is still waiting for an update it will accept.
+  let assert [bridge.UpdateAccepted("p2"), bridge.ScheduleActivity(..)] =
+    activate(run, [update_job("p2", 1, True)])
+}
+
+pub fn validators_do_not_run_on_replay_test() {
+  let run = adder()
+  let _ = activate(run, [init("adder", 1)])
+  // History says this update was accepted, so it is, whatever the validator thinks now.
+  let assert [bridge.UpdateAccepted("p1"), bridge.ScheduleActivity(..)] =
+    activate(run, [update_job("p1", -1, False)])
+}
+
+pub fn an_update_for_an_unknown_name_is_rejected_once_the_workflow_waits_test() {
+  let run =
+    start(
+      int_workflow("deaf", fn(ctx, n) {
+        use _ <- result.map(workflow.sleep(ctx, 1000))
+        n
+      }),
+    )
+  // Delivered with the first task: the workflow gets to run before it is judged.
+  let assert [
+    bridge.StartTimer(1, 1000),
+    bridge.UpdateRejected(
+      "p1",
+      failure.Failure(error_type: "UpdateRejected", ..),
+    ),
+  ] = activate(run, [init("deaf", 1), update_job("p1", 1, True)])
+}
+
+pub fn an_update_that_arrives_with_the_first_task_is_taken_test() {
+  let run = adder()
+  let assert [bridge.UpdateAccepted("p1"), bridge.ScheduleActivity(..)] =
+    activate(run, [init("adder", 1), update_job("p1", 2, True)])
+}
+
+pub fn a_local_activity_retries_after_the_backoff_core_asks_for_test() {
+  let run =
+    start(
+      int_workflow("local", fn(ctx, n) {
+        workflow.execute_local_activity(
+          ctx,
+          double(),
+          n,
+          workflow.local_activity_options(start_to_close_ms: 1000),
+        )
+      }),
+    )
+  let assert [
+    bridge.ScheduleLocalActivity(seq: 1, activity_id: "1", attempt: 1, ..),
+  ] = activate(run, [init("local", 4)])
+  // Core hands a long wait back: the runtime waits with a timer of its own.
+  assert activate(run, [bridge.ResolveActivity(1, bridge.Backoff(2, 9000, 555))])
+    == [bridge.StartTimer(1, 9000)]
+  // The retry is a new activity as far as numbering goes, carrying core's attempt.
+  let assert [
+    bridge.ScheduleLocalActivity(
+      seq: 2,
+      activity_id: "2",
+      attempt: 2,
+      original_schedule_time_ms: Some(555),
+      ..,
+    ),
+  ] = activate(run, [bridge.FireTimer(1)])
+  assert activate(run, [
+      bridge.ResolveActivity(2, bridge.Completed(int_payload(8))),
+    ])
+    == [bridge.CompleteWorkflow(int_payload(8))]
+}
+
+pub fn cancelling_a_local_activity_depends_on_what_it_is_waiting_for_test() {
+  let scoped = fn() {
+    start(
+      int_workflow("local", fn(ctx, n) {
+        workflow.execute_local_activity(
+          ctx,
+          double(),
+          n,
+          workflow.local_activity_options(start_to_close_ms: 1000),
+        )
+      }),
+    )
+  }
+  // Running: core is asked to cancel it.
+  let run = scoped()
+  let _ = activate(run, [init("local", 4)])
+  assert activate(run, [bridge.CancelWorkflow("stop")])
+    == [bridge.RequestCancelLocalActivity(1)]
+  // Between attempts: the timer is cancelled and the workflow sees the cancellation.
+  let run = scoped()
+  let _ = activate(run, [init("local", 4)])
+  let _ =
+    activate(run, [bridge.ResolveActivity(1, bridge.Backoff(2, 9000, 555))])
+  assert activate(run, [bridge.CancelWorkflow("stop")])
+    == [bridge.CancelTimer(1), bridge.CancelWorkflowExecution]
+}
+
+pub fn signals_to_other_workflows_are_numbered_apart_from_cancellations_test() {
+  let poke = workflow.SignalDefinition("poke", codec.int())
+  let run =
+    start(
+      int_workflow("talker", fn(ctx, n) {
+        let sent = workflow.signal_external(ctx, "other", poke, n)
+        let stopped = workflow.cancel_external(ctx, "other")
+        let assert Ok(Nil) = workflow.await(sent)
+        let assert Error(_) = workflow.await(stopped)
+        Ok(n)
+      }),
+    )
+  let assert [
+    bridge.SignalExternal(
+      seq: 1,
+      target: bridge.ExternalWorkflow("other", ""),
+      signal_name: "poke",
+      ..,
+    ),
+    bridge.CancelExternal(seq: 1, workflow_id: "other", ..),
+  ] = activate(run, [init("talker", 1)])
+  assert activate(run, [bridge.ResolveExternalSignal(1, None)]) == []
+  assert activate(run, [
+      bridge.ResolveExternalCancel(1, Some(failure.new("no such workflow"))),
+    ])
+    == [bridge.CompleteWorkflow(int_payload(1))]
+}
+
+pub fn a_pending_signal_to_another_workflow_is_cancelled_with_its_scope_test() {
+  let poke = workflow.SignalDefinition("poke", codec.int())
+  let run =
+    start(
+      int_workflow("talker", fn(ctx, n) {
+        use _ <- result.map(
+          workflow.await(workflow.signal_external(ctx, "other", poke, n)),
+        )
+        n
+      }),
+    )
+  let _ = activate(run, [init("talker", 1)])
+  assert activate(run, [bridge.CancelWorkflow("stop")])
+    == [bridge.CancelSignalExternal(1)]
+}
+
+pub fn a_nexus_operation_starts_then_resolves_test() {
+  let operation =
+    workflow.NexusOperation("maths", "double", codec.int(), codec.int())
+  let run =
+    start(
+      int_workflow("caller", fn(ctx, n) {
+        use handle <- result.try(workflow.start_nexus_operation(
+          ctx,
+          "endpoint",
+          operation,
+          n,
+          workflow.nexus_options(),
+        ))
+        assert workflow.nexus_operation_token(handle) == Some("token")
+        workflow.await(workflow.nexus_result(handle))
+      }),
+    )
+  let assert [
+    bridge.ScheduleNexusOperation(
+      seq: 1,
+      endpoint: "endpoint",
+      service: "maths",
+      operation: "double",
+      cancellation_type: 0,
+      ..,
+    ),
+  ] = activate(run, [init("caller", 3)])
+  assert activate(run, [
+      bridge.ResolveNexusStart(1, bridge.NexusStartedAsync("token")),
+    ])
+    == []
+  // Cancelling the workflow now asks for the operation to be cancelled.
+  assert activate(run, [bridge.CancelWorkflow("stop")])
+    == [bridge.CancelNexusOperation(1)]
+  assert activate(run, [
+      bridge.ResolveNexus(1, bridge.Completed(int_payload(6))),
+    ])
+    == [bridge.CompleteWorkflow(int_payload(6))]
+}
+
+pub fn a_workflow_reports_its_versioning_behaviour_test() {
+  let handler =
+    int_workflow("pinned", fn(_, n) { Ok(n) })
+    |> workflow.with_versioning(workflow.Pinned)
+  let run = start(handler)
+  bridge.send_activation(
+    run.0,
+    Activation("run", 1000, False, 3, [init("pinned", 1)], False),
+  )
+  let assert Ok(bridge.Success("run", [bridge.CompleteWorkflow(_)], 1)) =
+    process.receive(run.1, 1000)
+}
