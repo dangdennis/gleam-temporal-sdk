@@ -53,6 +53,24 @@ pub fn main() {
 }
 ```
 
+The modules:
+
+| Module | For |
+|---|---|
+| `temporal/workflow` | Writing workflows: timers, activities, signals, queries, futures, cancellation scopes |
+| `temporal/workflow/child` | Child workflows |
+| `temporal/workflow/update` | Taking and answering updates |
+| `temporal/workflow/local_activity` | Local activities |
+| `temporal/workflow/operation` | Calling Nexus operations |
+| `temporal/activity` | Writing activities |
+| `temporal/client` | Starting, signalling, querying, updating and awaiting workflows |
+| `temporal/worker` | Running workflows and activities |
+| `temporal/schedule` | Schedules |
+| `temporal/nexus` | Serving Nexus operations |
+| `temporal/codec`, `temporal/encryption` | Value codecs and payload codecs |
+| `temporal/failure` | Failures |
+| `temporal/testing`, `temporal/replayer` | Test servers, activity contexts, history replay |
+
 Passing the wrong input type to `execute_activity` or `client.execute` is a compile error.
 So is passing a bare number where a length of time is wanted: every timeout and delay is a
 `gleam/time/duration.Duration`, and every point in time a `timestamp.Timestamp`.
@@ -154,12 +172,37 @@ fn accumulator_workflow(ctx: workflow.Context, sum: Int) -> Result(Int, Failure)
 }
 ```
 
+## Arguments, results and errors
+
+A definition names one input and one output. For a workflow or activity that takes several
+arguments, as those written with other SDKs often do, use an argument-list codec and pass
+a tuple:
+
+```gleam
+pub fn transfer() {
+  workflow.Definition(
+    "transfer",
+    codec.args3(codec.string(), codec.string(), codec.int()),
+    codec.nil(),
+  )
+}
+
+client.execute(client, transfer(), #("alice", "bob", 250), options)
+```
+
+Every client call returns `Result(_, client.Error)`: one type, whose variants say whether
+the workflow failed, was cancelled, timed out, was not found, and so on.
+
+`start` never waits. `workflow.start_activity` returns a future of the result;
+`child.start` and `operation.start` return a handle with a `started` future and a `result`
+future. The `execute` functions start and wait for the result.
+
 ## Cancellation
 
 Cancellation travels with the `Context`, as in Go. Whatever a workflow starts with a
 context belongs to that context's scope and fails with a cancellation when the scope is
 cancelled. A request to cancel the workflow cancels the context the workflow function was
-given, so `sleep`, `execute_activity` and `execute_child` all return a `Result`:
+given, so `sleep`, `execute_activity` and `child.execute` all return a `Result`:
 
 ```gleam
 fn order_workflow(ctx: workflow.Context, order: Order) -> Result(Receipt, Failure) {
@@ -206,16 +249,16 @@ updates when it is ready for them, the way it takes signals, and answers each on
 ```gleam
 fn cart_workflow(ctx: workflow.Context, items: List(Item)) -> Result(Int, Failure) {
   // Decide what to accept. A refused update leaves no trace in history.
-  workflow.set_update_validator(ctx, add_item(), fn(item) {
+  update.set_validator(ctx, add_item(), fn(item) {
     case item.quantity > 0 {
       True -> Ok(Nil)
       False -> Error("quantity must be positive")
     }
   })
-  let update = workflow.receive_update(ctx, add_item())
-  let items = [workflow.update_argument(update), ..items]
+  let request = update.receive(ctx, add_item())
+  let items = [update.argument(request), ..items]
   // Work done before answering, such as an activity, happens while the client waits.
-  workflow.complete_update(ctx, update, Ok(list.length(items)))
+  update.complete(ctx, request, Ok(list.length(items)))
   cart_workflow(ctx, items)
 }
 
@@ -228,7 +271,7 @@ the workflow's main function. Histories are compatible either way.
 
 ## Local activities
 
-`workflow.execute_local_activity` runs an activity inside the workflow's own worker,
+`local_activity.execute` runs an activity inside the workflow's own worker,
 without a round trip through the server. Use it for work that takes a few seconds at most.
 A local activity is recorded only when it finishes, so if its worker dies the activity
 runs again from the start on another worker: it must be safe to repeat.
@@ -244,7 +287,7 @@ pub fn place_order() {
 }
 
 // Caller, in any namespace allowed to use the endpoint:
-workflow.execute_nexus_operation(ctx, "orders-endpoint", place_order(), order, workflow.nexus_options())
+operation.execute(ctx, "orders-endpoint", place_order(), order, operation.options())
 
 // Handler: the operation runs a workflow and finishes when it does.
 worker.new(client, "orders")
@@ -304,7 +347,7 @@ worker.new(client, "main")
 |> worker.with_activity_middleware(fn(ctx, next) {
   case next() {
     Error(failure) -> {
-      report(ctx.info.activity_type, failure)
+      report(activity.info(ctx).activity_type, failure)
       Error(failure)
     }
     ok -> ok
@@ -385,8 +428,8 @@ bin/conformance # bin/test, then replay this SDK's histories on the TypeScript S
 4. the history the Gleam twin recorded replays through the TypeScript twin, on the
    TypeScript SDK.
 
-The features are: basics (timers, activities, signals, children), cancellation scopes,
-waiting with a deadline, updates, signalling and cancelling other workflows, local
+The features are: basics (timers, activities, signals, children), several arguments,
+cancellation scopes, waiting with a deadline, updates, signalling and cancelling other workflows, local
 activities, patching with memo changes and continue-as-new, Nexus calls, and encrypted
 payloads. Steps 1 to 3 run as part of `bin/test`; step 4 needs Node.js.
 
@@ -412,6 +455,9 @@ order and identity; it does not compare payload contents or timing between the S
   scope lists what was started in it, nested scopes included, in order; cancelling one walks
   that list and emits the cancel commands in the order the TypeScript SDK would, which is
   what lets histories recorded there replay here.
+- **One module per kind of thing a workflow does.** Children, updates, local activities
+  and Nexus calls each have their own, so names read as `child.Abandon` and
+  `update.receive` with no suffixes to keep them apart.
 - **Updates are pulled, not pushed.** A workflow is one process running one function, so
   an update cannot run beside it. The runtime accepts or rejects each update as it
   arrives and queues the accepted ones for the workflow to take.

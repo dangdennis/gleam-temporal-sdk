@@ -34,7 +34,7 @@ pub type Failure {
     message: String,
     kind: Kind,
     /// Application-defined category, matched by retry policies' non-retryable types.
-    error_type: String,
+    error_type: Option(String),
     /// Retry policies give up on the failure instead of retrying.
     non_retryable: Bool,
     /// The failure this one wraps.
@@ -46,13 +46,13 @@ pub type Failure {
 
 /// A retryable application failure.
 pub fn new(message: String) -> Failure {
-  Failure(message, Application, "", False, None, [])
+  Failure(message, Application, None, False, None, [])
 }
 
 /// Set the failure's category. Retry policies can name categories that should not be
 /// retried, and callers match on it to tell failures apart.
 pub fn with_type(failure: Failure, error_type: String) -> Failure {
-  Failure(..failure, error_type:)
+  Failure(..failure, error_type: Some(error_type))
 }
 
 /// Mark the failure so that retry policies do not retry it.
@@ -62,7 +62,7 @@ pub fn non_retryable(failure: Failure) -> Failure {
 
 /// What a workflow returns to acknowledge a cancellation request.
 pub fn cancelled() -> Failure {
-  Failure("cancelled", Cancelled, "", False, None, [])
+  Failure("cancelled", Cancelled, None, False, None, [])
 }
 
 /// The innermost failure: the original error beneath activity and child workflow wrappers.
@@ -80,7 +80,7 @@ pub fn with_details(failure: Failure, details: List(Payload)) -> Failure {
 
 /// A failure of kind `Timeout`.
 pub fn timeout(message: String) -> Failure {
-  Failure(message, Timeout, "", False, None, [])
+  Failure(message, Timeout, None, False, None, [])
 }
 
 /// Whether the failure is a cancellation, directly or as the cause of an activity or child

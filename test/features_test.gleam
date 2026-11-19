@@ -20,6 +20,7 @@ import temporal/replayer
 import temporal/search_attributes
 import temporal/worker
 import temporal/workflow.{type Context}
+import temporal/workflow/child
 
 // ---- activities ----
 
@@ -32,7 +33,7 @@ fn patient_activity(ctx: activity.Context, remaining: Int) {
   activity.heartbeat(ctx)
   case activity.cancel_reason(ctx), remaining <= 0 {
     Some(reason), _ -> {
-      record(ctx.info.workflow_id, "saw " <> string.inspect(reason))
+      record(activity.info(ctx).workflow_id, "saw " <> string.inspect(reason))
       Error(failure.cancelled())
     }
     None, True -> Ok("ran to the end")
@@ -54,7 +55,7 @@ fn resumable() {
 
 fn resumable_activity(ctx: activity.Context, _: Nil) {
   case activity.heartbeat_details(ctx, codec.int()) {
-    Some(progress) -> Ok(progress + ctx.info.attempt)
+    Some(progress) -> Ok(progress + activity.info(ctx).attempt)
     None -> {
       activity.heartbeat_with(ctx, codec.int(), 40)
       Error(failure.new("interrupted"))
@@ -78,11 +79,11 @@ fn activities() -> List(activity.Handler) {
   [
     activity.handler(patient(), patient_activity),
     activity.handler(note(), fn(ctx, text) {
-      Ok(record(ctx.info.workflow_id, text))
+      Ok(record(activity.info(ctx).workflow_id, text))
     }),
     activity.handler(resumable(), resumable_activity),
     activity.handler(describe_self(), fn(ctx, _) {
-      let info = ctx.info
+      let info = activity.info(ctx)
       Ok(string.join(
         [
           info.activity_type,
@@ -103,7 +104,7 @@ fn activities() -> List(activity.Handler) {
         failure.new("over budget")
         |> failure.with_type("OverBudget")
         |> failure.non_retryable
-        |> failure.with_details([codec.int().encode(250)]),
+        |> failure.with_details([codec.encode(codec.int(), 250)]),
       )
     }),
     // Registered under the name the outbound middleware rewrites `double` to.
@@ -221,7 +222,7 @@ fn resuming_workflow(ctx: Context, _: Nil) -> Result(Int, Failure) {
     ctx,
     resumable(),
     Nil,
-    options() |> workflow.with_retry(retry),
+    workflow.ActivityOptions(..options(), retry: Some(retry)),
   )
 }
 
@@ -244,17 +245,14 @@ fn detaching_workflow(
   child_id: String,
 ) -> Result(String, Failure) {
   let options =
-    workflow.ChildOptions(
-      ..workflow.child_options(workflow_id: child_id),
-      parent_close_policy: workflow.AbandonChild,
+    child.Options(
+      ..child.options(workflow_id: child_id),
+      parent_close_policy: child.Abandon,
     )
-  use child <- result.map(workflow.start_child(
-    ctx,
-    slow_child(),
-    workflow.info(ctx).workflow_id,
-    options,
-  ))
-  workflow.child_run_id(child)
+  // Waiting for the child to start is what makes sure it does.
+  child.start(ctx, slow_child(), workflow.info(ctx).workflow_id, options)
+  |> child.started
+  |> workflow.await
 }
 
 fn supervising() {
@@ -268,11 +266,11 @@ fn supervising_workflow(
 ) -> Result(String, Failure) {
   let outcome =
     workflow.with_timeout(ctx, duration.milliseconds(200), fn(scope) {
-      workflow.execute_child(
+      child.execute(
         scope,
         waiting(),
         60_000,
-        workflow.child_options(workflow_id: child_id),
+        child.options(workflow_id: child_id),
       )
     })
   case outcome {
@@ -321,7 +319,7 @@ fn budgeting_workflow(ctx: Context, _: Nil) -> Result(Int, Failure) {
     Error(failure) -> {
       let cause = failure.root_cause(failure)
       let assert [payload] = cause.details
-      codec.int().decode(payload) |> result.map_error(failure.new)
+      codec.decode(codec.int(), payload) |> result.map_error(failure.new)
     }
   }
 }
@@ -385,8 +383,8 @@ fn tag_failures(ctx: Context, next) {
 }
 
 fn count_activities(ctx: activity.Context, next) {
-  let key = "ran:" <> ctx.info.workflow_id
-  record(key, recorded(key) <> ctx.info.activity_type <> ";")
+  let key = "ran:" <> activity.info(ctx).workflow_id
+  record(key, recorded(key) <> activity.info(ctx).activity_type <> ";")
   next()
 }
 
@@ -407,7 +405,7 @@ fn run(
   env: Env,
   definition: workflow.Definition(input, output),
   input: input,
-) -> Result(output, client.WorkflowError) {
+) -> Result(output, client.Error) {
   let assert Ok(handle) =
     client.start(env.client, definition, input, start_options(env))
   let result = client.result(handle)
@@ -432,7 +430,7 @@ pub fn cleanup_runs_shielded_after_the_workflow_is_cancelled_test() {
     client.start(env.client, tidy(), Nil, start_options(env))
   process.sleep(300)
   let assert Ok(Nil) = client.cancel(handle)
-  assert client.result(handle) == Error(client.Cancelled)
+  assert client.result(handle) == Error(client.WorkflowCancelled)
   assert recorded(client.workflow_id(handle)) == "cleaned up"
   assert_replays(handle)
 }
@@ -491,7 +489,7 @@ pub fn a_deadline_cancels_a_child_workflow_test() {
   assert run(env, supervising(), child_id)
     == Ok("child stopped: timeout=True cancelled=True")
   let child = client.handle(env.client, waiting(), child_id)
-  assert client.result(child) == Error(client.Cancelled)
+  assert client.result(child) == Error(client.WorkflowCancelled)
 }
 
 // ---- client ----
@@ -499,8 +497,12 @@ pub fn a_deadline_cancels_a_child_workflow_test() {
 pub fn memo_reaches_the_workflow_and_the_description_test() {
   use env <- in_both_modes("remembering")
   let options =
-    start_options(env)
-    |> client.with_memo("origin", codec.string(), "checkout")
+    client.StartOptions(
+      ..start_options(env),
+      memo: dict.from_list([
+        #("origin", codec.encode(codec.string(), "checkout")),
+      ]),
+    )
   let assert Ok(handle) = client.start(env.client, remembering(), Nil, options)
   assert client.result(handle) == Ok("checkout")
   let assert Ok(description) = client.describe(handle)
@@ -509,7 +511,7 @@ pub fn memo_reaches_the_workflow_and_the_description_test() {
   assert description.task_queue == env.task_queue
   assert option.is_some(description.close_time)
   let assert Ok(payload) = dict.get(description.memo, "origin")
-  assert codec.string().decode(payload) == Ok("checkout")
+  assert codec.decode(codec.string(), payload) == Ok("checkout")
   assert_replays(handle)
 }
 
@@ -566,9 +568,9 @@ pub fn a_closed_workflow_id_can_be_refused_test() {
     )
   let assert Ok(handle) = client.start(env.client, waiting(), 10, options)
   assert client.result(handle) == Ok("nobody nudged")
-  assert client.start(env.client, waiting(), 10, options)
-    |> result.map(fn(_) { Nil })
-    == Error(client.AlreadyStarted)
+  let assert Error(client.AlreadyExists(_)) =
+    client.start(env.client, waiting(), 10, options)
+  Nil
 }
 
 pub fn a_run_timeout_ends_the_workflow_test() {
@@ -579,7 +581,7 @@ pub fn a_run_timeout_ends_the_workflow_test() {
       run_timeout: Some(duration.milliseconds(1000)),
     )
   let assert Ok(handle) = client.start(env.client, waiting(), 60_000, options)
-  assert client.result(handle) == Error(client.TimedOut)
+  assert client.result(handle) == Error(client.WorkflowTimedOut)
 }
 
 pub fn requests_about_a_missing_workflow_are_not_found_test() {
@@ -608,14 +610,15 @@ pub fn workflows_can_be_listed_and_counted_test() {
           client,
           waiting(),
           10,
-          client.start_options(
-            workflow_id: task_queue <> "-" <> int.to_string(n),
-            task_queue:,
-          )
-            |> client.with_search_attribute(
-              attribute,
-              search_attributes.Keyword(task_queue),
+          client.StartOptions(
+            ..client.start_options(
+              workflow_id: task_queue <> "-" <> int.to_string(n),
+              task_queue:,
             ),
+            search_attributes: dict.from_list([
+              #(attribute, search_attributes.Keyword(task_queue)),
+            ]),
+          ),
         )
       handle
     })
@@ -646,8 +649,8 @@ pub fn workflow_middleware_reports_a_failure_once_test() {
   use env <- in_both_modes("tagging")
   let assert Ok(handle) =
     client.start(env.client, failing(), Nil, start_options(env))
-  let assert Error(client.Failed(failure)) = client.result(handle)
-  assert failure.error_type == "Tagged"
+  let assert Error(client.WorkflowFailed(failure)) = client.result(handle)
+  assert failure.error_type == Some("Tagged")
   assert_replays(handle)
   assert recorded("reports:" <> client.workflow_id(handle)) == "x"
 }

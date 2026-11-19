@@ -142,7 +142,10 @@ pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
         &[
             f.message.encode(env),
             atom(env, kind),
-            error_type.encode(env),
+            option(
+                env,
+                (!error_type.is_empty()).then(|| error_type.encode(env)),
+            ),
             non_retryable.encode(env),
             cause,
             details,
@@ -497,7 +500,10 @@ pub fn decode_failure(term: Term) -> DecodeResult<Failure> {
         })
     } else {
         FailureInfo::ApplicationFailureInfo(ApplicationFailureInfo {
-            r#type: get(&f, 2)?,
+            r#type: opt(field(&f, 2)?)
+                .map(|t| t.decode().map_err(|_| "error type must be a String"))
+                .transpose()?
+                .unwrap_or_default(),
             non_retryable: get(&f, 3)?,
             details,
             ..Default::default()

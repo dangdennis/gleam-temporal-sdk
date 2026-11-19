@@ -26,8 +26,10 @@ pub fn a_schedule_round_trips_and_can_be_changed_test() {
       ..client.start_options(workflow_id: id <> "-run", task_queue: id),
       run_timeout: Some(duration.milliseconds(60_000)),
       task_timeout: Some(duration.milliseconds(10_000)),
+      memo: dict.from_list([
+        #("origin", codec.encode(codec.string(), "schedule")),
+      ]),
     )
-    |> client.with_memo("origin", codec.string(), "schedule")
   let created =
     schedule.Schedule(
       ..schedule.new(
@@ -147,9 +149,15 @@ pub fn a_triggered_schedule_starts_its_workflow_test() {
     ])
     |> worker.start
   let options =
-    client.start_options(workflow_id: id <> "-run", task_queue: id)
-    |> client.with_memo("origin", codec.string(), "schedule")
-    |> client.with_search_attribute(attribute, search_attributes.Keyword(id))
+    client.StartOptions(
+      ..client.start_options(workflow_id: id <> "-run", task_queue: id),
+      memo: dict.from_list([
+        #("origin", codec.encode(codec.string(), "schedule")),
+      ]),
+      search_attributes: dict.from_list([
+        #(attribute, search_attributes.Keyword(id)),
+      ]),
+    )
   let assert Ok(Nil) =
     schedule.create(
       client,

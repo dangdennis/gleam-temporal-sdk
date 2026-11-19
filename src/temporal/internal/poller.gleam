@@ -285,7 +285,7 @@ fn run_activity(
     is_local:,
   ) = task
   let ctx =
-    activity.Context(
+    activity.new_context(
       info: activity.Info(
         activity_id:,
         activity_type:,

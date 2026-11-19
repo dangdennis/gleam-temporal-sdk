@@ -40,7 +40,14 @@ fn payload(text: String) -> Payload {
 }
 
 fn sample_failure(message: String) -> Failure {
-  failure.Failure(message, failure.Application, "SampleType", True, None, [])
+  failure.Failure(
+    message,
+    failure.Application,
+    Some("SampleType"),
+    True,
+    None,
+    [],
+  )
 }
 
 pub fn every_job_arrives_as_the_gleam_type_describes_it_test() {
@@ -390,4 +397,27 @@ pub fn every_nexus_result_reaches_core_test() {
     "CancelOperation",
   )
   assert string.contains(seen(bridge.NexusTaskCancelAcknowledged), "AckCancel")
+}
+
+pub fn argument_list_codecs_carry_one_payload_per_argument_test() {
+  let pair = codec.args2(codec.string(), codec.int())
+  let payloads = codec.encode_arguments(pair, #("a", 2))
+  assert payloads
+    == [codec.encode(codec.string(), "a"), codec.encode(codec.int(), 2)]
+  assert codec.decode_arguments(pair, payloads) == Ok(#("a", 2))
+
+  // A caller that sent fewer arguments sent nulls for the rest, which only a codec that
+  // accepts a null can read.
+  let optional = codec.args2(codec.string(), codec.nil())
+  assert codec.decode_arguments(optional, [codec.encode(codec.string(), "a")])
+    == Ok(#("a", Nil))
+  let assert Error(reason) =
+    codec.decode_arguments(pair, [codec.encode(codec.string(), "a")])
+  assert string.starts_with(reason, "argument 2:")
+
+  // A single-value codec reads the first argument and ignores the rest.
+  assert codec.decode_arguments(codec.string(), payloads) == Ok("a")
+  assert codec.encode_arguments(codec.no_args(), Nil) == []
+  assert codec.encode_arguments(codec.nil(), Nil)
+    == [codec.encode(codec.nil(), Nil)]
 }

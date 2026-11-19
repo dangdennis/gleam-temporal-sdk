@@ -20,6 +20,7 @@ import temporal/failure.{type Failure}
 import temporal/replayer
 import temporal/worker
 import temporal/workflow.{type Context}
+import temporal/workflow/child
 
 type Step {
   Sleep(ms: Int)
@@ -157,13 +158,8 @@ fn interpret(ctx: Context, seed: Int) -> Result(List(Int), Failure) {
         Ok([])
       }
       Child(n) -> {
-        let child = workflow.child_options(workflow_id: workflow.uuid4(ctx))
-        use doubled <- result.try(workflow.execute_child(
-          ctx,
-          double_child(),
-          n,
-          child,
-        ))
+        let child = child.options(workflow_id: workflow.uuid4(ctx))
+        use doubled <- result.try(child.execute(ctx, double_child(), n, child))
         Ok([doubled])
       }
       Deadline(n) -> {

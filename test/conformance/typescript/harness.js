@@ -54,6 +54,7 @@ const encrypted = { payloadCodecs: [encryptionCodec] };
 const activities = {
   double: async (n) => n * 2,
   slow: async (ms) => sleep(ms),
+  join: async (text, times) => Array(times).fill(text).join(' '),
   stubborn: async (attempts) => {
     const { Context } = require('@temporalio/activity');
     const attempt = Context.current().info.attempt;
@@ -131,6 +132,7 @@ const features = {
     },
   },
   local: { args: [3] },
+  arguments: { args: ['hey', 3, true] },
   lifecycle: { args: [2] },
   nexus_caller: {
     args: ({ endpoint }) => [endpoint],

@@ -221,13 +221,13 @@ pub fn with_activity_cancellation_grace(
 /// times in a minute, the worker gives up and exits abnormally, which takes the calling
 /// process with it unless it traps exits: a worker that cannot work should not look
 /// healthy. Under a supervisor, use `supervised` instead.
-pub fn start(config: Config) -> Result(Worker, String) {
+pub fn start(config: Config) -> Result(Worker, client.Error) {
   let started = process.new_subject()
   let parent = process.self()
   let manager = process.spawn(fn() { manage(config, parent, started) })
   case process.receive_forever(started) {
     Ok(control) -> Ok(Worker(manager, control))
-    Error(reason) -> Error(reason)
+    Error(reason) -> Error(client.ConnectionFailed(reason))
   }
 }
 
@@ -237,7 +237,7 @@ pub fn supervised(config: Config) -> supervision.ChildSpecification(Worker) {
   supervision.worker(fn() {
     case start(config) {
       Ok(worker) -> Ok(actor.Started(worker.manager, worker))
-      Error(reason) -> Error(actor.InitFailed(reason))
+      Error(error) -> Error(actor.InitFailed(string.inspect(error)))
     }
   })
   // Stopping waits for tasks in flight, for longer than a supervisor waits by default.

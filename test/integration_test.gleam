@@ -8,6 +8,7 @@
 
 import gleam/int
 import gleam/list
+import gleam/option.{Some}
 import gleam/result
 import gleam/string
 import gleam/time/duration
@@ -20,6 +21,7 @@ import temporal/failure.{type Failure}
 import temporal/replayer
 import temporal/worker
 import temporal/workflow.{type Context}
+import temporal/workflow/child
 
 // ---- activities ----
 
@@ -41,8 +43,8 @@ fn activities() -> List(activity.Handler) {
     activity.handler(say_hello(), fn(_, name) { Ok("Hello, " <> name <> "!") }),
     activity.handler(double(), fn(_, n) { Ok(n * 2) }),
     activity.handler(flaky(), fn(ctx, succeed_on) {
-      case ctx.info.attempt >= succeed_on {
-        True -> Ok(ctx.info.attempt)
+      case activity.info(ctx).attempt >= succeed_on {
+        True -> Ok(activity.info(ctx).attempt)
         False -> Error(failure.new("not yet") |> failure.with_type("Flaky"))
       }
     }),
@@ -54,12 +56,14 @@ fn options() -> workflow.ActivityOptions {
 }
 
 fn quick_retry(maximum_attempts: Int) -> workflow.ActivityOptions {
-  workflow.with_retry(
-    options(),
-    workflow.RetryPolicy(
-      ..workflow.retry_policy(maximum_attempts:),
-      initial_interval: duration.milliseconds(10),
-      backoff_coefficient: 1.0,
+  workflow.ActivityOptions(
+    ..options(),
+    retry: Some(
+      workflow.RetryPolicy(
+        ..workflow.retry_policy(maximum_attempts:),
+        initial_interval: duration.milliseconds(10),
+        backoff_coefficient: 1.0,
+      ),
     ),
   )
 }
@@ -115,7 +119,13 @@ fn retrying_workflow(ctx: Context, attempts: Int) -> Result(String, Failure) {
     Ok(attempt) -> Ok("succeeded on attempt " <> int.to_string(attempt))
     Error(failure) -> {
       let cause = failure.root_cause(failure)
-      Ok("gave up: " <> cause.message <> " (" <> cause.error_type <> ")")
+      Ok(
+        "gave up: "
+        <> cause.message
+        <> " ("
+        <> option.unwrap(cause.error_type, "untyped")
+        <> ")",
+      )
     }
   }
 }
@@ -176,8 +186,8 @@ fn parent() {
 
 fn parent_workflow(ctx: Context, name: String) -> Result(String, Failure) {
   let child_id = workflow.info(ctx).workflow_id <> "-child"
-  let options = workflow.child_options(workflow_id: child_id)
-  case workflow.execute_child(ctx, greet(), name, options) {
+  let options = child.options(workflow_id: child_id)
+  case child.execute(ctx, greet(), name, options) {
     Ok(greeting) -> Ok("child said: " <> greeting)
     Error(failure) -> Error(failure)
   }
@@ -258,7 +268,7 @@ fn run(
   env: Env,
   definition: workflow.Definition(input, output),
   input: input,
-) -> Result(output, client.WorkflowError) {
+) -> Result(output, client.Error) {
   let assert Ok(handle) =
     client.start(env.client, definition, input, start_options(env))
   let result = client.result(handle)
@@ -301,9 +311,9 @@ pub fn activity_retries_are_bounded_test() {
 
 pub fn workflow_failure_reaches_the_client_test() {
   use env <- in_both_modes("failing")
-  let assert Error(client.Failed(failure)) = run(env, failing(), Nil)
+  let assert Error(client.WorkflowFailed(failure)) = run(env, failing(), Nil)
   assert failure.message == "out of stock"
-  assert failure.error_type == "OutOfStock"
+  assert failure.error_type == Some("OutOfStock")
 }
 
 pub fn signals_and_queries_test() {
@@ -333,7 +343,7 @@ pub fn cancellation_test() {
   let assert Ok(handle) =
     client.start(env.client, cancellable(), Nil, start_options(env))
   let assert Ok(Nil) = client.cancel(handle)
-  assert client.result(handle) == Error(client.Cancelled)
+  assert client.result(handle) == Error(client.WorkflowCancelled)
   assert_replays(handle)
 }
 
@@ -368,10 +378,10 @@ pub fn starting_a_running_workflow_id_again_is_rejected_test() {
   use env <- in_both_modes("duplicate")
   let options = start_options(env)
   let assert Ok(handle) = client.start(env.client, accumulator(), 0, options)
-  let assert Error(client.AlreadyStarted) =
+  let assert Error(client.AlreadyExists(_)) =
     client.start(env.client, accumulator(), 0, options)
   let assert Ok(Nil) = client.terminate(handle, "test over")
-  assert client.result(handle) == Error(client.Terminated)
+  assert client.result(handle) == Error(client.WorkflowTerminated)
 }
 
 pub fn a_workflow_crash_does_not_fail_the_workflow_or_the_worker_test() {
@@ -381,7 +391,7 @@ pub fn a_workflow_crash_does_not_fail_the_workflow_or_the_worker_test() {
   // The task fails and is retried; the workflow stays open, waiting for a fixed deploy.
   assert run(env, greet(), "still here") == Ok("Hello, still here!")
   let assert Ok(Nil) = client.terminate(handle, "test over")
-  assert client.result(handle) == Error(client.Terminated)
+  assert client.result(handle) == Error(client.WorkflowTerminated)
 }
 
 /// Payloads use the encoding the Temporal CLI and the other SDKs read and write.

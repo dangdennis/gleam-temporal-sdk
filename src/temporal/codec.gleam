@@ -17,10 +17,148 @@ pub type Payload {
   Payload(metadata: Dict(String, BitArray), data: BitArray)
 }
 
-/// How to turn a value of one type into a payload and back. Definitions carry one for
-/// each value they send, which is what makes a mismatch a compile error.
+/// How to turn a value of one type into payloads and back. Definitions carry one for each
+/// value they send, which is what makes a mismatch a compile error.
+///
+/// Most codecs are a `Codec`: one value, one payload. An `Arguments` codec covers a whole
+/// argument list, for workflows and activities that take several arguments, as those
+/// written with other SDKs often do: see `args2`.
 pub type Codec(a) {
   Codec(encode: fn(a) -> Payload, decode: fn(Payload) -> Result(a, String))
+  Arguments(
+    encode: fn(a) -> List(Payload),
+    decode: fn(List(Payload)) -> Result(a, String),
+  )
+}
+
+/// The value as one payload. An argument-list codec gives its first argument.
+pub fn encode(codec: Codec(a), value: a) -> Payload {
+  case codec {
+    Codec(encode:, ..) -> encode(value)
+    Arguments(encode:, ..) ->
+      case encode(value) {
+        [first, ..] -> first
+        [] -> null_payload()
+      }
+  }
+}
+
+/// The value one payload holds.
+pub fn decode(codec: Codec(a), payload: Payload) -> Result(a, String) {
+  case codec {
+    Codec(decode:, ..) -> decode(payload)
+    Arguments(decode:, ..) -> decode([payload])
+  }
+}
+
+/// The value as an argument list: one payload, or one per argument for an `Arguments`
+/// codec.
+pub fn encode_arguments(codec: Codec(a), value: a) -> List(Payload) {
+  case codec {
+    Codec(encode:, ..) -> [encode(value)]
+    Arguments(encode:, ..) -> encode(value)
+  }
+}
+
+/// Decode an argument list. A single-value codec reads the first argument and ignores the
+/// rest; with no arguments at all it reads a null, so `nil()` inputs work when the caller
+/// sent nothing.
+pub fn decode_arguments(
+  codec: Codec(a),
+  payloads: List(Payload),
+) -> Result(a, String) {
+  case codec, payloads {
+    Arguments(decode:, ..), _ -> decode(payloads)
+    Codec(decode:, ..), [payload, ..] -> decode(payload)
+    Codec(decode:, ..), [] -> decode(null_payload())
+  }
+}
+
+fn null_payload() -> Payload {
+  Payload(
+    metadata: dict.from_list([#("encoding", <<"binary/null":utf8>>)]),
+    data: <<>>,
+  )
+}
+
+/// A codec for a call with no arguments.
+pub fn no_args() -> Codec(Nil) {
+  Arguments(encode: fn(_) { [] }, decode: fn(_) { Ok(Nil) })
+}
+
+/// A codec for a call with two arguments, as a tuple.
+pub fn args2(first: Codec(a), second: Codec(b)) -> Codec(#(a, b)) {
+  Arguments(
+    encode: fn(value: #(a, b)) {
+      [encode(first, value.0), encode(second, value.1)]
+    },
+    decode: fn(payloads) {
+      use a <- result.try(argument(first, payloads, 0))
+      use b <- result.map(argument(second, payloads, 1))
+      #(a, b)
+    },
+  )
+}
+
+/// A codec for a call with three arguments, as a tuple.
+pub fn args3(
+  first: Codec(a),
+  second: Codec(b),
+  third: Codec(c),
+) -> Codec(#(a, b, c)) {
+  Arguments(
+    encode: fn(value: #(a, b, c)) {
+      [encode(first, value.0), encode(second, value.1), encode(third, value.2)]
+    },
+    decode: fn(payloads) {
+      use a <- result.try(argument(first, payloads, 0))
+      use b <- result.try(argument(second, payloads, 1))
+      use c <- result.map(argument(third, payloads, 2))
+      #(a, b, c)
+    },
+  )
+}
+
+/// A codec for a call with four arguments, as a tuple.
+pub fn args4(
+  first: Codec(a),
+  second: Codec(b),
+  third: Codec(c),
+  fourth: Codec(d),
+) -> Codec(#(a, b, c, d)) {
+  Arguments(
+    encode: fn(value: #(a, b, c, d)) {
+      [
+        encode(first, value.0),
+        encode(second, value.1),
+        encode(third, value.2),
+        encode(fourth, value.3),
+      ]
+    },
+    decode: fn(payloads) {
+      use a <- result.try(argument(first, payloads, 0))
+      use b <- result.try(argument(second, payloads, 1))
+      use c <- result.try(argument(third, payloads, 2))
+      use d <- result.map(argument(fourth, payloads, 3))
+      #(a, b, c, d)
+    },
+  )
+}
+
+/// The argument at `index`. A caller that sent fewer arguments sent nulls for the rest,
+/// as far as the other SDKs are concerned.
+fn argument(
+  codec: Codec(a),
+  payloads: List(Payload),
+  index: Int,
+) -> Result(a, String) {
+  case list.drop(payloads, index) {
+    [payload, ..] -> decode(codec, payload)
+    [] -> decode(codec, null_payload())
+  }
+  |> result.map_error(fn(reason) {
+    "argument " <> string.inspect(index + 1) <> ": " <> reason
+  })
 }
 
 /// A codec for values encoded as JSON.
@@ -63,27 +201,7 @@ pub fn bool() -> Codec(Bool) {
 
 /// A codec for `Nil`, encoded as Temporal's null payload. Any payload decodes to `Nil`.
 pub fn nil() -> Codec(Nil) {
-  Codec(
-    encode: fn(_) {
-      Payload(
-        metadata: dict.from_list([#("encoding", <<"binary/null":utf8>>)]),
-        data: <<>>,
-      )
-    },
-    decode: fn(_) { Ok(Nil) },
-  )
-}
-
-/// Decode the single argument Temporal delivers as a list of payloads. A missing argument
-/// decodes as the null payload, so `nil()` inputs work when the caller sent nothing.
-pub fn decode_argument(
-  codec: Codec(a),
-  payloads: List(Payload),
-) -> Result(a, String) {
-  case payloads {
-    [payload, ..] -> codec.decode(payload)
-    [] -> codec.decode(nil().encode(Nil))
-  }
+  Codec(encode: fn(_) { null_payload() }, decode: fn(_) { Ok(Nil) })
 }
 
 /// A codec for a JSON array of values.

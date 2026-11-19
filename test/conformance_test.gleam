@@ -32,6 +32,10 @@ import temporal/nexus
 import temporal/replayer
 import temporal/worker
 import temporal/workflow.{type Context}
+import temporal/workflow/child
+import temporal/workflow/local_activity
+import temporal/workflow/operation
+import temporal/workflow/update
 
 // ---- activities ----
 
@@ -47,6 +51,15 @@ fn stubborn() {
   activity.Definition("stubborn", codec.int(), codec.string())
 }
 
+/// Takes two arguments.
+fn join() {
+  activity.Definition(
+    "join",
+    codec.args2(codec.string(), codec.int()),
+    codec.string(),
+  )
+}
+
 /// Scheduled only by the diverging twins.
 fn stray() {
   activity.Definition("stray", codec.nil(), codec.nil())
@@ -56,9 +69,13 @@ fn activities() -> List(activity.Handler) {
   [
     activity.handler(double(), fn(_, n) { Ok(n * 2) }),
     activity.handler(slow(), fn(_, ms) { Ok(process.sleep(ms)) }),
+    activity.handler(join(), fn(_, arguments) {
+      let #(text, times) = arguments
+      Ok(string.join(list.repeat(text, times), " "))
+    }),
     activity.handler(stubborn(), fn(ctx, attempts) {
-      case ctx.info.attempt >= attempts {
-        True -> Ok("attempt " <> int.to_string(ctx.info.attempt))
+      case activity.info(ctx).attempt >= attempts {
+        True -> Ok("attempt " <> int.to_string(activity.info(ctx).attempt))
         False -> Error(failure.new("not yet"))
       }
     }),
@@ -94,15 +111,8 @@ fn basics_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
     ])
   let signalled = workflow.receive_signal(ctx, added())
   let child =
-    workflow.child_options(
-      workflow_id: workflow.info(ctx).workflow_id <> "-child",
-    )
-  use doubled <- result.try(workflow.execute_child(
-    ctx,
-    double_child(),
-    c,
-    child,
-  ))
+    child.options(workflow_id: workflow.info(ctx).workflow_id <> "-child")
+  use doubled <- result.try(child.execute(ctx, double_child(), c, child))
   Ok(b + c + signalled + doubled)
 }
 
@@ -192,7 +202,7 @@ fn updates() {
 
 /// Updates: validated, answered after an activity, and one that fails after acceptance.
 fn updates_workflow(ctx: Context, total: Int) -> Result(Int, Failure) {
-  workflow.set_update_validator(ctx, add(), fn(amount) {
+  update.set_validator(ctx, add(), fn(amount) {
     case amount < 0 {
       True -> Error("amount must not be negative")
       False -> Ok(Nil)
@@ -200,15 +210,15 @@ fn updates_workflow(ctx: Context, total: Int) -> Result(Int, Failure) {
   })
   let next =
     workflow.race([
-      workflow.update(ctx, add()) |> workflow.map(Some),
+      update.next(ctx, add()) |> workflow.map(Some),
       workflow.signal(ctx, finish()) |> workflow.map(fn(_) { None }),
     ])
   case workflow.await(next) {
     None -> Ok(total)
     Some(update) ->
-      case workflow.update_argument(update) {
+      case update.argument(update) {
         13 -> {
-          workflow.complete_update(
+          update.complete(
             ctx,
             update,
             Error(failure.new("unlucky") |> failure.with_type("Unlucky")),
@@ -222,7 +232,7 @@ fn updates_workflow(ctx: Context, total: Int) -> Result(Int, Failure) {
             amount,
             options(),
           ))
-          workflow.complete_update(ctx, update, Ok(total + doubled))
+          update.complete(ctx, update, Ok(total + doubled))
           updates_workflow(ctx, total + doubled)
         }
       }
@@ -270,16 +280,18 @@ fn external_workflow(ctx: Context, prefix: String) -> Result(String, Failure) {
       poke(),
       "anyone?",
     ))
-  use child <- result.try(workflow.start_child(
-    ctx,
-    listener(),
-    Nil,
-    workflow.child_options(workflow_id: prefix <> "-child"),
-  ))
+  let listening =
+    child.start(
+      ctx,
+      listener(),
+      Nil,
+      child.options(workflow_id: prefix <> "-child"),
+    )
+  use _ <- result.try(workflow.await(child.started(listening)))
   use _ <- result.try(
-    workflow.await(workflow.signal_child(ctx, child, poke(), "from parent")),
+    workflow.await(child.signal(ctx, listening, poke(), "from parent")),
   )
-  use heard <- result.map(workflow.await(workflow.child_result(child)))
+  use heard <- result.map(workflow.await(child.result(listening)))
   "missing="
   <> string.lowercase(string.inspect(result.is_error(missing)))
   <> " "
@@ -293,10 +305,9 @@ fn local() {
 /// Local activities: one that succeeds at once, and one whose retries are far enough apart
 /// that the wait becomes a timer in history.
 fn local_workflow(ctx: Context, attempts: Int) -> Result(String, Failure) {
-  let once =
-    workflow.local_activity_options(start_to_close: duration.milliseconds(5000))
+  let once = local_activity.options(start_to_close: duration.milliseconds(5000))
   let retrying =
-    workflow.LocalActivityOptions(
+    local_activity.Options(
       ..once,
       retry: Some(
         workflow.RetryPolicy(
@@ -307,13 +318,8 @@ fn local_workflow(ctx: Context, attempts: Int) -> Result(String, Failure) {
       ),
       local_retry_threshold: Some(duration.milliseconds(1000)),
     )
-  use doubled <- result.try(workflow.execute_local_activity(
-    ctx,
-    double(),
-    21,
-    once,
-  ))
-  use outcome <- result.map(workflow.execute_local_activity(
+  use doubled <- result.try(local_activity.execute(ctx, double(), 21, once))
+  use outcome <- result.map(local_activity.execute(
     ctx,
     stubborn(),
     attempts,
@@ -373,24 +379,19 @@ fn nexus_caller_workflow(
   ctx: Context,
   endpoint: String,
 ) -> Result(String, Failure) {
-  let options = workflow.nexus_options()
-  use shouted <- result.try(workflow.execute_nexus_operation(
+  let options = operation.options()
+  use shouted <- result.try(operation.execute(
     ctx,
     endpoint,
     shout(),
     "hello",
     options,
   ))
-  use handle <- result.try(workflow.start_nexus_operation(
-    ctx,
-    endpoint,
-    double_operation(),
-    21,
-    options,
-  ))
-  use doubled <- result.try(workflow.await(workflow.nexus_result(handle)))
+  let pending = operation.start(ctx, endpoint, double_operation(), 21, options)
+  use _ <- result.try(workflow.await(operation.started(pending)))
+  use doubled <- result.try(workflow.await(operation.result(pending)))
   let reason = case
-    workflow.execute_nexus_operation(ctx, endpoint, refuse(), "this", options)
+    operation.execute(ctx, endpoint, refuse(), "this", options)
   {
     Ok(_) -> "not refused"
     Error(_) -> "refused"
@@ -414,8 +415,35 @@ fn nexus_handlers(task_queue: String) -> List(nexus.Handler) {
   ]
 }
 
+fn several_arguments() {
+  workflow.Definition(
+    "arguments",
+    codec.args3(codec.string(), codec.int(), codec.bool()),
+    codec.string(),
+  )
+}
+
+/// Several arguments, to a workflow and to an activity.
+fn several_arguments_workflow(
+  ctx: Context,
+  arguments: #(String, Int, Bool),
+) -> Result(String, Failure) {
+  let #(greeting, times, loud) = arguments
+  use joined <- result.map(workflow.execute_activity(
+    ctx,
+    join(),
+    #(greeting, times),
+    options(),
+  ))
+  case loud {
+    True -> string.uppercase(joined)
+    False -> joined
+  }
+}
+
 fn workflows() -> List(workflow.Handler) {
   [
+    workflow.handler(several_arguments(), several_arguments_workflow),
     workflow.handler(basics(), basics_workflow),
     workflow.handler(double_child(), double_child_workflow),
     workflow.handler(scopes(), scopes_workflow),
@@ -558,7 +586,7 @@ pub fn cancellation_scopes_conform_test() {
   // Long enough for the workflow to reach its final sleep.
   process.sleep(5000)
   let assert Ok(Nil) = client.cancel(handle)
-  assert client.result(handle) == Error(client.Cancelled)
+  assert client.result(handle) == Error(client.WorkflowCancelled)
   handle
 }
 
@@ -655,5 +683,13 @@ pub fn encrypted_payloads_conform_test() {
   let handle = start(env, basics(), 5)
   let assert Ok(Nil) = client.signal(handle, added(), 1000)
   assert client.result(handle) == Ok(1086)
+  handle
+}
+
+pub fn several_arguments_conform_test() {
+  check_typescript_history("arguments", None)
+  use env <- record_gleam_history("arguments", None)
+  let handle = start(env, several_arguments(), #("hey", 3, True))
+  assert client.result(handle) == Ok("HEY HEY HEY")
   handle
 }

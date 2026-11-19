@@ -180,16 +180,6 @@ pub type ActivityOptions {
   )
 }
 
-/// What happens to a child workflow when its parent closes.
-pub type ParentClosePolicy {
-  /// The default.
-  TerminateChild
-  /// The child carries on.
-  AbandonChild
-  /// The child is asked to cancel.
-  RequestCancelChild
-}
-
 /// Whether a workflow id may be used again after a run with that id has closed.
 pub type IdReusePolicy {
   /// The default.
@@ -200,48 +190,22 @@ pub type IdReusePolicy {
   RejectDuplicate
 }
 
-/// What cancelling a child workflow from the parent does.
-pub type ChildCancellation {
-  /// Request cancellation and wait until the child has closed. The default.
-  WaitChildCancelled
-  /// Request cancellation and wait only until the child has been told.
-  WaitChildCancelRequested
-  /// Request cancellation and fail the parent's wait at once.
-  TryCancelChild
-  /// Fail the parent's wait at once without telling the child.
-  AbandonChildCancellation
+/// The cancellation scope a context names.
+@internal
+pub fn scope_of(ctx: Context) -> Int {
+  ctx.scope
 }
 
-/// How a child workflow is run. Build with `child_options` and change what differs.
-pub type ChildOptions {
-  ChildOptions(
-    /// No two open workflows in a namespace share an id.
-    workflow_id: String,
-    /// `None` runs the child on the parent's task queue.
-    task_queue: Option(String),
-    parent_close_policy: ParentClosePolicy,
-    id_reuse_policy: IdReusePolicy,
-    /// Longest the child may take across retries and continue-as-new.
-    execution_timeout: Option(Duration),
-    /// Longest a single run of the child may take.
-    run_timeout: Option(Duration),
-    /// Longest one workflow task may take. `None` is ten seconds.
-    task_timeout: Option(Duration),
-    /// `None` does not retry a failed child.
-    retry: Option(RetryPolicy),
-    memo: Dict(String, Payload),
-    /// What cancelling the child's scope does.
-    cancellation: ChildCancellation,
-  )
+/// The future's value if it has one, without waiting.
+@internal
+pub fn peek(future: Future(a)) -> Option(a) {
+  future.poll()
 }
 
-/// A child workflow that has started.
-pub opaque type Child(output) {
-  Child(
-    workflow_id: String,
-    run_id: String,
-    result: Future(Result(output, Failure)),
-  )
+/// A future that asks `poll` every time it is asked.
+@internal
+pub fn future(poll: fn() -> Option(a)) -> Future(a) {
+  Future(poll)
 }
 
 /// Pair a definition with its implementation.
@@ -250,10 +214,12 @@ pub fn handler(
   run: fn(Context, input) -> Result(output, Failure),
 ) -> Handler {
   Handler(definition.name, fn(arguments) {
-    case codec.decode_argument(definition.input, arguments) {
+    case codec.decode_arguments(definition.input, arguments) {
       Ok(input) ->
         run(Context(runtime.root_scope), input)
-        |> result.map(fn(output) { Some(definition.output.encode(output)) })
+        |> result.map(fn(output) {
+          Some(codec.encode(definition.output, output))
+        })
       Error(reason) ->
         Error(
           failure.new("could not decode workflow input: " <> reason)
@@ -313,9 +279,9 @@ pub fn info(_ctx: Context) -> Info {
 
 /// A value from the memo the workflow was started with. `None` if the key is absent or its
 /// value does not decode.
-pub fn memo(_ctx: Context, key: String, codec: Codec(a)) -> Option(a) {
+pub fn memo(_ctx: Context, key: String, value_codec: Codec(a)) -> Option(a) {
   case dict.get(runtime.get().memo, key) {
-    Ok(payload) -> option.from_result(codec.decode(payload))
+    Ok(payload) -> option.from_result(codec.decode(value_codec, payload))
     Error(Nil) -> None
   }
 }
@@ -431,7 +397,8 @@ pub fn map(future: Future(a), with transform: fn(a) -> b) -> Future(b) {
 /// A future that keeps its value once it has one, however often it is asked. Without
 /// this, a future that takes something when it resolves, such as the next signal, would
 /// take another each time it was awaited.
-fn once(poll: fn() -> Option(a)) -> Future(a) {
+@internal
+pub fn once(poll: fn() -> Option(a)) -> Future(a) {
   let cell = bridge.new_cell()
   Future(fn() {
     case bridge.read_cell(cell) {
@@ -613,13 +580,12 @@ pub fn timer(ctx: Context, lasting: Duration) -> Future(Result(Nil, Failure)) {
   }
 }
 
-/// Wait `ms` with a durable timer. Fails with a cancellation if the context is cancelled
-/// first.
 /// The server's timers are no finer than a millisecond.
 fn timer_ms(lasting: Duration) -> Int {
   int.max(time.to_ms(lasting), 1)
 }
 
+/// Wait with a durable timer. Fails with a cancellation if the context is cancelled first.
 pub fn sleep(ctx: Context, lasting: Duration) -> Result(Nil, Failure) {
   await(timer(ctx, lasting))
 }
@@ -639,14 +605,6 @@ pub fn activity_options(
     task_queue: None,
     cancellation: TryCancel,
   )
-}
-
-/// Set the retry policy.
-pub fn with_retry(
-  options: ActivityOptions,
-  retry: RetryPolicy,
-) -> ActivityOptions {
-  ActivityOptions(..options, retry: Some(retry))
 }
 
 /// A retry policy that gives up after `maximum_attempts` attempts, one second apart at first
@@ -697,13 +655,11 @@ pub fn start_activity(
     None -> {
       let state = runtime.get()
       let call =
-        state.outbound.activity(
-          middleware.ActivityCall(
-            activity_type: definition.name,
-            task_queue: option.unwrap(options.task_queue, state.task_queue),
-            arguments: [definition.input.encode(input)],
-          ),
-        )
+        state.outbound.activity(middleware.ActivityCall(
+          activity_type: definition.name,
+          task_queue: option.unwrap(options.task_queue, state.task_queue),
+          arguments: codec.encode_arguments(definition.input, input),
+        ))
       runtime.push(
         bridge.ScheduleActivity(
           seq:,
@@ -742,7 +698,8 @@ pub fn execute_activity(
   await(start_activity(ctx, definition, input, options))
 }
 
-fn resolution(
+@internal
+pub fn resolution(
   lookup: fn() -> Result(bridge.Resolution, Nil),
   output: Codec(a),
 ) -> Future(Result(a, Failure)) {
@@ -751,7 +708,7 @@ fn resolution(
       Error(Nil) -> None
       Ok(bridge.Completed(payload)) ->
         Some(
-          codec.decode_argument(output, option.values([payload]))
+          codec.decode_arguments(output, option.values([payload]))
           |> result.map_error(fn(reason) {
             failure.new("could not decode result: " <> reason)
             |> failure.with_type("InvalidResult")
@@ -766,140 +723,6 @@ fn resolution(
   })
 }
 
-// ---- child workflows ----
-
-/// Options for a child with this id: the parent's task queue, terminated when the parent
-/// closes, not retried.
-pub fn child_options(workflow_id workflow_id: String) -> ChildOptions {
-  ChildOptions(
-    workflow_id:,
-    task_queue: None,
-    parent_close_policy: TerminateChild,
-    id_reuse_policy: AllowDuplicate,
-    execution_timeout: None,
-    run_timeout: None,
-    task_timeout: None,
-    retry: None,
-    memo: dict.new(),
-    cancellation: WaitChildCancelled,
-  )
-}
-
-/// Start a child workflow and wait until the server has started it. A child with an
-/// `AbandonChild` policy keeps running after the parent returns; any other child must be
-/// awaited with `child_result` before the parent finishes.
-pub fn start_child(
-  ctx: Context,
-  definition: Definition(input, output),
-  input: input,
-  options: ChildOptions,
-) -> Result(Child(output), Failure) {
-  let seq = runtime.next_child()
-  case runtime.scope_cancelled(ctx.scope) {
-    Some(_) -> Error(failure.cancelled())
-    None -> {
-      let state = runtime.get()
-      let call =
-        state.outbound.child(
-          middleware.ChildCall(
-            workflow_type: definition.name,
-            workflow_id: options.workflow_id,
-            task_queue: option.unwrap(options.task_queue, state.task_queue),
-            arguments: [definition.input.encode(input)],
-          ),
-        )
-      runtime.push(bridge.StartChildWorkflow(
-        seq:,
-        workflow_id: call.workflow_id,
-        workflow_type: call.workflow_type,
-        task_queue: call.task_queue,
-        input: call.arguments,
-        options: bridge.ChildStartOptions(
-          execution_timeout_ms: time.option_to_ms(options.execution_timeout),
-          run_timeout_ms: time.option_to_ms(options.run_timeout),
-          task_timeout_ms: time.option_to_ms(options.task_timeout),
-          parent_close_policy: case options.parent_close_policy {
-            TerminateChild -> 1
-            AbandonChild -> 2
-            RequestCancelChild -> 3
-          },
-          id_reuse_policy: case options.id_reuse_policy {
-            AllowDuplicate -> 1
-            AllowDuplicateFailedOnly -> 2
-            RejectDuplicate -> 3
-          },
-          retry: option.map(options.retry, to_bridge_retry),
-          memo: options.memo,
-          search_attributes: dict.new(),
-          cancellation_type: case options.cancellation {
-            AbandonChildCancellation -> 0
-            TryCancelChild -> 1
-            WaitChildCancelled -> 2
-            WaitChildCancelRequested -> 3
-          },
-        ),
-      ))
-      runtime.register(ctx.scope, runtime.ChildOp(seq))
-      let started =
-        Future(fn() {
-          case dict.get(runtime.get().child_starts, seq) {
-            Ok(bridge.ChildStarted(run_id)) -> Some(Ok(run_id))
-            Ok(bridge.ChildStartFailed(workflow_id, cause)) ->
-              Some(Error(
-                failure.new(
-                  "child workflow \""
-                  <> workflow_id
-                  <> "\" could not be started",
-                )
-                |> failure.with_type(case cause {
-                  1 -> "WorkflowExecutionAlreadyStarted"
-                  _ -> "ChildWorkflowStartFailed"
-                })
-                |> failure.non_retryable,
-              ))
-            Ok(bridge.ChildStartCancelled(failure)) -> Some(Error(failure))
-            Error(Nil) -> None
-          }
-        })
-      use run_id <- result.map(await(started))
-      Child(
-        workflow_id: call.workflow_id,
-        run_id:,
-        result: resolution(
-          fn() { dict.get(runtime.get().children, seq) },
-          definition.output,
-        ),
-      )
-    }
-  }
-}
-
-/// The child's result, once it finishes.
-pub fn child_result(child: Child(output)) -> Future(Result(output, Failure)) {
-  child.result
-}
-
-/// The child's workflow id.
-pub fn child_workflow_id(child: Child(output)) -> String {
-  child.workflow_id
-}
-
-/// The id of the child's first run.
-pub fn child_run_id(child: Child(output)) -> String {
-  child.run_id
-}
-
-/// Start a child workflow and wait for its result.
-pub fn execute_child(
-  ctx: Context,
-  definition: Definition(input, output),
-  input: input,
-  options: ChildOptions,
-) -> Result(output, Failure) {
-  use child <- result.try(start_child(ctx, definition, input, options))
-  await(child.result)
-}
-
 // ---- signals and queries ----
 
 /// A future of the next signal of this kind. Signals that arrived before anyone asked are
@@ -912,7 +735,7 @@ fn next_signal(definition: SignalDefinition(a)) -> Option(a) {
   case runtime.take_signal(definition.name) {
     None -> None
     Some(payloads) ->
-      case codec.decode_argument(definition.codec, payloads) {
+      case codec.decode_arguments(definition.codec, payloads) {
         Ok(value) -> Some(value)
         Error(_) -> next_signal(definition)
       }
@@ -941,8 +764,10 @@ pub fn set_query_handler(
   handler: fn(argument) -> result,
 ) -> Nil {
   let erased = fn(arguments) {
-    codec.decode_argument(definition.argument, arguments)
-    |> result.map(fn(argument) { definition.result.encode(handler(argument)) })
+    codec.decode_arguments(definition.argument, arguments)
+    |> result.map(fn(argument) {
+      codec.encode(definition.result, handler(argument))
+    })
   }
   runtime.update(fn(state) {
     State(
@@ -961,11 +786,11 @@ pub fn continue_as_new(
   input: input,
 ) -> Result(output, Failure) {
   runtime.abandon_updates()
-  runtime.push(
-    bridge.ContinueAsNew(definition.name, runtime.get().task_queue, [
-      definition.input.encode(input),
-    ]),
-  )
+  runtime.push(bridge.ContinueAsNew(
+    definition.name,
+    runtime.get().task_queue,
+    codec.encode_arguments(definition.input, input),
+  ))
   runtime.serve()
 }
 
@@ -989,242 +814,10 @@ pub fn deprecate_patch(_ctx: Context, patch_id: String) -> Nil {
   runtime.deprecate_patch(patch_id)
 }
 
-// ---- local activities ----
-
-/// How a local activity is run. Build with `local_activity_options` and change what
-/// differs.
-pub type LocalActivityOptions {
-  LocalActivityOptions(
-    /// Longest a single attempt may run.
-    start_to_close: Duration,
-    /// Longest the activity may take across all retries.
-    schedule_to_close: Option(Duration),
-    /// `None` retries without limit, one second apart at first and doubling.
-    retry: Option(RetryPolicy),
-    /// A retry that would wait longer than this is not waited for inside the workflow
-    /// task: the workflow starts a durable timer and tries again when it fires. `None`
-    /// uses core's default of one minute.
-    local_retry_threshold: Option(Duration),
-    /// What cancelling the activity's scope does.
-    cancellation: ActivityCancellation,
-  )
-}
-
-/// Options with only the per-attempt timeout set, and default retries.
-pub fn local_activity_options(
-  start_to_close start_to_close: Duration,
-) -> LocalActivityOptions {
-  LocalActivityOptions(
-    start_to_close:,
-    schedule_to_close: None,
-    retry: None,
-    local_retry_threshold: None,
-    cancellation: TryCancel,
-  )
-}
-
-/// Run an activity inside this workflow's own worker, without a round trip through the
-/// server's task queue. Much faster for short activities, a few seconds at most. In
-/// exchange the activity cannot heartbeat, must be registered on the worker that runs the
-/// workflow, and a long-running one holds up the workflow's other work.
-pub fn start_local_activity(
-  ctx: Context,
-  definition: activity.Definition(input, output),
-  input: input,
-  options: LocalActivityOptions,
-) -> Future(Result(output, Failure)) {
-  case runtime.scope_cancelled(ctx.scope) {
-    Some(_) -> {
-      let _ = runtime.next_activity()
-      ready(Error(failure.cancelled()))
-    }
-    None -> {
-      let call =
-        runtime.get().outbound.activity(
-          middleware.ActivityCall(
-            activity_type: definition.name,
-            task_queue: runtime.get().task_queue,
-            arguments: [definition.input.encode(input)],
-          ),
-        )
-      let seq =
-        runtime.start_local(fn(seq) {
-          bridge.ScheduleLocalActivity(
-            seq:,
-            activity_id: int.to_string(seq),
-            activity_type: call.activity_type,
-            attempt: 1,
-            original_schedule_time_ms: None,
-            arguments: call.arguments,
-            schedule_to_close_ms: time.option_to_ms(options.schedule_to_close),
-            schedule_to_start_ms: None,
-            start_to_close_ms: Some(time.to_ms(options.start_to_close)),
-            retry: option.map(options.retry, to_bridge_retry),
-            local_retry_threshold_ms: time.option_to_ms(
-              options.local_retry_threshold,
-            ),
-            cancellation_type: case options.cancellation {
-              TryCancel -> 0
-              WaitCancellationCompleted -> 1
-              AbandonActivity -> 2
-            },
-          )
-        })
-      runtime.register(ctx.scope, runtime.ActivityOp(seq))
-      resolution(
-        fn() { dict.get(runtime.get().activities, seq) },
-        definition.output,
-      )
-    }
-  }
-}
-
-/// Run a local activity and wait for its result. See `start_local_activity`.
-pub fn execute_local_activity(
-  ctx: Context,
-  definition: activity.Definition(input, output),
-  input: input,
-  options: LocalActivityOptions,
-) -> Result(output, Failure) {
-  await(start_local_activity(ctx, definition, input, options))
-}
-
-// ---- updates ----
-
-/// An update a client sent, taken by the workflow and awaiting its answer.
-pub opaque type Update(argument, result) {
-  Update(
-    id: String,
-    protocol_instance_id: String,
-    argument: argument,
-    result: Codec(result),
-  )
-}
-
-fn decodes(
-  definition: UpdateDefinition(argument, result),
-) -> fn(List(Payload)) -> Result(Nil, String) {
-  fn(input) {
-    codec.decode_argument(definition.argument, input)
-    |> result.replace(Nil)
-    |> result.map_error(fn(reason) { "invalid update argument: " <> reason })
-  }
-}
-
-/// Decide which updates of this kind to accept. An update the validator refuses is
-/// rejected without a trace in history; one it passes is accepted and queued for the
-/// workflow to take. The validator must not change anything or use this module. Without a
-/// validator, every update whose argument decodes is accepted.
-///
-/// Calling this, or asking for an update with `update` or `receive_update`, is what tells
-/// the worker that the workflow handles this kind of update. Updates of a kind the
-/// workflow has not asked about by the time it next waits are rejected.
-pub fn set_update_validator(
-  _ctx: Context,
-  definition: UpdateDefinition(argument, result),
-  validator: fn(argument) -> Result(Nil, String),
-) -> Nil {
-  runtime.register_update(
-    definition.name,
-    fn(input) {
-      case codec.decode_argument(definition.argument, input) {
-        Ok(argument) -> validator(argument)
-        Error(reason) -> Error("invalid update argument: " <> reason)
-      }
-    },
-    True,
-  )
-}
-
-/// A future of the next accepted update of this kind. Like a signal, the workflow takes
-/// updates when it is ready for them; unlike a signal, each must be answered with
-/// `complete_update`, and the client is waiting for that answer.
-pub fn update(
-  _ctx: Context,
-  definition: UpdateDefinition(argument, result),
-) -> Future(Update(argument, result)) {
-  runtime.register_update(definition.name, decodes(definition), False)
-  once(fn() { next_update(definition) })
-}
-
-fn next_update(
-  definition: UpdateDefinition(argument, result),
-) -> Option(Update(argument, result)) {
-  case runtime.take_update(definition.name) {
-    None -> None
-    Some(pending) ->
-      case codec.decode_argument(definition.argument, pending.input) {
-        Ok(argument) ->
-          Some(Update(
-            id: pending.id,
-            protocol_instance_id: pending.protocol_instance_id,
-            argument:,
-            result: definition.result,
-          ))
-        // Only on replay of an update accepted by different code: fail it and move on.
-        Error(reason) -> {
-          runtime.answer_update(
-            pending.protocol_instance_id,
-            bridge.UpdateRejected(
-              pending.protocol_instance_id,
-              failure.new("invalid update argument: " <> reason),
-            ),
-          )
-          next_update(definition)
-        }
-      }
-  }
-}
-
-/// Wait for the next accepted update of this kind.
-pub fn receive_update(
-  ctx: Context,
-  definition: UpdateDefinition(argument, result),
-) -> Update(argument, result) {
-  await(update(ctx, definition))
-}
-
-/// The next accepted update of this kind if one is waiting. Does not wait.
-pub fn try_receive_update(
-  _ctx: Context,
-  definition: UpdateDefinition(argument, result),
-) -> Option(Update(argument, result)) {
-  runtime.register_update(definition.name, decodes(definition), False)
-  next_update(definition)
-}
-
-/// The value the client sent with the update.
-pub fn update_argument(update: Update(argument, result)) -> argument {
-  update.argument
-}
-
-/// The id the client gave the update, or the one the server generated.
-pub fn update_id(update: Update(argument, result)) -> String {
-  update.id
-}
-
-/// Answer an update. The client's call returns the value, or fails with the failure. Only
-/// the first answer counts. An update still unanswered when the workflow ends fails with a
-/// `WorkflowFinished` failure.
-pub fn complete_update(
-  _ctx: Context,
-  update: Update(argument, result),
-  outcome: Result(result, Failure),
-) -> Nil {
-  runtime.answer_update(update.protocol_instance_id, case outcome {
-    Ok(value) ->
-      bridge.UpdateCompleted(
-        update.protocol_instance_id,
-        update.result.encode(value),
-      )
-    Error(failure) ->
-      bridge.UpdateRejected(update.protocol_instance_id, failure)
-  })
-}
-
 // ---- other workflows ----
 
-fn external_outcome(
+@internal
+pub fn external_outcome(
   lookup: fn() -> Result(Option(Failure), Nil),
 ) -> Future(Result(Nil, Failure)) {
   Future(fn() {
@@ -1236,7 +829,8 @@ fn external_outcome(
   })
 }
 
-fn send_signal(
+@internal
+pub fn send_signal(
   ctx: Context,
   target: bridge.SignalTarget,
   definition: SignalDefinition(a),
@@ -1246,11 +840,12 @@ fn send_signal(
   case runtime.scope_cancelled(ctx.scope) {
     Some(_) -> ready(Error(failure.cancelled()))
     None -> {
-      runtime.push(
-        bridge.SignalExternal(seq, target, definition.name, [
-          definition.codec.encode(value),
-        ]),
-      )
+      runtime.push(bridge.SignalExternal(
+        seq,
+        target,
+        definition.name,
+        codec.encode_arguments(definition.codec, value),
+      ))
       runtime.register(ctx.scope, runtime.SignalOp(seq))
       external_outcome(fn() { dict.get(runtime.get().external_signals, seq) })
     }
@@ -1266,21 +861,6 @@ pub fn signal_external(
   value: a,
 ) -> Future(Result(Nil, Failure)) {
   send_signal(ctx, bridge.ExternalWorkflow(workflow_id, ""), definition, value)
-}
-
-/// Signal a child workflow this workflow started.
-pub fn signal_child(
-  ctx: Context,
-  child: Child(output),
-  definition: SignalDefinition(a),
-  value: a,
-) -> Future(Result(Nil, Failure)) {
-  send_signal(
-    ctx,
-    bridge.ChildWorkflowTarget(child.workflow_id),
-    definition,
-    value,
-  )
 }
 
 /// Ask another workflow to cancel. Resolves once the server has passed the request on, not
@@ -1299,135 +879,16 @@ pub fn cancel_external(
   external_outcome(fn() { dict.get(runtime.get().external_cancels, seq) })
 }
 
-// ---- Nexus ----
-
-/// What cancelling a Nexus operation from the workflow does.
-pub type NexusCancellation {
-  /// Request cancellation and wait until the operation has ended. The default.
-  WaitNexusCancelled
-  /// Request cancellation and wait only until the request has been delivered.
-  WaitNexusCancelRequested
-  /// Request cancellation and fail the workflow's wait at once.
-  TryCancelNexus
-  /// Fail the workflow's wait at once without telling the operation.
-  AbandonNexus
-}
-
-/// How a Nexus operation is run. Build with `nexus_options` and change what differs.
-pub type NexusOptions {
-  NexusOptions(
-    /// Longest the operation may take, retries included. `None` leaves it to the server.
-    schedule_to_close: Option(Duration),
-    /// What cancelling the operation's scope does.
-    cancellation: NexusCancellation,
-  )
-}
-
-/// No deadline of its own; cancellation waits for the operation to end.
-pub fn nexus_options() -> NexusOptions {
-  NexusOptions(schedule_to_close: None, cancellation: WaitNexusCancelled)
-}
-
-/// A Nexus operation that has started.
-pub opaque type NexusHandle(output) {
-  NexusHandle(
-    /// Names an operation that runs on after starting; `None` for one that finished at once.
-    token: Option(String),
-    result: Future(Result(output, Failure)),
-  )
-}
-
-/// Start an operation on a Nexus endpoint and wait until the service has taken it on. The
-/// endpoint, registered on the server, decides which namespace and task queue handle it.
-pub fn start_nexus_operation(
-  ctx: Context,
-  endpoint: String,
-  operation: NexusOperation(input, output),
-  input: input,
-  options: NexusOptions,
-) -> Result(NexusHandle(output), Failure) {
-  let seq = runtime.next_nexus()
-  case runtime.scope_cancelled(ctx.scope) {
-    Some(_) -> Error(failure.cancelled())
-    None -> {
-      runtime.push(
-        bridge.ScheduleNexusOperation(
-          seq:,
-          endpoint:,
-          service: operation.service,
-          operation: operation.name,
-          input: operation.input.encode(input),
-          schedule_to_close_ms: time.option_to_ms(options.schedule_to_close),
-          cancellation_type: case options.cancellation {
-            WaitNexusCancelled -> 0
-            AbandonNexus -> 1
-            TryCancelNexus -> 2
-            WaitNexusCancelRequested -> 3
-          },
-        ),
-      )
-      runtime.register(ctx.scope, runtime.NexusOp(seq))
-      let started =
-        Future(fn() {
-          case dict.get(runtime.get().nexus_starts, seq) {
-            Ok(bridge.NexusStartedAsync(token)) -> Some(Ok(Some(token)))
-            Ok(bridge.NexusStartedSync) -> Some(Ok(None))
-            Ok(bridge.NexusStartFailed(failure)) -> Some(Error(failure))
-            Error(Nil) -> None
-          }
-        })
-      use token <- result.map(await(started))
-      NexusHandle(
-        token:,
-        result: resolution(
-          fn() { dict.get(runtime.get().nexus_results, seq) },
-          operation.output,
-        ),
-      )
-    }
-  }
-}
-
-/// The operation's result, once it finishes.
-pub fn nexus_result(
-  handle: NexusHandle(output),
-) -> Future(Result(output, Failure)) {
-  handle.result
-}
-
-/// The token of an operation that runs on after starting.
-pub fn nexus_operation_token(handle: NexusHandle(output)) -> Option(String) {
-  handle.token
-}
-
-/// Start a Nexus operation and wait for its result.
-pub fn execute_nexus_operation(
-  ctx: Context,
-  endpoint: String,
-  operation: NexusOperation(input, output),
-  input: input,
-  options: NexusOptions,
-) -> Result(output, Failure) {
-  use handle <- result.try(start_nexus_operation(
-    ctx,
-    endpoint,
-    operation,
-    input,
-    options,
-  ))
-  await(handle.result)
-}
-
 // ---- changing what the server knows about this run ----
 
 /// Set or replace a memo entry on the running workflow.
 pub fn upsert_memo(
   _ctx: Context,
   key: String,
-  codec: Codec(a),
+  value_codec: Codec(a),
   value: a,
 ) -> Nil {
-  let payload = codec.encode(value)
+  let payload = codec.encode(value_codec, value)
   runtime.update(fn(state) {
     State(..state, memo: dict.insert(state.memo, key, payload))
   })

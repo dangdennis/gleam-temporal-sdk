@@ -35,8 +35,11 @@ pub opaque type Env {
 fn start(
   kind: bridge.ServerKind,
   executable: Option(String),
-) -> Result(Env, String) {
-  use #(server, target) <- result.try(bridge.server_start(kind, executable))
+) -> Result(Env, client.Error) {
+  use #(server, target) <- result.try(
+    bridge.server_start(kind, executable)
+    |> result.map_error(client.ConnectionFailed),
+  )
   case client.connect(client.Options(..client.local(), target:)) {
     Ok(client) -> Ok(Env(server, client, kind == bridge.TimeSkipping))
     Error(reason) -> {
@@ -52,25 +55,27 @@ fn start(
 ///
 /// The server is downloaded on first use and cached in the temporary directory. It does
 /// not implement everything a real server does; visibility queries in particular.
-pub fn start_time_skipping() -> Result(Env, String) {
+pub fn start_time_skipping() -> Result(Env, client.Error) {
   start(bridge.TimeSkipping, None)
 }
 
 /// Like `start_time_skipping`, with a `temporal-test-server` executable already on disk.
 pub fn start_time_skipping_with(
   executable executable: String,
-) -> Result(Env, String) {
+) -> Result(Env, client.Error) {
   start(bridge.TimeSkipping, Some(executable))
 }
 
 /// Start a full development server on a free port, with a real clock. The Temporal CLI is
 /// downloaded on first use and cached in the temporary directory.
-pub fn start_local() -> Result(Env, String) {
+pub fn start_local() -> Result(Env, client.Error) {
   start(bridge.Dev, None)
 }
 
 /// Like `start_local`, with a `temporal` executable already on disk.
-pub fn start_local_with(executable executable: String) -> Result(Env, String) {
+pub fn start_local_with(
+  executable executable: String,
+) -> Result(Env, client.Error) {
   start(bridge.Dev, Some(executable))
 }
 
@@ -89,7 +94,7 @@ pub fn stop(env: Env) -> Nil {
 pub fn result(
   env: Env,
   handle: client.Handle(output),
-) -> Result(output, client.WorkflowError) {
+) -> Result(output, client.Error) {
   case env.time_skipping {
     False -> client.result(handle)
     True -> {
@@ -108,13 +113,9 @@ pub fn execute(
   definition: workflow.Definition(input, output),
   input: input,
   options: client.StartOptions,
-) -> Result(output, client.WorkflowError) {
-  case client.start(env.client, definition, input, options) {
-    Ok(handle) -> result(env, handle)
-    Error(client.AlreadyStarted) ->
-      Error(client.ClientError("a workflow with this id is already running"))
-    Error(client.StartFailed(message)) -> Error(client.ClientError(message))
-  }
+) -> Result(output, client.Error) {
+  client.start(env.client, definition, input, options)
+  |> result.try(result(env, _))
 }
 
 /// Let `ms` pass. A time-skipping server jumps its clock forward, firing the timers that
@@ -189,7 +190,7 @@ pub fn activity_env(info: activity.Info) -> ActivityEnv {
     }
   }
   ActivityEnv(
-    context: activity.Context(
+    context: activity.new_context(
       info:,
       heartbeat: fn(details) { process.send(heartbeats, details) },
       cancel_reason:,
@@ -211,11 +212,12 @@ pub fn cancel_activity(env: ActivityEnv, reason: activity.CancelReason) -> Nil {
 
 /// The details of every heartbeat so far, oldest first, decoded with `codec`. Heartbeats
 /// without details, or with details that do not decode, are left out.
-pub fn heartbeats(env: ActivityEnv, codec: codec.Codec(a)) -> List(a) {
+pub fn heartbeats(env: ActivityEnv, value_codec: codec.Codec(a)) -> List(a) {
   drain(env.heartbeats, [])
   |> list.filter_map(fn(details) {
     case details {
-      [payload, ..] -> codec.decode(payload) |> result.replace_error(Nil)
+      [payload, ..] ->
+        codec.decode(value_codec, payload) |> result.replace_error(Nil)
       [] -> Error(Nil)
     }
   })

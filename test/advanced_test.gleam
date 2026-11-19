@@ -24,6 +24,9 @@ import temporal/nexus
 import temporal/replayer
 import temporal/worker
 import temporal/workflow.{type Context}
+import temporal/workflow/local_activity
+import temporal/workflow/operation
+import temporal/workflow/update
 
 // ---- activities ----
 
@@ -44,13 +47,13 @@ fn activities(build: String) -> List(activity.Handler) {
   [
     activity.handler(double(), fn(_, n) { Ok(n * 2) }),
     activity.handler(stubborn(), fn(ctx, attempts) {
-      case ctx.info.attempt >= attempts {
+      case activity.info(ctx).attempt >= attempts {
         True ->
           Ok(
             "attempt "
-            <> int.to_string(ctx.info.attempt)
+            <> int.to_string(activity.info(ctx).attempt)
             <> " local="
-            <> string.inspect(ctx.info.is_local),
+            <> string.inspect(activity.info(ctx).is_local),
           )
         False -> Error(failure.new("not yet"))
       }
@@ -80,7 +83,7 @@ fn counter() {
 /// A counter changed by updates. Each update runs an activity before it answers, and
 /// negative amounts are refused by the validator.
 fn counter_workflow(ctx: Context, total: Int) -> Result(Int, Failure) {
-  workflow.set_update_validator(ctx, add(), fn(amount) {
+  update.set_validator(ctx, add(), fn(amount) {
     case amount < 0 {
       True -> Error("amount must not be negative")
       False -> Ok(Nil)
@@ -88,17 +91,17 @@ fn counter_workflow(ctx: Context, total: Int) -> Result(Int, Failure) {
   })
   let next =
     workflow.race([
-      workflow.update(ctx, add()) |> workflow.map(Some),
+      update.next(ctx, add()) |> workflow.map(Some),
       workflow.signal(ctx, finish()) |> workflow.map(fn(_) { None }),
     ])
   case workflow.await(next) {
     None -> Ok(total)
     Some(update) -> {
-      let amount = workflow.update_argument(update)
+      let amount = update.argument(update)
       case amount {
         // An update the workflow accepts and then fails.
         13 -> {
-          workflow.complete_update(
+          update.complete(
             ctx,
             update,
             Error(failure.new("unlucky") |> failure.with_type("Unlucky")),
@@ -113,7 +116,7 @@ fn counter_workflow(ctx: Context, total: Int) -> Result(Int, Failure) {
             options(),
           ))
           let total = total + doubled
-          workflow.complete_update(ctx, update, Ok(total))
+          update.complete(ctx, update, Ok(total))
           counter_workflow(ctx, total)
         }
       }
@@ -147,10 +150,8 @@ fn hasty() {
 /// Cancels a local activity while it waits to be retried.
 fn hasty_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   let retrying =
-    workflow.LocalActivityOptions(
-      ..workflow.local_activity_options(start_to_close: duration.milliseconds(
-        5000,
-      )),
+    local_activity.Options(
+      ..local_activity.options(start_to_close: duration.milliseconds(5000)),
       retry: Some(
         workflow.RetryPolicy(
           ..workflow.retry_policy(maximum_attempts: 5),
@@ -161,7 +162,7 @@ fn hasty_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
     )
   let outcome =
     workflow.with_timeout(ctx, duration.milliseconds(1500), fn(scope) {
-      workflow.execute_local_activity(scope, stubborn(), 2, retrying)
+      local_activity.execute(scope, stubborn(), 2, retrying)
     })
   case outcome {
     Ok(text) -> Ok(text)
@@ -211,25 +212,19 @@ fn caller() {
 
 /// Calls a synchronous operation, a workflow-backed one, and one that fails.
 fn caller_workflow(ctx: Context, endpoint: String) -> Result(String, Failure) {
-  let options = workflow.nexus_options()
-  use shouted <- result.try(workflow.execute_nexus_operation(
+  let options = operation.options()
+  use shouted <- result.try(operation.execute(
     ctx,
     endpoint,
     shout(),
     "hello",
     options,
   ))
-  use handle <- result.try(workflow.start_nexus_operation(
-    ctx,
-    endpoint,
-    double_slowly(),
-    21,
-    options,
-  ))
-  let asynchronous = option.is_some(workflow.nexus_operation_token(handle))
-  use doubled <- result.try(workflow.await(workflow.nexus_result(handle)))
-  let refused =
-    workflow.execute_nexus_operation(ctx, endpoint, refuse(), "this", options)
+  let pending = operation.start(ctx, endpoint, double_slowly(), 21, options)
+  use token <- result.try(workflow.await(operation.started(pending)))
+  let asynchronous = option.is_some(token)
+  use doubled <- result.try(workflow.await(operation.result(pending)))
+  let refused = operation.execute(ctx, endpoint, refuse(), "this", options)
   let reason = case refused {
     Ok(_) -> "not refused"
     Error(failure) -> failure.root_cause(failure).message
@@ -308,7 +303,7 @@ pub fn updates_change_the_workflow_and_return_a_value_test() {
   // Accepted, then failed by the workflow.
   let assert Error(client.UpdateFailed(failed)) =
     client.execute_update(handle, add(), 13)
-  assert failed.error_type == "Unlucky"
+  assert failed.error_type == Some("Unlucky")
 
   // Accepted first, result collected later.
   let assert Ok(update) = client.start_update(handle, add(), 4)
@@ -358,7 +353,7 @@ pub fn a_workflow_can_change_its_memo_test() {
   assert client.result(handle) == Ok("finished")
   let assert Ok(description) = client.describe(handle)
   let assert Ok(stage) = dict.get(description.memo, "stage")
-  assert codec.string().decode(stage) == Ok("finished")
+  assert codec.decode(codec.string(), stage) == Ok("finished")
   assert_replays(handle)
 }
 
@@ -384,21 +379,25 @@ pub fn an_encryption_codec_hides_payloads_from_the_server_test() {
   let new = key("2026", 9)
   use env <- in_both_modes_with("encrypted", encrypted_client(old, []))
   let options =
-    start_options(env)
-    |> client.with_memo("note", codec.string(), "memo-secret")
+    client.StartOptions(
+      ..start_options(env),
+      memo: dict.from_list([
+        #("note", codec.encode(codec.string(), "memo-secret")),
+      ]),
+    )
   let assert Ok(handle) = client.start(env.client, counter(), 4100, options)
   assert client.execute_update(handle, add(), 21) == Ok(4142)
   let assert Ok(Nil) = client.signal(handle, finish(), Nil)
   assert client.result(handle) == Ok(4142)
   let assert Ok(description) = client.describe(handle)
   let assert Ok(note) = dict.get(description.memo, "note")
-  assert codec.string().decode(note) == Ok("memo-secret")
+  assert codec.decode(codec.string(), note) == Ok("memo-secret")
 
   // What the server holds is ciphertext: a client without the key cannot read it, and
   // the plaintext appears nowhere in the stored history.
   let assert Ok(plain) = client.connect(client.local())
   let outsider = client.handle(plain, counter(), client.workflow_id(handle))
-  let assert Error(client.ClientError(_)) = client.result(outsider)
+  let assert Error(client.DecodeFailed(_)) = client.result(outsider)
   let assert Ok(seen) = client.describe(outsider)
   let assert Ok(stored) = dict.get(seen.memo, "note")
   assert dict.get(stored.metadata, "encoding")
@@ -432,7 +431,7 @@ pub fn an_encryption_codec_hides_payloads_from_the_server_test() {
       counter(),
       client.workflow_id(handle),
     )
-  let assert Error(client.ClientError(_)) = client.result(forgetful)
+  let assert Error(client.DecodeFailed(_)) = client.result(forgetful)
   Nil
 }
 
@@ -455,7 +454,7 @@ pub fn a_payload_survives_the_protobuf_round_trip_test() {
       data: bit_array.concat(list.repeat(<<"0123456789":utf8>>, 40)),
     )
   assert codec.from_bytes(codec.to_bytes(payload)) == Ok(payload)
-  let empty = codec.nil().encode(Nil)
+  let empty = codec.encode(codec.nil(), Nil)
   assert codec.from_bytes(codec.to_bytes(empty)) == Ok(empty)
 }
 
@@ -619,9 +618,9 @@ fn runs_so_far(workflow_id: String) -> Int {
 }
 
 fn hang_once_activity(ctx: activity.Context, _: Nil) {
-  let runs = runs_so_far(ctx.info.workflow_id) + 1
+  let runs = runs_so_far(activity.info(ctx).workflow_id) + 1
   write_file(
-    runs_file(ctx.info.workflow_id),
+    runs_file(activity.info(ctx).workflow_id),
     bit_array.concat(list.repeat(<<"x":utf8>>, runs)),
   )
   case runs {
@@ -636,13 +635,11 @@ fn hang_once_activity(ctx: activity.Context, _: Nil) {
 fn fragile_handlers() -> List(workflow.Handler) {
   [
     workflow.handler(fragile(), fn(ctx, _) {
-      workflow.execute_local_activity(
+      local_activity.execute(
         ctx,
         hang_once(),
         Nil,
-        workflow.local_activity_options(start_to_close: duration.milliseconds(
-          60_000,
-        )),
+        local_activity.options(start_to_close: duration.milliseconds(60_000)),
       )
     }),
   ]

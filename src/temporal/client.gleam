@@ -58,9 +58,15 @@ pub opaque type Handle(output) {
   Handle(
     client: Client,
     workflow_id: String,
-    run_id: String,
+    /// `None` refers to the workflow's latest run.
+    run_id: Option(String),
     output: Codec(output),
   )
+}
+
+/// The run id as requests carry it: empty for the latest run.
+fn run_of(handle: Handle(output)) -> String {
+  option.unwrap(handle.run_id, "")
 }
 
 /// What to do when a workflow with the same id is already running.
@@ -102,20 +108,25 @@ pub type StartOptions {
   )
 }
 
-/// Why a workflow could not be started.
-pub type StartError {
-  /// A workflow with this id is already running, or its id may not be reused.
-  AlreadyStarted
-  /// Anything else, with the server's message.
-  StartFailed(message: String)
-}
-
-/// Why a request about an existing workflow failed.
+/// Why a client call failed.
 pub type Error {
+  /// The service could not be reached, or refused the connection.
+  ConnectionFailed(message: String)
   /// No such workflow, run or schedule.
   NotFound(message: String)
-  /// A schedule with this id already exists.
+  /// A workflow with this id is running or may not be started again, or a schedule with
+  /// this id exists.
   AlreadyExists(message: String)
+  /// The workflow returned a failure.
+  WorkflowFailed(failure: Failure)
+  /// The workflow accepted a request to cancel.
+  WorkflowCancelled
+  /// The workflow was terminated from outside.
+  WorkflowTerminated
+  /// A run or execution timeout passed.
+  WorkflowTimedOut
+  /// The workflow rejected the update, or accepted it and then failed it.
+  UpdateFailed(failure: Failure)
   /// The workflow rejected a query, or the query handler failed.
   QueryFailed(message: String)
   /// The server's answer could not be decoded with the codec given.
@@ -124,29 +135,15 @@ pub type Error {
   RequestFailed(code: Int, message: String)
 }
 
-/// Why a workflow did not produce a result.
-pub type WorkflowError {
-  /// The workflow returned a failure.
-  Failed(failure: Failure)
-  /// The workflow accepted a request to cancel.
-  Cancelled
-  /// The workflow was terminated from outside.
-  Terminated
-  /// A run or execution timeout passed.
-  TimedOut
-  /// The result could not be fetched or decoded.
-  ClientError(message: String)
-}
-
 /// Where a run is in its life.
 pub type Status {
   Running
   Completed
-  WorkflowFailed
-  WorkflowCancelled
-  WorkflowTerminated
+  Failed
+  Cancelled
+  Terminated
   ContinuedAsNew
-  WorkflowTimedOut
+  TimedOut
   /// A status this SDK does not know.
   UnknownStatus
 }
@@ -207,7 +204,7 @@ pub fn cloud(
 }
 
 /// Connect to the service. Fails if it cannot be reached or refuses the credentials.
-pub fn connect(options: Options) -> Result(Client, String) {
+pub fn connect(options: Options) -> Result(Client, Error) {
   bridge.connect(
     options.target,
     options.namespace,
@@ -218,6 +215,7 @@ pub fn connect(options: Options) -> Result(Client, String) {
     }),
   )
   |> result.map(Client(_, options.codec, options.namespace))
+  |> result.map_error(ConnectionFailed)
 }
 
 /// The codec workers started with this client apply.
@@ -256,31 +254,6 @@ pub fn start_options(
     search_attributes: dict.new(),
     start_delay: None,
     cron_schedule: None,
-  )
-}
-
-/// Add a memo entry.
-pub fn with_memo(
-  options: StartOptions,
-  key: String,
-  codec: Codec(a),
-  value: a,
-) -> StartOptions {
-  StartOptions(
-    ..options,
-    memo: dict.insert(options.memo, key, codec.encode(value)),
-  )
-}
-
-/// Add a search attribute. Custom attributes must be registered on the namespace first.
-pub fn with_search_attribute(
-  options: StartOptions,
-  name: String,
-  value: search_attributes.Value,
-) -> StartOptions {
-  StartOptions(
-    ..options,
-    search_attributes: dict.insert(options.search_attributes, name, value),
   )
 }
 
@@ -347,9 +320,13 @@ pub fn start_for_nexus(
   options: StartOptions,
   request_id: String,
   callbacks: List(#(String, Dict(String, String))),
-) -> Result(Handle(output), StartError) {
+) -> Result(Handle(output), Error) {
   let request =
-    start_request(definition.name, [definition.input.encode(input)], options)
+    start_request(
+      definition.name,
+      codec.encode_arguments(definition.input, input),
+      options,
+    )
   let request =
     encode_request(
       client,
@@ -357,10 +334,8 @@ pub fn start_for_nexus(
     )
   case bridge.start_workflow(client.connection, request, None) {
     Ok(run_id) ->
-      Ok(Handle(client, options.workflow_id, run_id, definition.output))
-    Error(bridge.RpcError(code, _)) if code == already_exists ->
-      Error(AlreadyStarted)
-    Error(bridge.RpcError(_, message)) -> Error(StartFailed(message))
+      Ok(Handle(client, options.workflow_id, Some(run_id), definition.output))
+    Error(error) -> Error(request_error(error))
   }
 }
 
@@ -370,9 +345,13 @@ fn start_with(
   input: input,
   options: StartOptions,
   signal: Option(#(String, List(Payload))),
-) -> Result(Handle(output), StartError) {
+) -> Result(Handle(output), Error) {
   let request =
-    start_request(definition.name, [definition.input.encode(input)], options)
+    start_request(
+      definition.name,
+      codec.encode_arguments(definition.input, input),
+      options,
+    )
     |> encode_request(client, _)
   let signal =
     option.map(signal, fn(signal) {
@@ -386,10 +365,8 @@ fn start_with(
   }
   case bridge.start_workflow(client.connection, request, signal) {
     Ok(run_id) ->
-      Ok(Handle(client, options.workflow_id, run_id, definition.output))
-    Error(bridge.RpcError(code, _)) if code == already_exists ->
-      Error(AlreadyStarted)
-    Error(bridge.RpcError(_, message)) -> Error(StartFailed(message))
+      Ok(Handle(client, options.workflow_id, Some(run_id), definition.output))
+    Error(error) -> Error(request_error(error))
   }
 }
 
@@ -399,7 +376,7 @@ pub fn start(
   definition: workflow.Definition(input, output),
   input: input,
   options: StartOptions,
-) -> Result(Handle(output), StartError) {
+) -> Result(Handle(output), Error) {
   start_with(client, definition, input, options, None)
 }
 
@@ -412,13 +389,13 @@ pub fn signal_with_start(
   options: StartOptions,
   signal: workflow.SignalDefinition(a),
   value: a,
-) -> Result(Handle(output), StartError) {
+) -> Result(Handle(output), Error) {
   start_with(
     client,
     definition,
     input,
     options,
-    Some(#(signal.name, [signal.codec.encode(value)])),
+    Some(#(signal.name, codec.encode_arguments(signal.codec, value))),
   )
 }
 
@@ -428,7 +405,7 @@ pub fn handle(
   definition: workflow.Definition(input, output),
   workflow_id: String,
 ) -> Handle(output) {
-  Handle(client, workflow_id, "", definition.output)
+  Handle(client, workflow_id, None, definition.output)
 }
 
 /// The id of the workflow the handle refers to.
@@ -436,33 +413,33 @@ pub fn workflow_id(handle: Handle(output)) -> String {
   handle.workflow_id
 }
 
-/// The run this handle was started with, or `""` for a handle to the latest run.
-pub fn run_id(handle: Handle(output)) -> String {
+/// The run this handle was started with, or `None` for a handle to the latest run.
+pub fn run_id(handle: Handle(output)) -> Option(String) {
   handle.run_id
 }
 
 /// Wait for the workflow to finish. Follows continue-as-new and retries to the final run.
-pub fn result(handle: Handle(output)) -> Result(output, WorkflowError) {
+pub fn result(handle: Handle(output)) -> Result(output, Error) {
   case
     bridge.workflow_result(
       handle.client.connection,
       handle.workflow_id,
-      handle.run_id,
+      run_of(handle),
     )
   {
     Ok(bridge.OutcomeCompleted(payloads)) ->
       transcode.decode_list(handle.client.codec, payloads)
-      |> result.try(codec.decode_argument(handle.output, _))
-      |> result.map_error(ClientError)
+      |> result.try(codec.decode_arguments(handle.output, _))
+      |> result.map_error(DecodeFailed)
     Ok(bridge.OutcomeFailed(failure)) ->
-      Error(Failed(
+      Error(WorkflowFailed(
         transcode.decode_failure(handle.client.codec, failure)
         |> result.unwrap(failure),
       ))
-    Ok(bridge.OutcomeCancelled) -> Error(Cancelled)
-    Ok(bridge.OutcomeTerminated) -> Error(Terminated)
-    Ok(bridge.OutcomeTimedOut) -> Error(TimedOut)
-    Error(bridge.RpcError(_, message)) -> Error(ClientError(message))
+    Ok(bridge.OutcomeCancelled) -> Error(WorkflowCancelled)
+    Ok(bridge.OutcomeTerminated) -> Error(WorkflowTerminated)
+    Ok(bridge.OutcomeTimedOut) -> Error(WorkflowTimedOut)
+    Error(error) -> Error(request_error(error))
   }
 }
 
@@ -472,13 +449,8 @@ pub fn execute(
   definition: workflow.Definition(input, output),
   input: input,
   options: StartOptions,
-) -> Result(output, WorkflowError) {
-  case start(client, definition, input, options) {
-    Ok(handle) -> result(handle)
-    Error(AlreadyStarted) ->
-      Error(ClientError("a workflow with this id is already running"))
-    Error(StartFailed(message)) -> Error(ClientError(message))
-  }
+) -> Result(output, Error) {
+  start(client, definition, input, options) |> result.try(result)
 }
 
 /// A failed request as the error callers see.
@@ -502,9 +474,12 @@ pub fn signal(
   bridge.signal_workflow(
     handle.client.connection,
     handle.workflow_id,
-    handle.run_id,
+    run_of(handle),
     definition.name,
-    transcode.encode_list(handle.client.codec, [definition.codec.encode(value)]),
+    transcode.encode_list(
+      handle.client.codec,
+      codec.encode_arguments(definition.codec, value),
+    ),
   )
   |> result.map_error(request_error)
 }
@@ -520,16 +495,17 @@ pub fn query(
     bridge.query_workflow(
       handle.client.connection,
       handle.workflow_id,
-      handle.run_id,
+      run_of(handle),
       definition.name,
-      transcode.encode_list(handle.client.codec, [
-        definition.argument.encode(argument),
-      ]),
+      transcode.encode_list(
+        handle.client.codec,
+        codec.encode_arguments(definition.argument, argument),
+      ),
     )
   {
     Ok(payloads) ->
       transcode.decode_list(handle.client.codec, payloads)
-      |> result.try(codec.decode_argument(definition.result, _))
+      |> result.try(codec.decode_arguments(definition.result, _))
       |> result.map_error(DecodeFailed)
     Error(bridge.RpcError(code, message)) if code == not_found ->
       Error(NotFound(message))
@@ -544,7 +520,7 @@ pub fn cancel(handle: Handle(output)) -> Result(Nil, Error) {
   bridge.cancel_workflow(
     handle.client.connection,
     handle.workflow_id,
-    handle.run_id,
+    run_of(handle),
   )
   |> result.map_error(request_error)
 }
@@ -554,7 +530,7 @@ pub fn terminate(handle: Handle(output), reason: String) -> Result(Nil, Error) {
   bridge.terminate_workflow(
     handle.client.connection,
     handle.workflow_id,
-    handle.run_id,
+    run_of(handle),
     reason,
   )
   |> result.map_error(request_error)
@@ -565,7 +541,7 @@ pub fn history(handle: Handle(output)) -> Result(History, Error) {
   bridge.fetch_history(
     handle.client.connection,
     handle.workflow_id,
-    handle.run_id,
+    run_of(handle),
   )
   |> result.map(History(handle.workflow_id, _))
   |> result.map_error(request_error)
@@ -580,11 +556,11 @@ fn description(client: Client, execution: bridge.Execution) -> Description {
     status: case execution.status {
       1 -> Running
       2 -> Completed
-      3 -> WorkflowFailed
-      4 -> WorkflowCancelled
-      5 -> WorkflowTerminated
+      3 -> Failed
+      4 -> Cancelled
+      5 -> Terminated
       6 -> ContinuedAsNew
-      7 -> WorkflowTimedOut
+      7 -> TimedOut
       _ -> UnknownStatus
     },
     start_time: time.timestamp(execution.start_time_ms),
@@ -603,7 +579,7 @@ pub fn describe(handle: Handle(output)) -> Result(Description, Error) {
   bridge.describe_workflow(
     handle.client.connection,
     handle.workflow_id,
-    handle.run_id,
+    run_of(handle),
   )
   |> result.map(description(handle.client, _))
   |> result.map_error(request_error)
@@ -629,14 +605,6 @@ pub fn count(client: Client, query: String) -> Result(Int, Error) {
 
 // ---- updates ----
 
-/// Why an update did not return a value.
-pub type UpdateError {
-  /// The workflow rejected the update, or accepted it and then failed it.
-  UpdateFailed(failure: Failure)
-  /// The update could not be sent, or its result could not be read.
-  UpdateNotDelivered(error: Error)
-}
-
 /// An update the workflow has accepted.
 pub opaque type UpdateHandle(result) {
   UpdateHandle(
@@ -661,17 +629,20 @@ fn send_update(
   argument: argument,
   update_id: String,
   stage: Int,
-) -> Result(UpdateHandle(result), UpdateError) {
+) -> Result(UpdateHandle(result), Error) {
   let client = handle.client
   case
     bridge.update_workflow(
       client.connection,
-      #(handle.workflow_id, handle.run_id, update_id, definition.name),
-      transcode.encode_list(client.codec, [definition.argument.encode(argument)]),
+      #(handle.workflow_id, run_of(handle), update_id, definition.name),
+      transcode.encode_list(
+        client.codec,
+        codec.encode_arguments(definition.argument, argument),
+      ),
       stage,
     )
   {
-    Error(error) -> Error(UpdateNotDelivered(request_error(error)))
+    Error(error) -> Error(request_error(error))
     // Rejected by the workflow's validator: there is no update to hold a handle to.
     Ok(#(_, _, bridge.UpdateFailed(failure))) if stage == accepted ->
       Error(UpdateFailed(decoded_failure(client, failure)))
@@ -701,7 +672,7 @@ pub fn execute_update(
   handle: Handle(output),
   definition: workflow.UpdateDefinition(argument, result),
   argument: argument,
-) -> Result(result, UpdateError) {
+) -> Result(result, Error) {
   send_update(handle, definition, argument, "", completed)
   |> result.try(update_result)
 }
@@ -712,7 +683,7 @@ pub fn start_update(
   handle: Handle(output),
   definition: workflow.UpdateDefinition(argument, result),
   argument: argument,
-) -> Result(UpdateHandle(result), UpdateError) {
+) -> Result(UpdateHandle(result), Error) {
   send_update(handle, definition, argument, "", accepted)
 }
 
@@ -723,7 +694,7 @@ pub fn start_update_with_id(
   definition: workflow.UpdateDefinition(argument, result),
   argument: argument,
   update_id update_id: String,
-) -> Result(UpdateHandle(result), UpdateError) {
+) -> Result(UpdateHandle(result), Error) {
   send_update(handle, definition, argument, update_id, accepted)
 }
 
@@ -733,9 +704,7 @@ pub fn update_id(update: UpdateHandle(result)) -> String {
 }
 
 /// Wait for an accepted update's answer.
-pub fn update_result(
-  update: UpdateHandle(result),
-) -> Result(result, UpdateError) {
+pub fn update_result(update: UpdateHandle(result)) -> Result(result, Error) {
   let outcome = case update.outcome {
     Some(outcome) -> Ok(outcome)
     None ->
@@ -747,21 +716,17 @@ pub fn update_result(
       )
   }
   case outcome {
-    Error(error) -> Error(UpdateNotDelivered(request_error(error)))
+    Error(error) -> Error(request_error(error))
     Ok(bridge.UpdateFailed(failure)) ->
       Error(UpdateFailed(decoded_failure(update.client, failure)))
     Ok(bridge.UpdateSucceeded(payloads)) ->
       transcode.decode_list(update.client.codec, payloads)
-      |> result.try(codec.decode_argument(update.result, _))
-      |> result.map_error(fn(reason) {
-        UpdateNotDelivered(DecodeFailed(reason))
-      })
+      |> result.try(codec.decode_arguments(update.result, _))
+      |> result.map_error(DecodeFailed)
     Ok(bridge.UpdatePending) ->
-      Error(
-        UpdateNotDelivered(RequestFailed(
-          4,
-          "the update did not finish before the request gave up",
-        )),
-      )
+      Error(RequestFailed(
+        4,
+        "the update did not finish before the request gave up",
+      ))
   }
 }

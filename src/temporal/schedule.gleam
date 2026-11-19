@@ -225,7 +225,7 @@ pub fn action(
 ) -> Action {
   from_request(client.start_request(
     definition.name,
-    [definition.input.encode(input)],
+    codec.encode_arguments(definition.input, input),
     options,
   ))
 }

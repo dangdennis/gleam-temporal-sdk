@@ -161,3 +161,11 @@ exports.nexus_caller = async function nexusCaller(endpoint) {
 exports.doubling = async function doubling(n) {
   return await double(n);
 };
+
+const { join } = wf.proxyActivities({ startToCloseTimeout: '10 seconds' });
+
+// Several arguments, to a workflow and to an activity.
+exports.arguments = async function severalArguments(greeting, times, loud) {
+  const joined = await join(greeting, times);
+  return loud ? joined.toUpperCase() : joined;
+};

@@ -55,9 +55,9 @@ pub type CancelReason {
   Reset
 }
 
-/// Passed to every activity. Use the functions of this module on it rather than its
-/// fields, which exist so that tests can build one: see `testing.activity_env`.
-pub type Context {
+/// Passed to every activity: what it is running for, and its line to the server for
+/// heartbeats and cancellation. Tests build one with `testing.activity_env`.
+pub opaque type Context {
   Context(
     info: Info,
     heartbeat: fn(List(Payload)) -> Nil,
@@ -85,10 +85,12 @@ pub fn handler(
   run: fn(Context, input) -> Result(output, Failure),
 ) -> Handler {
   Handler(definition.name, fn(ctx, arguments) {
-    case codec.decode_argument(definition.input, arguments) {
+    case codec.decode_arguments(definition.input, arguments) {
       Ok(input) ->
         run(ctx, input)
-        |> result.map(fn(output) { Some(definition.output.encode(output)) })
+        |> result.map(fn(output) {
+          Some(codec.encode(definition.output, output))
+        })
       Error(reason) ->
         Error(
           failure.new("could not decode activity input: " <> reason)
@@ -106,6 +108,20 @@ pub fn wrap(handler: Handler, middleware: Middleware) -> Handler {
   })
 }
 
+@internal
+pub fn new_context(
+  info info: Info,
+  heartbeat heartbeat: fn(List(Payload)) -> Nil,
+  cancel_reason cancel_reason: fn() -> Option(CancelReason),
+) -> Context {
+  Context(info:, heartbeat:, cancel_reason:)
+}
+
+/// The task the activity is running for.
+pub fn info(ctx: Context) -> Info {
+  ctx.info
+}
+
 /// Tell the server the activity is still alive. Long activities with a heartbeat timeout
 /// must call this more often than the timeout. Heartbeating is also how an activity learns
 /// that it was cancelled: see `is_cancelled`.
@@ -114,14 +130,14 @@ pub fn heartbeat(ctx: Context) -> Nil {
 }
 
 /// Heartbeat with progress that the next attempt can read with `heartbeat_details`.
-pub fn heartbeat_with(ctx: Context, codec: Codec(a), details: a) -> Nil {
-  ctx.heartbeat([codec.encode(details)])
+pub fn heartbeat_with(ctx: Context, value_codec: Codec(a), details: a) -> Nil {
+  ctx.heartbeat([codec.encode(value_codec, details)])
 }
 
 /// The progress the previous attempt last recorded with `heartbeat_with`, if any.
-pub fn heartbeat_details(ctx: Context, codec: Codec(a)) -> Option(a) {
+pub fn heartbeat_details(ctx: Context, value_codec: Codec(a)) -> Option(a) {
   case ctx.info.heartbeat_details {
-    [payload, ..] -> option.from_result(codec.decode(payload))
+    [payload, ..] -> option.from_result(codec.decode(value_codec, payload))
     [] -> None
   }
 }

@@ -2,8 +2,8 @@
 //// namespaces to call, by service and operation name, through an endpoint registered on
 //// the server.
 ////
-//// A worker serves operations with `worker.with_nexus_handlers`. Workflows call them with
-//// `workflow.execute_nexus_operation`. Both sides share the `workflow.NexusOperation`
+//// A worker serves operations with `worker.with_nexus_handlers`. Workflows call them
+//// through `temporal/workflow/operation`. Both sides share the `workflow.NexusOperation`
 //// value that names the operation and fixes its types.
 ////
 //// ```gleam
@@ -24,6 +24,7 @@ import gleam/json
 import gleam/list
 import gleam/option
 import gleam/result
+import gleam/string
 import temporal/client.{type Client}
 import temporal/codec.{type Payload}
 import temporal/failure.{type Failure}
@@ -82,7 +83,7 @@ pub fn handler_error(error_type: String, message: String) -> Failure {
   failure.Failure(
     ..failure.new(message),
     kind: failure.NexusHandler,
-    error_type:,
+    error_type: option.Some(error_type),
   )
 }
 
@@ -90,7 +91,7 @@ fn decode_input(
   operation: workflow.NexusOperation(input, output),
   payloads: List(Payload),
 ) -> Result(input, Failure) {
-  codec.decode_argument(operation.input, payloads)
+  codec.decode_arguments(operation.input, payloads)
   |> result.map_error(fn(reason) {
     handler_error("BAD_REQUEST", "could not decode operation input: " <> reason)
   })
@@ -109,7 +110,7 @@ pub fn sync(
     start: fn(request) {
       use input <- result.try(decode_input(operation, request.input))
       use output <- result.map(run(request.context, input))
-      Finished(operation.output.encode(output))
+      Finished(codec.encode(operation.output, output))
     },
     cancel: fn(_, _) { Ok(Nil) },
   )
@@ -158,15 +159,9 @@ pub fn workflow_run(
               client.workflow_id(handle),
             )),
           )
-        Error(client.AlreadyStarted) ->
-          Error(handler_error(
-            "BAD_REQUEST",
-            "a workflow with id \""
-              <> options.workflow_id
-              <> "\" already exists",
-          ))
-        Error(client.StartFailed(message)) ->
-          Error(handler_error("INTERNAL", message))
+        Error(client.AlreadyExists(message)) ->
+          Error(handler_error("BAD_REQUEST", message))
+        Error(error) -> Error(handler_error("INTERNAL", string.inspect(error)))
       }
     },
     cancel: fn(ctx, token) {
@@ -257,7 +252,10 @@ pub fn dispatcher(
     let failure = transcode.encode_failure(codec, failure)
     case failure.kind {
       failure.NexusHandler ->
-        bridge.NexusHandlerFailed(failure.error_type, failure)
+        bridge.NexusHandlerFailed(
+          option.unwrap(failure.error_type, "INTERNAL"),
+          failure,
+        )
       _ -> bridge.NexusOperationFailed(failure)
     }
   }

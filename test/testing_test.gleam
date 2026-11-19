@@ -125,7 +125,7 @@ pub fn an_activity_can_be_tested_without_a_server_test() {
   // A retry resumes from the progress the last attempt recorded.
   let info =
     activity.Info(..testing.activity_info(), attempt: 2, heartbeat_details: [
-      codec.int().encode(2),
+      codec.encode(codec.int(), 2),
     ])
   let env = testing.activity_env(info)
   assert counting(testing.activity_context(env), 3) == Ok(3)

@@ -16,6 +16,10 @@ import temporal/internal/bridge.{type Completion, Activation}
 import temporal/internal/runtime
 import temporal/middleware
 import temporal/workflow
+import temporal/workflow/child
+import temporal/workflow/local_activity
+import temporal/workflow/operation
+import temporal/workflow/update
 
 fn double() {
   activity.Definition("double", codec.int(), codec.int())
@@ -66,7 +70,7 @@ fn init(workflow_type: String, input: Int) -> bridge.Job {
   bridge.InitializeWorkflow(
     workflow_type,
     "wf",
-    [codec.int().encode(input)],
+    [codec.encode(codec.int(), input)],
     42,
     1,
     "run",
@@ -76,7 +80,7 @@ fn init(workflow_type: String, input: Int) -> bridge.Job {
 }
 
 fn int_payload(value: Int) {
-  Some(codec.int().encode(value))
+  Some(codec.encode(codec.int(), value))
 }
 
 pub fn timer_then_complete_test() {
@@ -150,7 +154,7 @@ fn accumulate(ctx: workflow.Context, sum: Int) -> Result(Int, failure.Failure) {
 }
 
 fn signal(value: Int) -> bridge.Job {
-  bridge.SignalWorkflow("added", [codec.int().encode(value)])
+  bridge.SignalWorkflow("added", [codec.encode(codec.int(), value)])
 }
 
 pub fn signals_are_buffered_and_delivered_in_order_test() {
@@ -165,7 +169,7 @@ pub fn queries_see_the_state_after_the_jobs_delivered_with_them_test() {
   let run = start(accumulator())
   let _ = activate(run, [init("accumulator", 10)])
   assert activate(run, [signal(5), bridge.QueryWorkflow("q1", "total", [])])
-    == [bridge.RespondToQuery("q1", Ok(codec.int().encode(15)))]
+    == [bridge.RespondToQuery("q1", Ok(codec.encode(codec.int(), 15)))]
   let assert [bridge.RespondToQuery("q2", Error(_))] =
     activate(run, [bridge.QueryWorkflow("q2", "unknown", [])])
 }
@@ -174,7 +178,7 @@ pub fn queries_are_answered_after_completion_test() {
   let run = start(accumulator())
   let _ = activate(run, [init("accumulator", 10), signal(0)])
   assert activate(run, [bridge.QueryWorkflow("q", "total", [])])
-    == [bridge.RespondToQuery("q", Ok(codec.int().encode(10)))]
+    == [bridge.RespondToQuery("q", Ok(codec.encode(codec.int(), 10)))]
 }
 
 pub fn race_prefers_the_earlier_future_test() {
@@ -361,7 +365,7 @@ pub fn await_timeout_returns_the_signal_or_times_out_test() {
   let run = waiter()
   assert activate(run, [init("waiter", 0)]) == [bridge.StartTimer(1, 5000)]
   assert activate(run, [
-      bridge.SignalWorkflow("added", [codec.int().encode(7)]),
+      bridge.SignalWorkflow("added", [codec.encode(codec.int(), 7)]),
     ])
     == [bridge.CancelTimer(1), bridge.CompleteWorkflow(int_payload(7))]
 
@@ -409,21 +413,22 @@ pub fn cancelling_a_scope_reaches_nested_scopes_but_not_shielded_ones_test() {
 }
 
 pub fn child_is_started_before_its_result_is_awaited_test() {
-  let child = workflow.Definition("child", codec.int(), codec.int())
+  let definition = workflow.Definition("child", codec.int(), codec.int())
   let run =
     start(
       int_workflow("parent", fn(ctx, n) {
         let options =
-          workflow.ChildOptions(
-            ..workflow.child_options(workflow_id: "kid"),
-            parent_close_policy: workflow.AbandonChild,
+          child.Options(
+            ..child.options(workflow_id: "kid"),
+            parent_close_policy: child.Abandon,
             id_reuse_policy: workflow.RejectDuplicate,
             run_timeout: Some(duration.seconds(9)),
           )
-        use started <- result.try(workflow.start_child(ctx, child, n, options))
-        assert workflow.child_run_id(started) == "child-run"
-        assert workflow.child_workflow_id(started) == "kid"
-        workflow.await(workflow.child_result(started))
+        let kid = child.start(ctx, definition, n, options)
+        assert child.workflow_id(kid) == "kid"
+        use run_id <- result.try(workflow.await(child.started(kid)))
+        assert run_id == "child-run"
+        workflow.await(child.result(kid))
       }),
     )
   let assert [
@@ -452,22 +457,17 @@ pub fn child_is_started_before_its_result_is_awaited_test() {
 }
 
 pub fn child_that_already_exists_is_a_typed_failure_test() {
-  let child = workflow.Definition("child", codec.int(), codec.int())
+  let definition = workflow.Definition("child", codec.int(), codec.int())
   let run =
     start(
       int_workflow("parent", fn(ctx, n) {
-        workflow.execute_child(
-          ctx,
-          child,
-          n,
-          workflow.child_options(workflow_id: "kid"),
-        )
+        child.execute(ctx, definition, n, child.options(workflow_id: "kid"))
       }),
     )
   let _ = activate(run, [init("parent", 4)])
   let assert [
     bridge.FailWorkflow(failure.Failure(
-      error_type: "WorkflowExecutionAlreadyStarted",
+      error_type: Some("WorkflowExecutionAlreadyStarted"),
       ..,
     )),
   ] =
@@ -477,16 +477,11 @@ pub fn child_that_already_exists_is_a_typed_failure_test() {
 }
 
 pub fn cancelling_the_workflow_cancels_a_running_child_test() {
-  let child = workflow.Definition("child", codec.int(), codec.int())
+  let definition = workflow.Definition("child", codec.int(), codec.int())
   let run =
     start(
       int_workflow("parent", fn(ctx, n) {
-        workflow.execute_child(
-          ctx,
-          child,
-          n,
-          workflow.child_options(workflow_id: "kid"),
-        )
+        child.execute(ctx, definition, n, child.options(workflow_id: "kid"))
       }),
     )
   let _ = activate(run, [init("parent", 4)])
@@ -522,12 +517,12 @@ pub fn info_and_memo_come_from_the_start_event_test() {
         bridge.InitializeWorkflow(
           "informed",
           "wf",
-          [codec.int().encode(0)],
+          [codec.encode(codec.int(), 0)],
           42,
           1,
           "first-run",
           "previous-run",
-          dict.from_list([#("trace", codec.string().encode("abc"))]),
+          dict.from_list([#("trace", codec.encode(codec.string(), "abc"))]),
         ),
       ],
       True,
@@ -607,7 +602,7 @@ pub fn continue_as_new_test() {
       }),
     )
   assert activate(run, [init("looper", 1)])
-    == [bridge.ContinueAsNew("looper", "queue", [codec.int().encode(2)])]
+    == [bridge.ContinueAsNew("looper", "queue", [codec.encode(codec.int(), 2)])]
 }
 
 pub fn random_values_depend_only_on_the_seed_test() {
@@ -644,7 +639,7 @@ pub fn uuid4_is_well_formed_test() {
     _:bytes-size(4),
     variant,
     _:bytes-size(16),
-  >>) = codec.string().decode(payload) |> result_bits
+  >>) = codec.decode(codec.string(), payload) |> result_bits
   assert variant == 56 || variant == 57 || variant == 97 || variant == 98
 }
 
@@ -727,10 +722,10 @@ pub fn eviction_while_blocked_stops_the_process_test() {
 
 pub fn invalid_input_fails_the_workflow_test() {
   let run = start(accumulator())
-  let bad = codec.string().encode("not a number")
+  let bad = codec.encode(codec.string(), "not a number")
   let assert [
     bridge.FailWorkflow(failure.Failure(
-      error_type: "InvalidArgument",
+      error_type: Some("InvalidArgument"),
       cause: None,
       ..,
     )),
@@ -794,7 +789,7 @@ fn update_job(protocol_id: String, amount: Int, validate: Bool) -> bridge.Job {
     id: "update-" <> protocol_id,
     protocol_instance_id: protocol_id,
     name: "add",
-    input: [codec.int().encode(amount)],
+    input: [codec.encode(codec.int(), amount)],
     run_validator: validate,
   )
 }
@@ -802,21 +797,21 @@ fn update_job(protocol_id: String, amount: Int, validate: Bool) -> bridge.Job {
 fn adder() {
   start(
     int_workflow("adder", fn(ctx, total) {
-      workflow.set_update_validator(ctx, add(), fn(amount) {
+      update.set_validator(ctx, add(), fn(amount) {
         case amount < 0 {
           True -> Error("negative")
           False -> Ok(Nil)
         }
       })
-      let update = workflow.receive_update(ctx, add())
-      let amount = workflow.update_argument(update)
+      let update = update.receive(ctx, add())
+      let amount = update.argument(update)
       use doubled <- result.try(workflow.execute_activity(
         ctx,
         double(),
         amount,
         options(),
       ))
-      workflow.complete_update(ctx, update, Ok(total + doubled))
+      update.complete(ctx, update, Ok(total + doubled))
       Ok(total + doubled)
     }),
   )
@@ -832,7 +827,7 @@ pub fn an_update_is_accepted_then_completed_after_its_work_test() {
       bridge.ResolveActivity(1, bridge.Completed(int_payload(10))),
     ])
     == [
-      bridge.UpdateCompleted("p1", codec.int().encode(11)),
+      bridge.UpdateCompleted("p1", codec.encode(codec.int(), 11)),
       bridge.CompleteWorkflow(int_payload(11)),
     ]
 }
@@ -869,7 +864,7 @@ pub fn an_update_for_an_unknown_name_is_rejected_once_the_workflow_waits_test() 
     bridge.StartTimer(1, 1000),
     bridge.UpdateRejected(
       "p1",
-      failure.Failure(error_type: "UpdateRejected", ..),
+      failure.Failure(error_type: Some("UpdateRejected"), ..),
     ),
   ] = activate(run, [init("deaf", 1), update_job("p1", 1, True)])
 }
@@ -884,13 +879,11 @@ pub fn a_local_activity_retries_after_the_backoff_core_asks_for_test() {
   let run =
     start(
       int_workflow("local", fn(ctx, n) {
-        workflow.execute_local_activity(
+        local_activity.execute(
           ctx,
           double(),
           n,
-          workflow.local_activity_options(start_to_close: duration.milliseconds(
-            1000,
-          )),
+          local_activity.options(start_to_close: duration.milliseconds(1000)),
         )
       }),
     )
@@ -920,13 +913,11 @@ pub fn cancelling_a_local_activity_depends_on_what_it_is_waiting_for_test() {
   let scoped = fn() {
     start(
       int_workflow("local", fn(ctx, n) {
-        workflow.execute_local_activity(
+        local_activity.execute(
           ctx,
           double(),
           n,
-          workflow.local_activity_options(start_to_close: duration.milliseconds(
-            1000,
-          )),
+          local_activity.options(start_to_close: duration.milliseconds(1000)),
         )
       }),
     )
@@ -990,20 +981,16 @@ pub fn a_pending_signal_to_another_workflow_is_cancelled_with_its_scope_test() {
 }
 
 pub fn a_nexus_operation_starts_then_resolves_test() {
-  let operation =
+  let double_it =
     workflow.NexusOperation("maths", "double", codec.int(), codec.int())
   let run =
     start(
       int_workflow("caller", fn(ctx, n) {
-        use handle <- result.try(workflow.start_nexus_operation(
-          ctx,
-          "endpoint",
-          operation,
-          n,
-          workflow.nexus_options(),
-        ))
-        assert workflow.nexus_operation_token(handle) == Some("token")
-        workflow.await(workflow.nexus_result(handle))
+        let pending =
+          operation.start(ctx, "endpoint", double_it, n, operation.options())
+        use token <- result.try(workflow.await(operation.started(pending)))
+        assert token == Some("token")
+        workflow.await(operation.result(pending))
       }),
     )
   let assert [
@@ -1054,7 +1041,9 @@ pub fn a_future_keeps_the_value_it_resolved_with_test() {
         Ok(first * 100 + again * 10 + other)
       }),
     )
-  let signal = fn(n) { bridge.SignalWorkflow("added", [codec.int().encode(n)]) }
+  let signal = fn(n) {
+    bridge.SignalWorkflow("added", [codec.encode(codec.int(), n)])
+  }
   assert activate(run, [init("twice", 0), signal(1), signal(2)])
     == [bridge.CompleteWorkflow(int_payload(112))]
 }
@@ -1064,7 +1053,7 @@ pub fn a_workflow_that_ends_fails_the_updates_it_did_not_answer_test() {
     start(
       int_workflow("rude", fn(ctx, n) {
         // Takes one update and answers neither it nor the one still queued.
-        let _ = workflow.receive_update(ctx, add())
+        let _ = update.receive(ctx, add())
         Ok(n)
       }),
     )
@@ -1074,7 +1063,7 @@ pub fn a_workflow_that_ends_fails_the_updates_it_did_not_answer_test() {
     bridge.UpdateAccepted("p1"),
     bridge.UpdateRejected(
       "p1",
-      failure.Failure(error_type: "WorkflowFinished", ..),
+      failure.Failure(error_type: Some("WorkflowFinished"), ..),
     ),
     bridge.UpdateRejected("p2", _),
     bridge.CompleteWorkflow(_),
@@ -1090,16 +1079,16 @@ pub fn only_the_first_answer_to_an_update_counts_test() {
   let run =
     start(
       int_workflow("eager", fn(ctx, n) {
-        let update = workflow.receive_update(ctx, add())
-        workflow.complete_update(ctx, update, Ok(1))
-        workflow.complete_update(ctx, update, Ok(2))
+        let update = update.receive(ctx, add())
+        update.complete(ctx, update, Ok(1))
+        update.complete(ctx, update, Ok(2))
         Ok(n)
       }),
     )
   assert activate(run, [init("eager", 7), update_job("p1", 1, True)])
     == [
       bridge.UpdateAccepted("p1"),
-      bridge.UpdateCompleted("p1", codec.int().encode(1)),
+      bridge.UpdateCompleted("p1", codec.encode(codec.int(), 1)),
       bridge.CompleteWorkflow(int_payload(7)),
     ]
 }
@@ -1110,7 +1099,7 @@ pub fn fail_on_crash_turns_a_crash_into_a_workflow_failure_test() {
     |> workflow.fail_on_crash
   let assert [
     bridge.FailWorkflow(failure.Failure(
-      error_type: "WorkflowCrashed",
+      error_type: Some("WorkflowCrashed"),
       non_retryable: True,
       ..,
     )),
@@ -1136,7 +1125,7 @@ pub fn a_scope_forgets_operations_that_have_settled_test() {
       activate(run, [bridge.FireTimer(seq)])
     })
   let assert [bridge.CompleteWorkflow(Some(remembered))] = remembered
-  let assert Ok(remembered) = codec.int().decode(remembered)
+  let assert Ok(remembered) = codec.decode(codec.int(), remembered)
   // Far fewer than the two hundred timers the workflow's scope has seen.
   assert remembered <= 64
 }
