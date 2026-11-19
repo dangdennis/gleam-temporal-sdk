@@ -203,3 +203,30 @@ pub fn a_supervisor_restarts_a_worker_that_dies_test() {
   assert client.result(handle) == Ok(42)
   shut_down(supervisor)
 }
+
+pub fn a_worker_whose_loops_keep_crashing_gives_up_test() {
+  use <- quietly
+  let task_queue = "doomed-" <> unique()
+  let found = process.new_subject()
+  // An owner of its own: the worker takes its owner down with it when it gives up.
+  let owner =
+    process.spawn_unlinked(fn() {
+      let assert Ok(worker) = worker.start(config(task_queue))
+      process.send(found, worker)
+      process.sleep_forever()
+    })
+  let assert Ok(worker) = process.receive(found, 10_000)
+  let manager = worker.manager(worker)
+  let kill_loops = fn() {
+    list.each(
+      linked(manager) |> list.filter(fn(pid) { pid != owner }),
+      process.kill,
+    )
+  }
+  // Six rounds of crashes inside a minute is one more than a worker tolerates.
+  assert eventually(fn() {
+    kill_loops()
+    !process.is_alive(manager)
+  })
+  assert eventually(fn() { !process.is_alive(owner) })
+}
