@@ -102,6 +102,7 @@ pub type State {
     first_execution_run_id: String,
     continued_from_run_id: String,
     memo: Dict(String, Payload),
+    headers: Dict(String, Payload),
     history_length: Int,
     continue_as_new_suggested: Bool,
     arguments: List(Payload),
@@ -186,6 +187,7 @@ pub fn run(
     first_execution_run_id: "",
     continued_from_run_id: "",
     memo: dict.new(),
+    headers: dict.new(),
     history_length: 0,
     continue_as_new_suggested: False,
     arguments: [],
@@ -499,6 +501,7 @@ fn apply_job(job: bridge.Job) -> Nil {
       first_execution_run_id:,
       continued_from_run_id:,
       memo:,
+      headers:,
     ) ->
       put(
         State(
@@ -511,6 +514,7 @@ fn apply_job(job: bridge.Job) -> Nil {
           first_execution_run_id:,
           continued_from_run_id:,
           memo:,
+          headers:,
         ),
       )
     bridge.FireTimer(seq) -> {

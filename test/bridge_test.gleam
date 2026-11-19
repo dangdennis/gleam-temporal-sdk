@@ -67,6 +67,7 @@ pub fn every_job_arrives_as_the_gleam_type_describes_it_test() {
           first_execution_run_id: "first",
           continued_from_run_id: "previous",
           memo: dict.from_list([#("key", payload("2"))]),
+          headers: dict.from_list([#("trace", payload("8"))]),
         ),
         bridge.FireTimer(11),
         bridge.ResolveActivity(12, bridge.Completed(Some(payload("3")))),
@@ -128,6 +129,7 @@ pub fn an_activity_task_arrives_as_the_gleam_type_describes_it_test() {
       heartbeat_timeout_ms: Some(700),
       scheduled_time_ms: 4321,
       is_local: True,
+      headers: dict.from_list([#("trace", payload("3"))]),
     )
 }
 
@@ -162,9 +164,10 @@ fn commands() -> List(#(bridge.Command, List(String))) {
         retry: Some(retry()),
         schedule_to_start_ms: Some(14_000),
         cancellation_type: 1,
+        headers: dict.from_list([#("h-activity", payload("14"))]),
       ),
       [
-        "ScheduleActivity", "seq: 3", "activity_id: \"a-id\"",
+        "ScheduleActivity", "seq: 3", "\"h-activity\"", "activity_id: \"a-id\"",
         "activity_type: \"a-type\"", "task_queue: \"a-queue\"",
         "schedule_to_close_timeout: Some(Duration { seconds: 11",
         "start_to_close_timeout: Some(Duration { seconds: 12",
@@ -214,11 +217,13 @@ fn commands() -> List(#(bridge.Command, List(String))) {
           memo: dict.from_list([#("m-key", payload("6"))]),
           search_attributes: dict.from_list([#("s-key", payload("7"))]),
           cancellation_type: 2,
+          headers: dict.from_list([#("h-child", payload("16"))]),
         ),
       ),
       [
-        "StartChildWorkflowExecution", "seq: 5", "workflow_id: \"ch-id\"",
-        "workflow_type: \"ch-type\"", "task_queue: \"ch-queue\"",
+        "StartChildWorkflowExecution", "seq: 5", "\"h-child\"",
+        "workflow_id: \"ch-id\"", "workflow_type: \"ch-type\"",
+        "task_queue: \"ch-queue\"",
         "workflow_execution_timeout: Some(Duration { seconds: 21",
         "workflow_run_timeout: Some(Duration { seconds: 22",
         "workflow_task_timeout: Some(Duration { seconds: 23",
@@ -244,10 +249,11 @@ fn commands() -> List(#(bridge.Command, List(String))) {
         retry: Some(retry()),
         local_retry_threshold_ms: Some(35_000),
         cancellation_type: 2,
+        headers: dict.from_list([#("h-local", payload("15"))]),
       ),
       [
-        "ScheduleLocalActivity", "seq: 7", "activity_id: \"l-id\"",
-        "activity_type: \"l-type\"", "attempt: 2",
+        "ScheduleLocalActivity", "seq: 7", "\"h-local\"",
+        "activity_id: \"l-id\"", "activity_type: \"l-type\"", "attempt: 2",
         "original_schedule_time: Some(Timestamp { seconds: 31",
         "schedule_to_close_timeout: Some(Duration { seconds: 32",
         "schedule_to_start_timeout: Some(Duration { seconds: 33",

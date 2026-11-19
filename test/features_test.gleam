@@ -77,6 +77,9 @@ fn double() {
 
 fn activities() -> List(activity.Handler) {
   [
+    activity.handler(read_trace(), fn(ctx, _) {
+      Ok(trace_of(activity.info(ctx).headers))
+    }),
     activity.handler(patient(), patient_activity),
     activity.handler(note(), fn(ctx, text) {
       Ok(record(activity.info(ctx).workflow_id, text))
@@ -336,8 +339,36 @@ fn failing() {
   workflow.Definition("failing", codec.nil(), codec.nil())
 }
 
+fn traced() {
+  workflow.Definition("traced", codec.nil(), codec.string())
+}
+
+fn read_trace() {
+  activity.Definition("read_trace", codec.nil(), codec.string())
+}
+
+/// Reports the trace header as the workflow and as its activity see it.
+fn traced_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
+  let seen = trace_of(workflow.headers(ctx))
+  use by_activity <- result.map(workflow.execute_activity(
+    ctx,
+    read_trace(),
+    Nil,
+    options(),
+  ))
+  seen <> " then " <> by_activity
+}
+
+fn trace_of(headers) -> String {
+  case dict.get(headers, "trace") {
+    Ok(payload) -> result.unwrap(codec.decode(codec.string(), payload), "?")
+    Error(Nil) -> "none"
+  }
+}
+
 fn workflows() -> List(workflow.Handler) {
   [
+    workflow.handler(traced(), traced_workflow),
     workflow.handler(scoped(), scoped_workflow),
     workflow.handler(tidy(), tidy_workflow),
     workflow.handler(deadline(), deadline_workflow),
@@ -691,4 +722,18 @@ fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
   |> worker.with_workflow_middleware(tag_failures)
   |> worker.with_activity_middleware(count_activities)
   |> worker.with_outbound_activity(outbound().activity)
+}
+
+pub fn headers_travel_from_the_client_to_the_workflow_and_its_activities_test() {
+  use env <- in_both_modes("traced")
+  let options =
+    client.StartOptions(
+      ..start_options(env),
+      headers: dict.from_list([
+        #("trace", codec.encode(codec.string(), "trace-42")),
+      ]),
+    )
+  let assert Ok(handle) = client.start(env.client, traced(), Nil, options)
+  assert client.result(handle) == Ok("trace-42 then trace-42")
+  assert_replays(handle)
 }

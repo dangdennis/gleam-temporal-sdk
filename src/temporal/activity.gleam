@@ -1,6 +1,7 @@
 //// Define and implement activities: the functions where a workflow's side effects happen.
 //// Activity code is ordinary Gleam and may do anything; the server retries it on failure.
 
+import gleam/dict.{type Dict}
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/time/duration.{type Duration}
@@ -36,6 +37,8 @@ pub type Info {
     scheduled_time: Timestamp,
     /// Whether the workflow started this as a local activity.
     is_local: Bool,
+    /// Context, such as a trace id, that the workflow passed beside the arguments.
+    headers: Dict(String, Payload),
   )
 }
 

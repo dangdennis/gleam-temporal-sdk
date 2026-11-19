@@ -283,6 +283,7 @@ fn run_activity(
     heartbeat_timeout_ms:,
     scheduled_time_ms:,
     is_local:,
+    headers:,
   ) = task
   let ctx =
     activity.new_context(
@@ -299,6 +300,7 @@ fn run_activity(
         heartbeat_timeout: time.option_from_ms(heartbeat_timeout_ms),
         scheduled_time: time.timestamp(scheduled_time_ms),
         is_local:,
+        headers:,
       ),
       // A local activity has no heartbeat: the workflow task it runs in is its lease.
       heartbeat: fn(details) {

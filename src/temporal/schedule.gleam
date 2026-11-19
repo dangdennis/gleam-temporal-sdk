@@ -289,6 +289,7 @@ fn to_request(action: Action) -> bridge.StartRequest {
     cron_schedule: "",
     request_id: "",
     callbacks: [],
+    headers: dict.new(),
   )
 }
 

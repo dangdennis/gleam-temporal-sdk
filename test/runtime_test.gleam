@@ -76,6 +76,7 @@ fn init(workflow_type: String, input: Int) -> bridge.Job {
     "run",
     "",
     dict.new(),
+    dict.new(),
   )
 }
 
@@ -503,6 +504,8 @@ pub fn info_and_memo_come_from_the_start_event_test() {
         assert info.continue_as_new_suggested
         assert workflow.memo(ctx, "trace", codec.string()) == Some("abc")
         assert workflow.memo(ctx, "missing", codec.string()) == None
+        assert dict.get(workflow.headers(ctx), "span")
+          == Ok(codec.encode(codec.string(), "s-1"))
         Ok(info.history_length)
       }),
     )
@@ -523,6 +526,7 @@ pub fn info_and_memo_come_from_the_start_event_test() {
           "first-run",
           "previous-run",
           dict.from_list([#("trace", codec.encode(codec.string(), "abc"))]),
+          dict.from_list([#("span", codec.encode(codec.string(), "s-1"))]),
         ),
       ],
       True,
@@ -631,7 +635,17 @@ pub fn uuid4_is_well_formed_test() {
     )
   let assert [bridge.CompleteWorkflow(Some(payload))] =
     activate(run, [
-      bridge.InitializeWorkflow("uuid", "wf", [], 7, 1, "run", "", dict.new()),
+      bridge.InitializeWorkflow(
+        "uuid",
+        "wf",
+        [],
+        7,
+        1,
+        "run",
+        "",
+        dict.new(),
+        dict.new(),
+      ),
     ])
   let assert Ok(<<
     _:bytes-size(14),
@@ -739,6 +753,7 @@ pub fn invalid_input_fails_the_workflow_test() {
         1,
         "run",
         "",
+        dict.new(),
         dict.new(),
       ),
     ])
@@ -1128,4 +1143,53 @@ pub fn a_scope_forgets_operations_that_have_settled_test() {
   let assert Ok(remembered) = codec.decode(codec.int(), remembered)
   // Far fewer than the two hundred timers the workflow's scope has seen.
   assert remembered <= 64
+}
+
+pub fn a_workflow_passes_its_headers_on_to_what_it_starts_test() {
+  let headers =
+    dict.from_list([#("trace", codec.encode(codec.string(), "t-1"))])
+  let definition = workflow.Definition("kid", codec.int(), codec.int())
+  let run =
+    start(
+      int_workflow("traced", fn(ctx, n) {
+        let _ = workflow.start_activity(ctx, double(), n, options())
+        child.execute(ctx, definition, n, child.options(workflow_id: "kid"))
+      }),
+    )
+  bridge.send_activation(
+    run.0,
+    Activation(
+      "run",
+      1000,
+      False,
+      3,
+      [
+        bridge.InitializeWorkflow(
+          "traced",
+          "wf",
+          [codec.encode(codec.int(), 1)],
+          42,
+          1,
+          "run",
+          "",
+          dict.new(),
+          headers,
+        ),
+      ],
+      False,
+    ),
+  )
+  let assert Ok(bridge.Success(
+    "run",
+    [
+      bridge.ScheduleActivity(headers: on_activity, ..),
+      bridge.StartChildWorkflow(
+        options: bridge.ChildStartOptions(headers: on_child, ..),
+        ..,
+      ),
+    ],
+    _,
+  )) = process.receive(run.1, 1000)
+  assert on_activity == headers
+  assert on_child == headers
 }

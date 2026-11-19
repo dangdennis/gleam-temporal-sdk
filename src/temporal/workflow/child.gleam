@@ -116,6 +116,7 @@ pub fn start(
           workflow_id: options.workflow_id,
           task_queue: option.unwrap(options.task_queue, state.task_queue),
           arguments: codec.encode_arguments(definition.input, input),
+          headers: state.headers,
         ))
       runtime.push(bridge.StartChildWorkflow(
         seq:,
@@ -146,6 +147,7 @@ pub fn start(
             WaitUntilCancelled -> 2
             WaitUntilRequested -> 3
           },
+          headers: call.headers,
         ),
       ))
       runtime.register(workflow.scope_of(ctx), runtime.ChildOp(seq))

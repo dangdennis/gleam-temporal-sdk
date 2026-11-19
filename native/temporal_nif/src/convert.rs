@@ -223,6 +223,7 @@ fn encode_job<'a>(env: Env<'a>, job: Job) -> Term<'a> {
                 j.first_execution_run_id.encode(env),
                 j.continued_from_execution_run_id.encode(env),
                 encode_payload_map(env, &j.memo.map(|m| m.fields).unwrap_or_default()),
+                encode_payload_map(env, &j.headers),
             ],
         ),
         Job::FireTimer(j) => rec(env, "fire_timer", &[j.seq.encode(env)]),
@@ -402,6 +403,7 @@ pub fn encode_activity_task<'a>(env: Env<'a>, t: ActivityTask) -> Term<'a> {
                     ),
                     millis(s.scheduled_time).encode(env),
                     s.is_local.encode(env),
+                    encode_payload_map(env, &s.header_fields),
                 ],
             )
         }
@@ -573,6 +575,7 @@ fn decode_command(term: Term, namespace: &str) -> DecodeResult<WorkflowCommand> 
             retry_policy: opt(field(&f, 8)?).map(decode_retry).transpose()?,
             schedule_to_start_timeout: decode_opt_ms(field(&f, 9)?)?,
             cancellation_type: get(&f, 10)?,
+            headers: decode_payload_map(field(&f, 11)?)?,
             ..Default::default()
         }),
         "request_cancel_activity" => {
@@ -630,6 +633,7 @@ fn decode_command(term: Term, namespace: &str) -> DecodeResult<WorkflowCommand> 
                 memo: decode_payload_map(field(&o, 6)?)?,
                 search_attributes: decode_search_attributes(field(&o, 7)?)?,
                 cancellation_type: get(&o, 8)?,
+                headers: decode_payload_map(field(&o, 9)?)?,
                 ..Default::default()
             })
         }
@@ -655,6 +659,7 @@ fn decode_command(term: Term, namespace: &str) -> DecodeResult<WorkflowCommand> 
             retry_policy: opt(field(&f, 9)?).map(decode_retry).transpose()?,
             local_retry_threshold: decode_opt_ms(field(&f, 10)?)?,
             cancellation_type: get(&f, 11)?,
+            headers: decode_payload_map(field(&f, 12)?)?,
             ..Default::default()
         }),
         "request_cancel_local_activity" => {

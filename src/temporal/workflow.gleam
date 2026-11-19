@@ -286,6 +286,13 @@ pub fn memo(_ctx: Context, key: String, value_codec: Codec(a)) -> Option(a) {
   }
 }
 
+/// The headers the workflow was started with: context, such as a trace id, that travels
+/// beside the arguments. They are passed on to the activities and child workflows the
+/// workflow starts unless outbound middleware changes them.
+pub fn headers(_ctx: Context) -> Dict(String, Payload) {
+  runtime.get().headers
+}
+
 /// The workflow's current time in milliseconds since the Unix epoch. It is the time of the
 /// workflow task being processed, so it is the same on replay.
 pub fn now(_ctx: Context) -> Timestamp {
@@ -659,26 +666,26 @@ pub fn start_activity(
           activity_type: definition.name,
           task_queue: option.unwrap(options.task_queue, state.task_queue),
           arguments: codec.encode_arguments(definition.input, input),
+          headers: state.headers,
         ))
-      runtime.push(
-        bridge.ScheduleActivity(
-          seq:,
-          activity_id: int.to_string(seq),
-          activity_type: call.activity_type,
-          task_queue: call.task_queue,
-          arguments: call.arguments,
-          schedule_to_close_ms: time.option_to_ms(options.schedule_to_close),
-          start_to_close_ms: Some(time.to_ms(options.start_to_close)),
-          heartbeat_timeout_ms: time.option_to_ms(options.heartbeat_timeout),
-          retry: option.map(options.retry, to_bridge_retry),
-          schedule_to_start_ms: time.option_to_ms(options.schedule_to_start),
-          cancellation_type: case options.cancellation {
-            TryCancel -> 0
-            WaitCancellationCompleted -> 1
-            AbandonActivity -> 2
-          },
-        ),
-      )
+      runtime.push(bridge.ScheduleActivity(
+        seq:,
+        activity_id: int.to_string(seq),
+        activity_type: call.activity_type,
+        task_queue: call.task_queue,
+        arguments: call.arguments,
+        schedule_to_close_ms: time.option_to_ms(options.schedule_to_close),
+        start_to_close_ms: Some(time.to_ms(options.start_to_close)),
+        heartbeat_timeout_ms: time.option_to_ms(options.heartbeat_timeout),
+        retry: option.map(options.retry, to_bridge_retry),
+        schedule_to_start_ms: time.option_to_ms(options.schedule_to_start),
+        cancellation_type: case options.cancellation {
+          TryCancel -> 0
+          WaitCancellationCompleted -> 1
+          AbandonActivity -> 2
+        },
+        headers: call.headers,
+      ))
       runtime.register(ctx.scope, runtime.ActivityOp(seq))
       resolution(
         fn() { dict.get(runtime.get().activities, seq) },

@@ -70,6 +70,7 @@ pub fn start(
           activity_type: definition.name,
           task_queue: state.task_queue,
           arguments: codec.encode_arguments(definition.input, input),
+          headers: state.headers,
         ))
       let seq =
         runtime.start_local(fn(seq) {
@@ -92,6 +93,7 @@ pub fn start(
               workflow.WaitCancellationCompleted -> 1
               workflow.AbandonActivity -> 2
             },
+            headers: call.headers,
           )
         })
       runtime.register(workflow.scope_of(ctx), runtime.ActivityOp(seq))

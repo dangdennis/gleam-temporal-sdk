@@ -36,6 +36,7 @@ pub type Job {
     /// Empty unless this run continues an earlier one.
     continued_from_run_id: String,
     memo: Dict(String, Payload),
+    headers: Dict(String, Payload),
   )
   FireTimer(seq: Int)
   ResolveActivity(seq: Int, result: Resolution)
@@ -115,6 +116,7 @@ pub type Command {
     schedule_to_start_ms: Option(Int),
     /// Core's `ActivityCancellationType` value.
     cancellation_type: Int,
+    headers: Dict(String, Payload),
   )
   RequestCancelActivity(seq: Int)
   RespondToQuery(query_id: String, result: Result(Payload, Failure))
@@ -151,6 +153,7 @@ pub type Command {
     retry: Option(RetryPolicy),
     local_retry_threshold_ms: Option(Int),
     cancellation_type: Int,
+    headers: Dict(String, Payload),
   )
   RequestCancelLocalActivity(seq: Int)
   SignalExternal(
@@ -199,6 +202,7 @@ pub type ChildStartOptions {
     search_attributes: Dict(String, Payload),
     /// Core's `ChildWorkflowCancellationType` value.
     cancellation_type: Int,
+    headers: Dict(String, Payload),
   )
 }
 
@@ -225,6 +229,7 @@ pub type ActivityTask {
     heartbeat_timeout_ms: Option(Int),
     scheduled_time_ms: Int,
     is_local: Bool,
+    headers: Dict(String, Payload),
   )
   ActivityCancel(task_token: BitArray, reason: Int)
 }
@@ -349,6 +354,7 @@ pub type StartRequest {
     request_id: String,
     /// Nexus callbacks to invoke when the workflow closes: `#(url, headers)`.
     callbacks: List(#(String, Dict(String, String))),
+    headers: Dict(String, Payload),
   )
 }
 

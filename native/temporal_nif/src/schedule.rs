@@ -147,6 +147,7 @@ fn action(r: StartRequest) -> ScheduleAction {
             retry_policy: r.retry,
             memo: r.memo,
             search_attributes: r.search_attributes,
+            header: r.header,
             ..Default::default()
         })),
     }
@@ -204,6 +205,7 @@ fn encode_action<'a>(env: Env<'a>, a: Option<ScheduleAction>) -> Term<'a> {
             "".encode(env),
             "".encode(env),
             Vec::<Term>::new().encode(env),
+            encode_payload_map(env, &w.header.map(|h| h.fields).unwrap_or_default()),
         ],
     )
 }

@@ -105,6 +105,9 @@ pub type StartOptions {
     start_delay: Option(Duration),
     /// Run again on this cron timetable. Prefer `temporal/schedule`.
     cron_schedule: Option(String),
+    /// Context, such as a trace id, that travels beside the arguments to the workflow
+    /// and on to the activities and child workflows it starts.
+    headers: Dict(String, Payload),
   )
 }
 
@@ -254,6 +257,7 @@ pub fn start_options(
     search_attributes: dict.new(),
     start_delay: None,
     cron_schedule: None,
+    headers: dict.new(),
   )
 }
 
@@ -289,6 +293,7 @@ pub fn start_request(
     cron_schedule: option.unwrap(options.cron_schedule, ""),
     request_id: "",
     callbacks: [],
+    headers: options.headers,
   )
 }
 

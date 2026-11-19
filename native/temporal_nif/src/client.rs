@@ -5,7 +5,7 @@ use rustler::{Atom, Encoder, Env, LocalPid, ResourceArc, Term};
 use std::{collections::HashMap, time::Duration};
 use temporalio_common::protos::temporal::api::{
     common::v1::{
-        Callback, Memo, Payload, Payloads, RetryPolicy, SearchAttributes, WorkflowExecution,
+        Callback, Header, Memo, Payload, Payloads, RetryPolicy, SearchAttributes, WorkflowExecution,
         WorkflowType, callback,
     },
     enums::v1::HistoryEventFilterType,
@@ -80,6 +80,7 @@ pub struct StartRequest {
     pub cron_schedule: String,
     pub request_id: String,
     pub callbacks: Vec<Callback>,
+    pub header: Option<Header>,
 }
 
 pub fn decode_start_request(term: Term) -> DecodeResult<StartRequest> {
@@ -110,6 +111,10 @@ pub fn decode_start_request(term: Term) -> DecodeResult<StartRequest> {
                 ..Default::default()
             })
             .collect(),
+        header: {
+            let fields = decode_payload_map(field(&f, 16)?)?;
+            (!fields.is_empty()).then_some(Header { fields })
+        },
     })
 }
 
@@ -171,6 +176,7 @@ fn start_workflow<'a>(
                     workflow_start_delay: r.start_delay,
                     cron_schedule: r.cron_schedule,
                     completion_callbacks: r.callbacks,
+                    header: r.header,
                     ..Default::default()
                 };
                 service
@@ -197,6 +203,7 @@ fn start_workflow<'a>(
                     search_attributes: r.search_attributes,
                     workflow_start_delay: r.start_delay,
                     cron_schedule: r.cron_schedule,
+                    header: r.header,
                     signal_name,
                     signal_input: Some(Payloads {
                         payloads: signal_input,

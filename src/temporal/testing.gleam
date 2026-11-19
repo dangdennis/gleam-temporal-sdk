@@ -14,6 +14,7 @@
 //// testing.stop(env)
 //// ```
 
+import gleam/dict
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -171,6 +172,7 @@ pub fn activity_info() -> activity.Info {
     heartbeat_timeout: None,
     scheduled_time: time.timestamp(0),
     is_local: False,
+    headers: dict.new(),
   )
 }
 

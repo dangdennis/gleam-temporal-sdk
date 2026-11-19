@@ -91,6 +91,7 @@ fn sample_activation(env: Env) -> Term {
             memo: Some(Memo {
                 fields: [("key".to_string(), payload("2"))].into(),
             }),
+            headers: [("trace".to_string(), payload("8"))].into(),
             ..Default::default()
         }),
         Job::FireTimer(wa::FireTimer { seq: 11 }),
@@ -234,6 +235,7 @@ fn sample_activity_task(env: Env) -> Term {
                 start_to_close_timeout: Some(duration(6000)),
                 heartbeat_timeout: Some(duration(700)),
                 is_local: true,
+                header_fields: [("trace".to_string(), payload("3"))].into(),
                 run_id: "run-id".to_string(),
                 ..Default::default()
             })),
