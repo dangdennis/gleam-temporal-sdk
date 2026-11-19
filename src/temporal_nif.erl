@@ -3,7 +3,7 @@
 %% calling these directly.
 -module(temporal_nif).
 
--export([connect/7, update_with_start/6, complete_activity_async/5, debug_completion/2, debug_activity_result/1, debug_nexus_result/1,
+-export([connect/7, start_metrics/1, update_with_start/6, complete_activity_async/5, debug_completion/2, debug_activity_result/1, debug_nexus_result/1,
          sample_activation/0, sample_activity_task/0, update_workflow/6, poll_update/6, worker_poll_nexus/3,
          worker_complete_nexus/5, schedule_put/7, schedule_describe/4, schedule_delete/4,
          schedule_patch/5, schedule_list/3, server_start/4, server_stop/3, time_control/4, describe_workflow/5, list_workflows/5, count_workflows/4, worker_new/5, replay_worker_new/2, worker_poll_workflow/3,
@@ -59,3 +59,4 @@ sample_activation() -> erlang:nif_error(nif_not_loaded).
 sample_activity_task() -> erlang:nif_error(nif_not_loaded).
 update_with_start(_, _, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
 complete_activity_async(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
+start_metrics(_) -> erlang:nif_error(nif_not_loaded).

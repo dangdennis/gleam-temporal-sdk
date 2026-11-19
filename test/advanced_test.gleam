@@ -22,6 +22,7 @@ import temporal/encryption
 import temporal/failure.{type Failure}
 import temporal/nexus
 import temporal/replayer
+import temporal/telemetry
 import temporal/worker
 import temporal/workflow.{type Context}
 import temporal/workflow/local_activity
@@ -811,4 +812,56 @@ pub fn an_activity_can_be_finished_later_from_outside_test() {
   let assert Error(client.WorkflowFailed(failed)) = client.result(refused)
   assert failure.root_cause(failed).message == "declined"
   worker.stop(worker)
+}
+
+// ---- metrics ----
+
+/// Entry point of a process that serves metrics and runs one workflow. Metrics have to be
+/// configured before anything else touches the runtime, so this cannot share the test
+/// suite's process.
+pub fn metered_worker(port: String, task_queue: String) -> Nil {
+  let assert Ok(_) = telemetry.serve_prometheus("127.0.0.1:" <> port)
+  let client = support.local_client()
+  let assert Ok(_) =
+    worker.new(client, task_queue)
+    |> worker.with_workflows([workflow.handler(doubling(), doubling_workflow)])
+    |> worker.with_activities(activities("unversioned"))
+    |> worker.start
+  let assert Ok(42) =
+    client.execute(
+      client,
+      doubling(),
+      21,
+      client.start_options(workflow_id: task_queue, task_queue:),
+    )
+  process.sleep_forever()
+}
+
+pub fn metrics_are_served_for_prometheus_test() {
+  let port = "19464"
+  let task_queue = "metered-" <> unique()
+  let os_pid =
+    cmd(
+      "erl -noshell -pa build/dev/erlang/*/ebin -eval 'advanced_test:metered_worker(<<\""
+      <> port
+      <> "\">>, <<\""
+      <> task_queue
+      <> "\">>)' >/dev/null 2>&1 & echo $!",
+    )
+    |> string.trim
+  let scrape = fn() { cmd("curl -s http://127.0.0.1:" <> port <> "/metrics") }
+  // Counted once the workflow has completed on this task queue.
+  let served =
+    eventually(fn() {
+      let metrics = scrape()
+      string.contains(metrics, "temporal_workflow_completed")
+      && string.contains(metrics, task_queue)
+    })
+  let _ = cmd("kill -9 " <> os_pid)
+  assert served
+}
+
+pub fn metrics_cannot_be_configured_once_the_runtime_has_started_test() {
+  let _ = support.local_client()
+  let assert Error(_) = telemetry.serve_prometheus("127.0.0.1:0")
 }

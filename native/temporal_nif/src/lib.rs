@@ -18,11 +18,13 @@ use futures_util::stream;
 use prost::Message;
 use rustler::{Atom, Binary, Encoder, Env, LocalPid, OwnedEnv, ResourceArc, Term};
 use std::{
+    net::SocketAddr,
     str::FromStr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use temporalio_client::{ClientTlsOptions, Connection, ConnectionOptions, TlsOptions};
+use temporalio_common::telemetry::{PrometheusExporterOptions, start_prometheus_metric_exporter};
 use temporalio_common::{
     protos::{
         coresdk::{
@@ -80,12 +82,66 @@ impl rustler::Resource for WorkerRes {
     }
 }
 
+/// Where to serve Prometheus metrics, if asked before the runtime started.
+static METRICS_ADDRESS: Mutex<Option<SocketAddr>> = Mutex::new(None);
+/// Where they are being served.
+static METRICS_BOUND: OnceLock<Result<SocketAddr, String>> = OnceLock::new();
+static RUNTIME: OnceLock<CoreRuntime> = OnceLock::new();
+
 pub fn runtime() -> &'static CoreRuntime {
-    static RT: OnceLock<CoreRuntime> = OnceLock::new();
-    RT.get_or_init(|| {
-        CoreRuntime::new(RuntimeOptions::default(), TokioRuntimeBuilder::default())
-            .expect("failed to start the Temporal core runtime")
+    RUNTIME.get_or_init(|| {
+        let mut runtime =
+            CoreRuntime::new(RuntimeOptions::default(), TokioRuntimeBuilder::default())
+                .expect("failed to start the Temporal core runtime");
+        if let Some(socket_addr) = METRICS_ADDRESS.lock().ok().and_then(|a| *a) {
+            let started = {
+                let _guard = runtime.tokio_handle().enter();
+                start_prometheus_metric_exporter(
+                    PrometheusExporterOptions::builder()
+                        .socket_addr(socket_addr)
+                        .build(),
+                )
+            };
+            let bound = match started {
+                Ok(server) => {
+                    runtime
+                        .telemetry_mut()
+                        .attach_late_init_metrics(server.meter);
+                    Ok(server.bound_addr)
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = METRICS_BOUND.set(bound);
+        }
+        runtime
     })
+}
+
+/// Serve the worker's and client's metrics in Prometheus format on `address`. Has to be
+/// called before anything else here, because the runtime reads it once, when it starts.
+/// Answers the address being served, which differs from the one asked for when that named
+/// port 0.
+#[rustler::nif]
+fn start_metrics<'a>(env: Env<'a>, address: String) -> Term<'a> {
+    if RUNTIME.get().is_some() {
+        return err(
+            env,
+            "metrics must be configured before the first connection or worker is made",
+        );
+    }
+    let address: SocketAddr = match address.parse() {
+        Ok(a) => a,
+        Err(e) => return err(env, format!("invalid address: {e}")),
+    };
+    if let Ok(mut wanted) = METRICS_ADDRESS.lock() {
+        *wanted = Some(address);
+    }
+    runtime();
+    match METRICS_BOUND.get() {
+        Some(Ok(bound)) => ok(env, Encoder::encode(&bound.to_string(), env)),
+        Some(Err(e)) => err(env, e),
+        None => err(env, "metrics could not be started"),
+    }
 }
 
 /// Run `fut` on the core runtime, then send `{temporal_nif, Ref, reply}` to `pid`. `reply`
