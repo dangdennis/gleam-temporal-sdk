@@ -1,8 +1,9 @@
 //// The types exchanged with the Rust NIF and the NIF's functions.
 ////
-//// `native/temporal_nif/src/convert.rs` builds and reads these values by their Erlang
-//// representation, so a constructor's name, field order and field types are part of the
-//// contract with that file: change both together.
+//// The Rust side of each type is generated from this file: after changing a type here,
+//// run `bin/codegen` and fix what the Rust compiler then points at. CI fails if the
+//// generated file is stale. `Payload` and `Failure` live in their own modules and are
+//// still matched by hand, in `native/temporal_nif/src/convert.rs`.
 
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid}

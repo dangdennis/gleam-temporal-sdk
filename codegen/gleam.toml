@@ -1,0 +1,9 @@
+name = "codegen"
+version = "1.0.0"
+description = "Generates the Rust side of the SDK's Gleam-Rust boundary; see bin/codegen"
+target = "erlang"
+
+[dependencies]
+gleam_stdlib = ">= 0.60.0 and < 2.0.0"
+glance = ">= 7.0.0 and < 8.0.0"
+simplifile = ">= 2.7.0 and < 3.0.0"

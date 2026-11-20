@@ -1,12 +1,21 @@
-//! Conversions between core's protobuf messages and the Erlang representation of the Gleam
-//! types in `temporal/internal/bridge`. A Gleam record `Foo(a, b)` is the tuple `{foo, A, B}`,
-//! a field-less constructor is a bare atom, and `Option` is `{some, X}` or `none`.
+//! Conversions between core's protobuf messages and the Gleam types in
+//! `temporal/internal/bridge`.
+//!
+//! Nothing here builds or reads a bridge type's term by position. `bridge.rs`, generated
+//! from the Gleam types, has a struct or enum for each with the same constructor and field
+//! names, and `wire.rs` turns those into terms and back. Towards Gleam, a function here
+//! builds the bridge value from core's message, and the caller writes it with `to_term`.
+//! From Gleam, the term is read with `from_term` and then taken apart field by field, with
+//! no `..`, so that a field added in Gleam does not compile here until it is handled.
+//!
+//! `temporal/codec.Payload` and `temporal/failure.Failure` are the exception: they are not
+//! bridge types, and are read straight into core's messages by hand below.
 
-use crate::atoms;
-use rustler::{
-    Atom, Binary, Encoder, Env, MapIterator, NewBinary, Term,
-    types::tuple::{get_tuple, make_tuple},
+use crate::{
+    bridge,
+    wire::{Bytes, DecodeResult, Wire, at, atom, binary, record, untag},
 };
+use rustler::{Encoder, Env, Term};
 use std::collections::HashMap;
 use temporalio_common::protos::{
     coresdk::{
@@ -16,6 +25,7 @@ use temporalio_common::protos::{
         },
         activity_task::{ActivityTask, activity_task},
         child_workflow::{ChildWorkflowResult, child_workflow_result},
+        nexus::{NexusTask, NexusTaskCompletion},
         workflow_activation::{
             WorkflowActivation, resolve_child_workflow_execution_start as child_start,
             workflow_activation_job::Variant as Job,
@@ -28,41 +38,6 @@ use temporalio_common::protos::{
         failure::v1::{ApplicationFailureInfo, CanceledFailureInfo, Failure, failure::FailureInfo},
     },
 };
-
-pub type DecodeResult<T> = Result<T, String>;
-
-pub fn atom<'a>(env: Env<'a>, name: &str) -> Term<'a> {
-    Atom::from_str(env, name)
-        .expect("atom names are short ASCII")
-        .to_term(env)
-}
-
-/// A Gleam record: `{tag, Fields...}`.
-pub fn rec<'a>(env: Env<'a>, tag: &str, fields: &[Term<'a>]) -> Term<'a> {
-    let mut terms = Vec::with_capacity(fields.len() + 1);
-    terms.push(atom(env, tag));
-    terms.extend_from_slice(fields);
-    make_tuple(env, &terms)
-}
-
-pub fn bin<'a>(env: Env<'a>, bytes: &[u8]) -> Term<'a> {
-    let mut b = NewBinary::new(env, bytes.len());
-    b.as_mut_slice().copy_from_slice(bytes);
-    b.into()
-}
-
-pub fn option<'a>(env: Env<'a>, value: Option<Term<'a>>) -> Term<'a> {
-    match value {
-        Some(t) => (atoms::some(), t).encode(env),
-        None => atoms::none().encode(env),
-    }
-}
-
-/// Decode a Gleam `Option`, yielding the inner term for `Some`.
-pub fn opt(term: Term) -> Option<Term> {
-    let parts = get_tuple(term).ok()?;
-    (parts.len() == 2).then(|| parts[1])
-}
 
 pub fn millis(ts: Option<impl Into<prost_wkt_types::Timestamp>>) -> i64 {
     ts.map(|t| {
@@ -83,33 +58,70 @@ pub fn duration(ms: u64) -> prost_wkt_types::Duration {
     }
 }
 
-// ---- encoding (core -> Gleam) ----
+pub fn timestamp(ms: i64) -> prost_wkt_types::Timestamp {
+    prost_wkt_types::Timestamp {
+        seconds: ms.div_euclid(1000),
+        nanos: (ms.rem_euclid(1000) * 1_000_000) as i32,
+    }
+}
+
+/// A Gleam `Int` in the width core wants. Gleam's has no size, so one that does not fit is
+/// reported by the name of its field.
+pub fn n<T: TryFrom<i64>>(value: i64, name: &str) -> DecodeResult<T> {
+    T::try_from(value).map_err(|_| format!("{name}: {value} is out of range"))
+}
+
+/// A length of time in milliseconds, which cannot be negative.
+pub fn ms(value: i64, name: &str) -> DecodeResult<prost_wkt_types::Duration> {
+    let value: u64 = value
+        .try_into()
+        .map_err(|_| format!("{name}: a duration must be a non-negative Int"))?;
+    Ok(duration(value))
+}
+
+pub fn opt_ms(value: Option<i64>, name: &str) -> DecodeResult<Option<prost_wkt_types::Duration>> {
+    value.map(|value| ms(value, name)).transpose()
+}
+
+/// A count from core as a Gleam `Int`. Core's unsigned counts never get near the limit.
+pub fn count(value: impl TryInto<i64>) -> i64 {
+    value.try_into().unwrap_or(i64::MAX)
+}
+
+// A memo or set of search attributes with nothing in it is sent as none at all.
+
+pub fn memo(fields: HashMap<String, Payload>) -> Option<Memo> {
+    (!fields.is_empty()).then_some(Memo { fields })
+}
+
+pub fn search_attributes(indexed_fields: HashMap<String, Payload>) -> Option<SearchAttributes> {
+    (!indexed_fields.is_empty()).then_some(SearchAttributes { indexed_fields })
+}
+
+// ---- payloads and failures, by hand ----
 
 pub fn encode_payload<'a>(env: Env<'a>, p: &Payload) -> Term<'a> {
     let mut metadata = Term::map_new(env);
     for (k, v) in &p.metadata {
         metadata = metadata
-            .map_put(k.as_str(), bin(env, v))
+            .map_put(k.as_str(), binary(env, v))
             .expect("map_put on a map");
     }
-    rec(env, "payload", &[metadata, bin(env, &p.data)])
+    record(env, "payload", &[metadata, binary(env, &p.data)])
 }
 
-pub fn encode_payload_map<'a>(env: Env<'a>, m: &HashMap<String, Payload>) -> Term<'a> {
-    let mut map = Term::map_new(env);
-    for (k, v) in m {
-        map = map
-            .map_put(k.as_str(), encode_payload(env, v))
-            .expect("map_put on a map");
+pub fn decode_payload(term: Term) -> DecodeResult<Payload> {
+    let (_, f) = untag(term)?;
+    if f.len() != 2 {
+        return Err("expected a Payload".to_string());
     }
-    map
-}
-
-pub fn encode_payloads<'a>(env: Env<'a>, ps: &[Payload]) -> Term<'a> {
-    ps.iter()
-        .map(|p| encode_payload(env, p))
-        .collect::<Vec<_>>()
-        .encode(env)
+    let metadata: HashMap<String, Bytes> = at(&f, 0, "Payload.metadata")?;
+    let data: Bytes = at(&f, 1, "Payload.data")?;
+    Ok(Payload {
+        metadata: metadata.into_iter().map(|(k, v)| (k, v.0)).collect(),
+        data: data.0,
+        ..Default::default()
+    })
 }
 
 pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
@@ -129,371 +141,39 @@ pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
         }
         _ => ("other", "", false),
     };
-    let cause = option(env, f.cause.as_deref().map(|c| encode_failure(env, c)));
+    let error_type = (!error_type.is_empty()).then(|| error_type.to_string());
     let details = match &f.failure_info {
         Some(FailureInfo::ApplicationFailureInfo(i)) => i.details.as_ref(),
         Some(FailureInfo::CanceledFailureInfo(i)) => i.details.as_ref(),
         _ => None,
     };
-    let details = encode_payloads(env, details.map(|d| d.payloads.as_slice()).unwrap_or(&[]));
-    rec(
+    let details: Vec<Term> = details
+        .map(|d| d.payloads.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .map(|p| encode_payload(env, p))
+        .collect();
+    record(
         env,
         "failure",
         &[
-            f.message.encode(env),
+            f.message.to_term(env),
             atom(env, kind),
-            option(
-                env,
-                (!error_type.is_empty()).then(|| error_type.encode(env)),
-            ),
-            non_retryable.encode(env),
-            cause,
-            details,
+            error_type.to_term(env),
+            non_retryable.to_term(env),
+            f.cause.to_term(env),
+            details.encode(env),
         ],
     )
-}
-
-fn failure_or_default<'a>(env: Env<'a>, f: &Option<Failure>) -> Term<'a> {
-    match f {
-        Some(f) => encode_failure(env, f),
-        None => encode_failure(env, &Failure::default()),
-    }
-}
-
-fn encode_activity_resolution<'a>(env: Env<'a>, r: Option<ActivityResolution>) -> Term<'a> {
-    match r.and_then(|r| r.status) {
-        Some(activity_resolution::Status::Completed(s)) => rec(
-            env,
-            "completed",
-            &[option(
-                env,
-                s.result.as_ref().map(|p| encode_payload(env, p)),
-            )],
-        ),
-        Some(activity_resolution::Status::Failed(f)) => {
-            rec(env, "failed", &[failure_or_default(env, &f.failure)])
-        }
-        Some(activity_resolution::Status::Cancelled(c)) => {
-            rec(env, "cancelled", &[failure_or_default(env, &c.failure)])
-        }
-        Some(activity_resolution::Status::Backoff(b)) => rec(
-            env,
-            "backoff",
-            &[
-                b.attempt.encode(env),
-                duration_ms(b.backoff_duration).unwrap_or(0).encode(env),
-                millis(b.original_schedule_time).encode(env),
-            ],
-        ),
-        None => rec(env, "failed", &[failure_or_default(env, &None)]),
-    }
-}
-
-fn encode_child_result<'a>(env: Env<'a>, r: Option<ChildWorkflowResult>) -> Term<'a> {
-    match r.and_then(|r| r.status) {
-        Some(child_workflow_result::Status::Completed(s)) => rec(
-            env,
-            "completed",
-            &[option(
-                env,
-                s.result.as_ref().map(|p| encode_payload(env, p)),
-            )],
-        ),
-        Some(child_workflow_result::Status::Failed(f)) => {
-            rec(env, "failed", &[failure_or_default(env, &f.failure)])
-        }
-        Some(child_workflow_result::Status::Cancelled(c)) => {
-            rec(env, "cancelled", &[failure_or_default(env, &c.failure)])
-        }
-        None => rec(env, "failed", &[failure_or_default(env, &None)]),
-    }
-}
-
-fn encode_job<'a>(env: Env<'a>, job: Job) -> Term<'a> {
-    match job {
-        Job::InitializeWorkflow(j) => rec(
-            env,
-            "initialize_workflow",
-            &[
-                j.workflow_type.encode(env),
-                j.workflow_id.encode(env),
-                encode_payloads(env, &j.arguments),
-                j.randomness_seed.encode(env),
-                j.attempt.encode(env),
-                j.first_execution_run_id.encode(env),
-                j.continued_from_execution_run_id.encode(env),
-                encode_payload_map(env, &j.memo.map(|m| m.fields).unwrap_or_default()),
-                encode_payload_map(env, &j.headers),
-            ],
-        ),
-        Job::FireTimer(j) => rec(env, "fire_timer", &[j.seq.encode(env)]),
-        Job::ResolveActivity(j) => rec(
-            env,
-            "resolve_activity",
-            &[j.seq.encode(env), encode_activity_resolution(env, j.result)],
-        ),
-        Job::UpdateRandomSeed(j) => {
-            rec(env, "update_random_seed", &[j.randomness_seed.encode(env)])
-        }
-        Job::QueryWorkflow(j) => rec(
-            env,
-            "query_workflow",
-            &[
-                j.query_id.encode(env),
-                j.query_type.encode(env),
-                encode_payloads(env, &j.arguments),
-            ],
-        ),
-        Job::CancelWorkflow(j) => rec(env, "cancel_workflow", &[j.reason.encode(env)]),
-        Job::SignalWorkflow(j) => rec(
-            env,
-            "signal_workflow",
-            &[j.signal_name.encode(env), encode_payloads(env, &j.input)],
-        ),
-        Job::NotifyHasPatch(j) => rec(env, "notify_has_patch", &[j.patch_id.encode(env)]),
-        Job::ResolveChildWorkflowExecutionStart(j) => {
-            let status = match j.status {
-                Some(child_start::Status::Succeeded(s)) => {
-                    rec(env, "child_started", &[s.run_id.encode(env)])
-                }
-                Some(child_start::Status::Failed(f)) => rec(
-                    env,
-                    "child_start_failed",
-                    &[f.workflow_id.encode(env), f.cause.encode(env)],
-                ),
-                Some(child_start::Status::Cancelled(c)) => rec(
-                    env,
-                    "child_start_cancelled",
-                    &[failure_or_default(env, &c.failure)],
-                ),
-                None => rec(env, "child_start_failed", &["".encode(env), 0.encode(env)]),
-            };
-            rec(
-                env,
-                "resolve_child_workflow_start",
-                &[j.seq.encode(env), status],
-            )
-        }
-        Job::ResolveChildWorkflowExecution(j) => rec(
-            env,
-            "resolve_child_workflow",
-            &[j.seq.encode(env), encode_child_result(env, j.result)],
-        ),
-        Job::RemoveFromCache(j) => rec(
-            env,
-            "remove_from_cache",
-            &[j.message.encode(env), j.reason.encode(env)],
-        ),
-        Job::ResolveSignalExternalWorkflow(j) => rec(
-            env,
-            "resolve_external_signal",
-            &[
-                j.seq.encode(env),
-                option(env, j.failure.as_ref().map(|f| encode_failure(env, f))),
-            ],
-        ),
-        Job::ResolveRequestCancelExternalWorkflow(j) => rec(
-            env,
-            "resolve_external_cancel",
-            &[
-                j.seq.encode(env),
-                option(env, j.failure.as_ref().map(|f| encode_failure(env, f))),
-            ],
-        ),
-        Job::DoUpdate(j) => rec(
-            env,
-            "do_update",
-            &[
-                j.id.encode(env),
-                j.protocol_instance_id.encode(env),
-                j.name.encode(env),
-                encode_payloads(env, &j.input),
-                j.run_validator.encode(env),
-            ],
-        ),
-        Job::ResolveNexusOperationStart(j) => {
-            use temporalio_common::protos::coresdk::workflow_activation::resolve_nexus_operation_start::Status;
-            let status = match j.status {
-                Some(Status::OperationToken(token)) => {
-                    rec(env, "nexus_started_async", &[token.encode(env)])
-                }
-                Some(Status::StartedSync(_)) => atom(env, "nexus_started_sync"),
-                Some(Status::Failed(f)) => {
-                    rec(env, "nexus_start_failed", &[encode_failure(env, &f)])
-                }
-                None => rec(
-                    env,
-                    "nexus_start_failed",
-                    &[encode_failure(env, &Failure::default())],
-                ),
-            };
-            rec(env, "resolve_nexus_start", &[j.seq.encode(env), status])
-        }
-        Job::ResolveNexusOperation(j) => {
-            use temporalio_common::protos::coresdk::nexus::nexus_operation_result::Status;
-            let result = match j.result.and_then(|r| r.status) {
-                Some(Status::Completed(p)) => rec(
-                    env,
-                    "completed",
-                    &[option(env, Some(encode_payload(env, &p)))],
-                ),
-                Some(Status::Cancelled(f)) => rec(env, "cancelled", &[encode_failure(env, &f)]),
-                Some(Status::Failed(f)) | Some(Status::TimedOut(f)) => {
-                    rec(env, "failed", &[encode_failure(env, &f)])
-                }
-                None => rec(env, "failed", &[encode_failure(env, &Failure::default())]),
-            };
-            rec(env, "resolve_nexus", &[j.seq.encode(env), result])
-        }
-    }
-}
-
-pub fn encode_activation<'a>(env: Env<'a>, a: WorkflowActivation) -> Term<'a> {
-    let jobs: Vec<Term> = a
-        .jobs
-        .into_iter()
-        .filter_map(|j| j.variant)
-        .map(|j| encode_job(env, j))
-        .collect();
-    rec(
-        env,
-        "activation",
-        &[
-            a.run_id.encode(env),
-            millis(a.timestamp).encode(env),
-            a.is_replaying.encode(env),
-            a.history_length.encode(env),
-            jobs.encode(env),
-            a.continue_as_new_suggested.encode(env),
-        ],
-    )
-}
-
-pub fn encode_activity_task<'a>(env: Env<'a>, t: ActivityTask) -> Term<'a> {
-    let token = bin(env, &t.task_token);
-    match t.variant {
-        Some(activity_task::Variant::Start(s)) => {
-            let workflow_id = s
-                .workflow_execution
-                .as_ref()
-                .map(|e| e.workflow_id.as_str())
-                .unwrap_or("");
-            rec(
-                env,
-                "activity_start",
-                &[
-                    token,
-                    s.activity_type.encode(env),
-                    s.activity_id.encode(env),
-                    workflow_id.encode(env),
-                    s.run_id.encode(env),
-                    encode_payloads(env, &s.input),
-                    s.attempt.encode(env),
-                    encode_payloads(env, &s.heartbeat_details),
-                    s.workflow_type.encode(env),
-                    option(
-                        env,
-                        duration_ms(s.start_to_close_timeout).map(|ms| ms.encode(env)),
-                    ),
-                    option(
-                        env,
-                        duration_ms(s.heartbeat_timeout)
-                            .filter(|ms| *ms > 0)
-                            .map(|ms| ms.encode(env)),
-                    ),
-                    millis(s.scheduled_time).encode(env),
-                    s.is_local.encode(env),
-                    encode_payload_map(env, &s.header_fields),
-                ],
-            )
-        }
-        Some(activity_task::Variant::Cancel(c)) => {
-            rec(env, "activity_cancel", &[token, c.reason.encode(env)])
-        }
-        None => rec(env, "activity_cancel", &[token, 0.encode(env)]),
-    }
-}
-
-// ---- decoding (Gleam -> core) ----
-
-/// Split a record into its tag and fields; a bare atom is a record without fields.
-pub fn untag(term: Term) -> DecodeResult<(String, Vec<Term>)> {
-    if term.is_atom() {
-        return Ok((term.atom_to_string().map_err(|_| "bad atom")?, vec![]));
-    }
-    let parts = get_tuple(term).map_err(|_| "expected a record".to_string())?;
-    let tag = parts
-        .first()
-        .and_then(|t| t.atom_to_string().ok())
-        .ok_or("record without a tag")?;
-    Ok((tag, parts[1..].to_vec()))
-}
-
-pub fn get<'a, T: rustler::Decoder<'a>>(fields: &[Term<'a>], i: usize) -> DecodeResult<T> {
-    fields
-        .get(i)
-        .ok_or_else(|| format!("missing field {i}"))?
-        .decode()
-        .map_err(|_| format!("field {i} has the wrong type"))
-}
-
-pub fn field<'a>(fields: &[Term<'a>], i: usize) -> DecodeResult<Term<'a>> {
-    fields
-        .get(i)
-        .copied()
-        .ok_or_else(|| format!("missing field {i}"))
-}
-
-pub fn decode_payload(term: Term) -> DecodeResult<Payload> {
-    let (_, f) = untag(term)?;
-    let mut metadata = HashMap::new();
-    let iter = MapIterator::new(field(&f, 0)?).ok_or("payload metadata is not a map")?;
-    for (k, v) in iter {
-        let k: String = k.decode().map_err(|_| "bad metadata key")?;
-        let v: Binary = v.decode().map_err(|_| "bad metadata value")?;
-        metadata.insert(k, v.as_slice().to_vec());
-    }
-    let data: Binary = get(&f, 1)?;
-    Ok(Payload {
-        metadata,
-        data: data.as_slice().to_vec(),
-        ..Default::default()
-    })
-}
-
-pub fn decode_payloads(term: Term) -> DecodeResult<Vec<Payload>> {
-    let list: Vec<Term> = term.decode().map_err(|_| "expected a list of payloads")?;
-    list.into_iter().map(decode_payload).collect()
-}
-
-pub fn decode_payload_map(term: Term) -> DecodeResult<HashMap<String, Payload>> {
-    let iter = MapIterator::new(term).ok_or("expected a map of payloads")?;
-    let mut out = HashMap::new();
-    for (k, v) in iter {
-        let k: String = k.decode().map_err(|_| "bad map key")?;
-        out.insert(k, decode_payload(v)?);
-    }
-    Ok(out)
-}
-
-pub fn decode_memo(term: Term) -> DecodeResult<Option<Memo>> {
-    let fields = decode_payload_map(term)?;
-    Ok((!fields.is_empty()).then_some(Memo { fields }))
-}
-
-pub fn decode_search_attributes(term: Term) -> DecodeResult<Option<SearchAttributes>> {
-    let indexed_fields = decode_payload_map(term)?;
-    Ok((!indexed_fields.is_empty()).then_some(SearchAttributes { indexed_fields }))
-}
-
-fn decode_opt_payload(term: Term) -> DecodeResult<Option<Payload>> {
-    opt(term).map(decode_payload).transpose()
 }
 
 pub fn decode_failure(term: Term) -> DecodeResult<Failure> {
     let (_, f) = untag(term)?;
-    let (kind, _) = untag(field(&f, 1)?)?;
-    let details = decode_payloads(field(&f, 5)?)?;
+    if f.len() != 6 {
+        return Err("expected a Failure".to_string());
+    }
+    let (kind, _) = untag(f[1])?;
+    let details: Vec<Payload> = at(&f, 5, "Failure.details")?;
     let details = (!details.is_empty()).then_some(Payloads { payloads: details });
     let info = if kind == "cancelled" {
         FailureInfo::CanceledFailureInfo(CanceledFailureInfo {
@@ -502,241 +182,583 @@ pub fn decode_failure(term: Term) -> DecodeResult<Failure> {
         })
     } else {
         FailureInfo::ApplicationFailureInfo(ApplicationFailureInfo {
-            r#type: opt(field(&f, 2)?)
-                .map(|t| t.decode().map_err(|_| "error type must be a String"))
-                .transpose()?
-                .unwrap_or_default(),
-            non_retryable: get(&f, 3)?,
+            r#type: at::<Option<String>>(&f, 2, "Failure.error_type")?.unwrap_or_default(),
+            non_retryable: at(&f, 3, "Failure.non_retryable")?,
             details,
             ..Default::default()
         })
     };
-    let cause = opt(field(&f, 4)?)
-        .map(decode_failure)
-        .transpose()?
-        .map(Box::new);
     Ok(Failure {
-        message: get(&f, 0)?,
+        message: at(&f, 0, "Failure.message")?,
         source: "GleamSDK".to_string(),
-        cause,
+        cause: at(&f, 4, "Failure.cause")?,
         failure_info: Some(info),
         ..Default::default()
     })
 }
 
-pub fn decode_opt_ms(term: Term) -> DecodeResult<Option<prost_wkt_types::Duration>> {
-    match opt(term) {
-        Some(t) => {
-            let ms: u64 = t
-                .decode()
-                .map_err(|_| "duration must be a non-negative Int")?;
-            Ok(Some(duration(ms)))
+// ---- core -> Gleam ----
+
+fn to_activity_resolution(r: Option<ActivityResolution>) -> bridge::Resolution {
+    match r.and_then(|r| r.status) {
+        Some(activity_resolution::Status::Completed(s)) => {
+            bridge::Resolution::Completed { result: s.result }
         }
-        None => Ok(None),
+        Some(activity_resolution::Status::Failed(f)) => bridge::Resolution::Failed {
+            failure: f.failure.unwrap_or_default(),
+        },
+        Some(activity_resolution::Status::Cancelled(c)) => bridge::Resolution::Cancelled {
+            failure: c.failure.unwrap_or_default(),
+        },
+        Some(activity_resolution::Status::Backoff(b)) => bridge::Resolution::Backoff {
+            attempt: i64::from(b.attempt),
+            backoff_ms: duration_ms(b.backoff_duration).unwrap_or(0),
+            original_schedule_time_ms: millis(b.original_schedule_time),
+        },
+        None => bridge::Resolution::Failed {
+            failure: Failure::default(),
+        },
     }
 }
 
-pub fn decode_retry(term: Term) -> DecodeResult<RetryPolicy> {
-    let (_, f) = untag(term)?;
+fn to_child_resolution(r: Option<ChildWorkflowResult>) -> bridge::Resolution {
+    match r.and_then(|r| r.status) {
+        Some(child_workflow_result::Status::Completed(s)) => {
+            bridge::Resolution::Completed { result: s.result }
+        }
+        Some(child_workflow_result::Status::Failed(f)) => bridge::Resolution::Failed {
+            failure: f.failure.unwrap_or_default(),
+        },
+        Some(child_workflow_result::Status::Cancelled(c)) => bridge::Resolution::Cancelled {
+            failure: c.failure.unwrap_or_default(),
+        },
+        None => bridge::Resolution::Failed {
+            failure: Failure::default(),
+        },
+    }
+}
+
+fn to_job(job: Job) -> bridge::Job {
+    match job {
+        Job::InitializeWorkflow(j) => bridge::Job::InitializeWorkflow {
+            workflow_type: j.workflow_type,
+            workflow_id: j.workflow_id,
+            arguments: j.arguments,
+            randomness_seed: j.randomness_seed,
+            attempt: i64::from(j.attempt),
+            first_execution_run_id: j.first_execution_run_id,
+            continued_from_run_id: j.continued_from_execution_run_id,
+            memo: j.memo.map(|m| m.fields).unwrap_or_default(),
+            headers: j.headers,
+        },
+        Job::FireTimer(j) => bridge::Job::FireTimer {
+            seq: i64::from(j.seq),
+        },
+        Job::ResolveActivity(j) => bridge::Job::ResolveActivity {
+            seq: i64::from(j.seq),
+            result: to_activity_resolution(j.result),
+        },
+        Job::UpdateRandomSeed(j) => bridge::Job::UpdateRandomSeed {
+            seed: j.randomness_seed,
+        },
+        Job::QueryWorkflow(j) => bridge::Job::QueryWorkflow {
+            query_id: j.query_id,
+            query_type: j.query_type,
+            arguments: j.arguments,
+        },
+        Job::CancelWorkflow(j) => bridge::Job::CancelWorkflow { reason: j.reason },
+        Job::SignalWorkflow(j) => bridge::Job::SignalWorkflow {
+            signal_name: j.signal_name,
+            input: j.input,
+        },
+        Job::NotifyHasPatch(j) => bridge::Job::NotifyHasPatch {
+            patch_id: j.patch_id,
+        },
+        Job::ResolveChildWorkflowExecutionStart(j) => {
+            let result = match j.status {
+                Some(child_start::Status::Succeeded(s)) => {
+                    bridge::ChildStart::ChildStarted { run_id: s.run_id }
+                }
+                Some(child_start::Status::Failed(f)) => bridge::ChildStart::ChildStartFailed {
+                    workflow_id: f.workflow_id,
+                    cause: i64::from(f.cause),
+                },
+                Some(child_start::Status::Cancelled(c)) => {
+                    bridge::ChildStart::ChildStartCancelled {
+                        failure: c.failure.unwrap_or_default(),
+                    }
+                }
+                None => bridge::ChildStart::ChildStartFailed {
+                    workflow_id: String::new(),
+                    cause: 0,
+                },
+            };
+            bridge::Job::ResolveChildWorkflowStart {
+                seq: i64::from(j.seq),
+                result,
+            }
+        }
+        Job::ResolveChildWorkflowExecution(j) => bridge::Job::ResolveChildWorkflow {
+            seq: i64::from(j.seq),
+            result: to_child_resolution(j.result),
+        },
+        Job::RemoveFromCache(j) => bridge::Job::RemoveFromCache {
+            message: j.message,
+            reason: i64::from(j.reason),
+        },
+        Job::ResolveSignalExternalWorkflow(j) => bridge::Job::ResolveExternalSignal {
+            seq: i64::from(j.seq),
+            failure: j.failure,
+        },
+        Job::ResolveRequestCancelExternalWorkflow(j) => bridge::Job::ResolveExternalCancel {
+            seq: i64::from(j.seq),
+            failure: j.failure,
+        },
+        Job::DoUpdate(j) => bridge::Job::DoUpdate {
+            id: j.id,
+            protocol_instance_id: j.protocol_instance_id,
+            name: j.name,
+            input: j.input,
+            run_validator: j.run_validator,
+        },
+        Job::ResolveNexusOperationStart(j) => {
+            use temporalio_common::protos::coresdk::workflow_activation::resolve_nexus_operation_start::Status;
+            let result = match j.status {
+                Some(Status::OperationToken(operation_token)) => {
+                    bridge::NexusStart::NexusStartedAsync { operation_token }
+                }
+                Some(Status::StartedSync(_)) => bridge::NexusStart::NexusStartedSync,
+                Some(Status::Failed(failure)) => bridge::NexusStart::NexusStartFailed { failure },
+                None => bridge::NexusStart::NexusStartFailed {
+                    failure: Failure::default(),
+                },
+            };
+            bridge::Job::ResolveNexusStart {
+                seq: i64::from(j.seq),
+                result,
+            }
+        }
+        Job::ResolveNexusOperation(j) => {
+            use temporalio_common::protos::coresdk::nexus::nexus_operation_result::Status;
+            let result = match j.result.and_then(|r| r.status) {
+                Some(Status::Completed(p)) => bridge::Resolution::Completed { result: Some(p) },
+                Some(Status::Cancelled(failure)) => bridge::Resolution::Cancelled { failure },
+                Some(Status::Failed(failure)) | Some(Status::TimedOut(failure)) => {
+                    bridge::Resolution::Failed { failure }
+                }
+                None => bridge::Resolution::Failed {
+                    failure: Failure::default(),
+                },
+            };
+            bridge::Job::ResolveNexus {
+                seq: i64::from(j.seq),
+                result,
+            }
+        }
+    }
+}
+
+pub fn to_activation(a: WorkflowActivation) -> bridge::Activation {
+    bridge::Activation {
+        run_id: a.run_id,
+        timestamp_ms: millis(a.timestamp),
+        is_replaying: a.is_replaying,
+        history_length: i64::from(a.history_length),
+        jobs: a
+            .jobs
+            .into_iter()
+            .filter_map(|j| j.variant)
+            .map(to_job)
+            .collect(),
+        continue_as_new_suggested: a.continue_as_new_suggested,
+    }
+}
+
+pub fn to_activity_task(t: ActivityTask) -> bridge::ActivityTask {
+    let task_token = Bytes(t.task_token);
+    match t.variant {
+        Some(activity_task::Variant::Start(s)) => bridge::ActivityTask::ActivityStart {
+            task_token,
+            activity_type: s.activity_type,
+            activity_id: s.activity_id,
+            workflow_id: s
+                .workflow_execution
+                .map(|e| e.workflow_id)
+                .unwrap_or_default(),
+            run_id: s.run_id,
+            input: s.input,
+            attempt: i64::from(s.attempt),
+            heartbeat_details: s.heartbeat_details,
+            workflow_type: s.workflow_type,
+            start_to_close_ms: duration_ms(s.start_to_close_timeout),
+            heartbeat_timeout_ms: duration_ms(s.heartbeat_timeout).filter(|ms| *ms > 0),
+            scheduled_time_ms: millis(s.scheduled_time),
+            is_local: s.is_local,
+            headers: s.header_fields,
+        },
+        Some(activity_task::Variant::Cancel(c)) => bridge::ActivityTask::ActivityCancel {
+            task_token,
+            reason: i64::from(c.reason),
+        },
+        None => bridge::ActivityTask::ActivityCancel {
+            task_token,
+            reason: 0,
+        },
+    }
+}
+
+pub fn to_nexus_task(task: NexusTask) -> bridge::NexusTask {
+    use temporalio_common::protos::{
+        coresdk::nexus::nexus_task::Variant, temporal::api::nexus::v1::request,
+    };
+    match task.variant {
+        Some(Variant::Task(t)) => {
+            let task_token = Bytes(t.task_token);
+            let request = t.request.unwrap_or_default();
+            match request.variant {
+                Some(request::Variant::StartOperation(s)) => bridge::NexusTask::NexusStartTask {
+                    task_token,
+                    service: s.service,
+                    operation: s.operation,
+                    request_id: s.request_id,
+                    input: s.payload,
+                    callback_url: s.callback,
+                    callback_headers: s.callback_header,
+                    headers: request.header,
+                },
+                Some(request::Variant::CancelOperation(c)) => bridge::NexusTask::NexusCancelTask {
+                    task_token,
+                    service: c.service,
+                    operation: c.operation,
+                    operation_token: c.operation_token,
+                },
+                None => bridge::NexusTask::NexusTaskCancelled { task_token },
+            }
+        }
+        Some(Variant::CancelTask(c)) => bridge::NexusTask::NexusTaskCancelled {
+            task_token: Bytes(c.task_token),
+        },
+        None => bridge::NexusTask::NexusTaskCancelled {
+            task_token: Bytes(vec![]),
+        },
+    }
+}
+
+// ---- Gleam -> core ----
+
+pub fn retry_policy(policy: bridge::RetryPolicy) -> DecodeResult<RetryPolicy> {
+    let bridge::RetryPolicy {
+        initial_interval_ms,
+        backoff_coefficient,
+        maximum_interval_ms,
+        maximum_attempts,
+        non_retryable_error_types,
+    } = policy;
     Ok(RetryPolicy {
-        initial_interval: Some(duration(get(&f, 0)?)),
-        backoff_coefficient: get(&f, 1)?,
-        maximum_interval: decode_opt_ms(field(&f, 2)?)?,
-        maximum_attempts: get(&f, 3)?,
-        non_retryable_error_types: get(&f, 4)?,
+        initial_interval: Some(ms(initial_interval_ms, "RetryPolicy.initial_interval_ms")?),
+        backoff_coefficient,
+        maximum_interval: opt_ms(maximum_interval_ms, "RetryPolicy.maximum_interval_ms")?,
+        maximum_attempts: n(maximum_attempts, "RetryPolicy.maximum_attempts")?,
+        non_retryable_error_types,
     })
 }
 
-fn timestamp(ms: i64) -> prost_wkt_types::Timestamp {
-    prost_wkt_types::Timestamp {
-        seconds: ms.div_euclid(1000),
-        nanos: (ms.rem_euclid(1000) * 1_000_000) as i32,
-    }
-}
-
-fn decode_command(term: Term, namespace: &str) -> DecodeResult<WorkflowCommand> {
+fn command(command: bridge::Command, namespace: &str) -> DecodeResult<WorkflowCommand> {
+    use bridge::Command as C;
     use temporalio_common::protos::coresdk::common::NamespacedWorkflowExecution;
-    let (tag, f) = untag(term)?;
-    let variant = match tag.as_str() {
-        "start_timer" => Cmd::StartTimer(wc::StartTimer {
-            seq: get(&f, 0)?,
-            start_to_fire_timeout: Some(duration(get(&f, 1)?)),
+    let variant = match command {
+        C::StartTimer { seq, ms: fire_in } => Cmd::StartTimer(wc::StartTimer {
+            seq: n(seq, "StartTimer.seq")?,
+            start_to_fire_timeout: Some(ms(fire_in, "StartTimer.ms")?),
         }),
-        "cancel_timer" => Cmd::CancelTimer(wc::CancelTimer { seq: get(&f, 0)? }),
-        "schedule_activity" => Cmd::ScheduleActivity(wc::ScheduleActivity {
-            seq: get(&f, 0)?,
-            activity_id: get(&f, 1)?,
-            activity_type: get(&f, 2)?,
-            task_queue: get(&f, 3)?,
-            arguments: decode_payloads(field(&f, 4)?)?,
-            schedule_to_close_timeout: decode_opt_ms(field(&f, 5)?)?,
-            start_to_close_timeout: decode_opt_ms(field(&f, 6)?)?,
-            heartbeat_timeout: decode_opt_ms(field(&f, 7)?)?,
-            retry_policy: opt(field(&f, 8)?).map(decode_retry).transpose()?,
-            schedule_to_start_timeout: decode_opt_ms(field(&f, 9)?)?,
-            cancellation_type: get(&f, 10)?,
-            headers: decode_payload_map(field(&f, 11)?)?,
+        C::CancelTimer { seq } => Cmd::CancelTimer(wc::CancelTimer {
+            seq: n(seq, "CancelTimer.seq")?,
+        }),
+        C::ScheduleActivity {
+            seq,
+            activity_id,
+            activity_type,
+            task_queue,
+            arguments,
+            schedule_to_close_ms,
+            start_to_close_ms,
+            heartbeat_timeout_ms,
+            retry,
+            schedule_to_start_ms,
+            cancellation_type,
+            headers,
+        } => Cmd::ScheduleActivity(wc::ScheduleActivity {
+            seq: n(seq, "ScheduleActivity.seq")?,
+            activity_id,
+            activity_type,
+            task_queue,
+            arguments,
+            schedule_to_close_timeout: opt_ms(
+                schedule_to_close_ms,
+                "ScheduleActivity.schedule_to_close_ms",
+            )?,
+            start_to_close_timeout: opt_ms(
+                start_to_close_ms,
+                "ScheduleActivity.start_to_close_ms",
+            )?,
+            heartbeat_timeout: opt_ms(
+                heartbeat_timeout_ms,
+                "ScheduleActivity.heartbeat_timeout_ms",
+            )?,
+            retry_policy: retry.map(retry_policy).transpose()?,
+            schedule_to_start_timeout: opt_ms(
+                schedule_to_start_ms,
+                "ScheduleActivity.schedule_to_start_ms",
+            )?,
+            cancellation_type: n(cancellation_type, "ScheduleActivity.cancellation_type")?,
+            headers,
             ..Default::default()
         }),
-        "request_cancel_activity" => {
-            Cmd::RequestCancelActivity(wc::RequestCancelActivity { seq: get(&f, 0)? })
-        }
-        "respond_to_query" => {
-            let (result_tag, r) = untag(field(&f, 1)?)?;
-            let variant = if result_tag == "ok" {
-                wc::query_result::Variant::Succeeded(wc::QuerySuccess {
-                    response: Some(decode_payload(field(&r, 0)?)?),
-                })
-            } else {
-                wc::query_result::Variant::Failed(decode_failure(field(&r, 0)?)?)
-            };
-            Cmd::RespondToQuery(wc::QueryResult {
-                query_id: get(&f, 0)?,
-                variant: Some(variant),
-            })
-        }
-        "complete_workflow" => Cmd::CompleteWorkflowExecution(wc::CompleteWorkflowExecution {
-            result: decode_opt_payload(field(&f, 0)?)?,
+        C::RequestCancelActivity { seq } => Cmd::RequestCancelActivity(wc::RequestCancelActivity {
+            seq: n(seq, "RequestCancelActivity.seq")?,
         }),
-        "fail_workflow" => Cmd::FailWorkflowExecution(wc::FailWorkflowExecution {
-            failure: Some(decode_failure(field(&f, 0)?)?),
+        C::RespondToQuery { query_id, result } => Cmd::RespondToQuery(wc::QueryResult {
+            query_id,
+            variant: Some(match result {
+                Ok(response) => wc::query_result::Variant::Succeeded(wc::QuerySuccess {
+                    response: Some(response),
+                }),
+                Err(failure) => wc::query_result::Variant::Failed(failure),
+            }),
         }),
-        "continue_as_new" => {
-            Cmd::ContinueAsNewWorkflowExecution(wc::ContinueAsNewWorkflowExecution {
-                workflow_type: get(&f, 0)?,
-                task_queue: get(&f, 1)?,
-                arguments: decode_payloads(field(&f, 2)?)?,
-                ..Default::default()
-            })
+        C::CompleteWorkflow { result } => {
+            Cmd::CompleteWorkflowExecution(wc::CompleteWorkflowExecution { result })
         }
-        "cancel_workflow_execution" => {
+        C::FailWorkflow { failure } => Cmd::FailWorkflowExecution(wc::FailWorkflowExecution {
+            failure: Some(failure),
+        }),
+        C::ContinueAsNew {
+            workflow_type,
+            task_queue,
+            arguments,
+        } => Cmd::ContinueAsNewWorkflowExecution(wc::ContinueAsNewWorkflowExecution {
+            workflow_type,
+            task_queue,
+            arguments,
+            ..Default::default()
+        }),
+        C::CancelWorkflowExecution => {
             Cmd::CancelWorkflowExecution(wc::CancelWorkflowExecution::default())
         }
-        "set_patch_marker" => Cmd::SetPatchMarker(wc::SetPatchMarker {
-            patch_id: get(&f, 0)?,
-            deprecated: get(&f, 1)?,
+        C::SetPatchMarker {
+            patch_id,
+            deprecated,
+        } => Cmd::SetPatchMarker(wc::SetPatchMarker {
+            patch_id,
+            deprecated,
         }),
-        "start_child_workflow" => {
-            let (_, o) = untag(field(&f, 5)?)?;
+        C::StartChildWorkflow {
+            seq,
+            workflow_id,
+            workflow_type,
+            task_queue,
+            input,
+            options,
+        } => {
+            let bridge::ChildStartOptions {
+                execution_timeout_ms,
+                run_timeout_ms,
+                task_timeout_ms,
+                parent_close_policy,
+                id_reuse_policy,
+                retry,
+                memo,
+                search_attributes: attributes,
+                cancellation_type,
+                headers,
+            } = options;
             Cmd::StartChildWorkflowExecution(wc::StartChildWorkflowExecution {
-                seq: get(&f, 0)?,
-                workflow_id: get(&f, 1)?,
-                workflow_type: get(&f, 2)?,
-                task_queue: get(&f, 3)?,
-                input: decode_payloads(field(&f, 4)?)?,
-                workflow_execution_timeout: decode_opt_ms(field(&o, 0)?)?,
-                workflow_run_timeout: decode_opt_ms(field(&o, 1)?)?,
-                workflow_task_timeout: decode_opt_ms(field(&o, 2)?)?,
-                parent_close_policy: get(&o, 3)?,
-                workflow_id_reuse_policy: get(&o, 4)?,
-                retry_policy: opt(field(&o, 5)?).map(decode_retry).transpose()?,
-                memo: decode_payload_map(field(&o, 6)?)?,
-                search_attributes: decode_search_attributes(field(&o, 7)?)?,
-                cancellation_type: get(&o, 8)?,
-                headers: decode_payload_map(field(&o, 9)?)?,
+                seq: n(seq, "StartChildWorkflow.seq")?,
+                workflow_id,
+                workflow_type,
+                task_queue,
+                input,
+                workflow_execution_timeout: opt_ms(
+                    execution_timeout_ms,
+                    "ChildStartOptions.execution_timeout_ms",
+                )?,
+                workflow_run_timeout: opt_ms(run_timeout_ms, "ChildStartOptions.run_timeout_ms")?,
+                workflow_task_timeout: opt_ms(
+                    task_timeout_ms,
+                    "ChildStartOptions.task_timeout_ms",
+                )?,
+                parent_close_policy: n(
+                    parent_close_policy,
+                    "ChildStartOptions.parent_close_policy",
+                )?,
+                workflow_id_reuse_policy: n(id_reuse_policy, "ChildStartOptions.id_reuse_policy")?,
+                retry_policy: retry.map(retry_policy).transpose()?,
+                memo,
+                search_attributes: search_attributes(attributes),
+                cancellation_type: n(cancellation_type, "ChildStartOptions.cancellation_type")?,
+                headers,
                 ..Default::default()
             })
         }
-        "cancel_child_workflow" => {
+        C::CancelChildWorkflow { seq } => {
             Cmd::CancelChildWorkflowExecution(wc::CancelChildWorkflowExecution {
-                child_workflow_seq: get(&f, 0)?,
+                child_workflow_seq: n(seq, "CancelChildWorkflow.seq")?,
                 reason: String::new(),
             })
         }
-        "schedule_local_activity" => Cmd::ScheduleLocalActivity(wc::ScheduleLocalActivity {
-            seq: get(&f, 0)?,
-            activity_id: get(&f, 1)?,
-            activity_type: get(&f, 2)?,
-            attempt: get(&f, 3)?,
-            original_schedule_time: opt(field(&f, 4)?)
-                .map(|t| t.decode::<i64>().map(timestamp))
-                .transpose()
-                .map_err(|_| "schedule time must be an Int")?,
-            arguments: decode_payloads(field(&f, 5)?)?,
-            schedule_to_close_timeout: decode_opt_ms(field(&f, 6)?)?,
-            schedule_to_start_timeout: decode_opt_ms(field(&f, 7)?)?,
-            start_to_close_timeout: decode_opt_ms(field(&f, 8)?)?,
-            retry_policy: opt(field(&f, 9)?).map(decode_retry).transpose()?,
-            local_retry_threshold: decode_opt_ms(field(&f, 10)?)?,
-            cancellation_type: get(&f, 11)?,
-            headers: decode_payload_map(field(&f, 12)?)?,
+        C::ScheduleLocalActivity {
+            seq,
+            activity_id,
+            activity_type,
+            attempt,
+            original_schedule_time_ms,
+            arguments,
+            schedule_to_close_ms,
+            schedule_to_start_ms,
+            start_to_close_ms,
+            retry,
+            local_retry_threshold_ms,
+            cancellation_type,
+            headers,
+        } => Cmd::ScheduleLocalActivity(wc::ScheduleLocalActivity {
+            seq: n(seq, "ScheduleLocalActivity.seq")?,
+            activity_id,
+            activity_type,
+            attempt: n(attempt, "ScheduleLocalActivity.attempt")?,
+            original_schedule_time: original_schedule_time_ms.map(timestamp),
+            arguments,
+            schedule_to_close_timeout: opt_ms(
+                schedule_to_close_ms,
+                "ScheduleLocalActivity.schedule_to_close_ms",
+            )?,
+            schedule_to_start_timeout: opt_ms(
+                schedule_to_start_ms,
+                "ScheduleLocalActivity.schedule_to_start_ms",
+            )?,
+            start_to_close_timeout: opt_ms(
+                start_to_close_ms,
+                "ScheduleLocalActivity.start_to_close_ms",
+            )?,
+            retry_policy: retry.map(retry_policy).transpose()?,
+            local_retry_threshold: opt_ms(
+                local_retry_threshold_ms,
+                "ScheduleLocalActivity.local_retry_threshold_ms",
+            )?,
+            cancellation_type: n(cancellation_type, "ScheduleLocalActivity.cancellation_type")?,
+            headers,
             ..Default::default()
         }),
-        "request_cancel_local_activity" => {
-            Cmd::RequestCancelLocalActivity(wc::RequestCancelLocalActivity { seq: get(&f, 0)? })
+        C::RequestCancelLocalActivity { seq } => {
+            Cmd::RequestCancelLocalActivity(wc::RequestCancelLocalActivity {
+                seq: n(seq, "RequestCancelLocalActivity.seq")?,
+            })
         }
-        "signal_external" => {
+        C::SignalExternal {
+            seq,
+            target,
+            signal_name,
+            input,
+        } => {
             use wc::signal_external_workflow_execution::Target;
-            let (target_tag, t) = untag(field(&f, 1)?)?;
-            let target = if target_tag == "child_workflow_target" {
-                Target::ChildWorkflowId(get(&t, 0)?)
-            } else {
-                Target::WorkflowExecution(NamespacedWorkflowExecution {
+            let target = match target {
+                bridge::SignalTarget::ChildWorkflowTarget { workflow_id } => {
+                    Target::ChildWorkflowId(workflow_id)
+                }
+                bridge::SignalTarget::ExternalWorkflow {
+                    workflow_id,
+                    run_id,
+                } => Target::WorkflowExecution(NamespacedWorkflowExecution {
                     namespace: namespace.to_string(),
-                    workflow_id: get(&t, 0)?,
-                    run_id: get(&t, 1)?,
-                })
+                    workflow_id,
+                    run_id,
+                }),
             };
             Cmd::SignalExternalWorkflowExecution(wc::SignalExternalWorkflowExecution {
-                seq: get(&f, 0)?,
+                seq: n(seq, "SignalExternal.seq")?,
                 target: Some(target),
-                signal_name: get(&f, 2)?,
-                args: decode_payloads(field(&f, 3)?)?,
+                signal_name,
+                args: input,
                 ..Default::default()
             })
         }
-        "cancel_signal_external" => {
-            Cmd::CancelSignalWorkflow(wc::CancelSignalWorkflow { seq: get(&f, 0)? })
-        }
-        "cancel_external" => Cmd::RequestCancelExternalWorkflowExecution(
+        C::CancelSignalExternal { seq } => Cmd::CancelSignalWorkflow(wc::CancelSignalWorkflow {
+            seq: n(seq, "CancelSignalExternal.seq")?,
+        }),
+        C::CancelExternal {
+            seq,
+            workflow_id,
+            run_id,
+            reason,
+        } => Cmd::RequestCancelExternalWorkflowExecution(
             wc::RequestCancelExternalWorkflowExecution {
-                seq: get(&f, 0)?,
+                seq: n(seq, "CancelExternal.seq")?,
                 workflow_execution: Some(NamespacedWorkflowExecution {
                     namespace: namespace.to_string(),
-                    workflow_id: get(&f, 1)?,
-                    run_id: get(&f, 2)?,
+                    workflow_id,
+                    run_id,
                 }),
-                reason: get(&f, 3)?,
+                reason,
             },
         ),
-        "update_accepted" => Cmd::UpdateResponse(wc::UpdateResponse {
-            protocol_instance_id: get(&f, 0)?,
+        C::UpdateAccepted {
+            protocol_instance_id,
+        } => Cmd::UpdateResponse(wc::UpdateResponse {
+            protocol_instance_id,
             response: Some(wc::update_response::Response::Accepted(())),
         }),
-        "update_rejected" => Cmd::UpdateResponse(wc::UpdateResponse {
-            protocol_instance_id: get(&f, 0)?,
-            response: Some(wc::update_response::Response::Rejected(decode_failure(
-                field(&f, 1)?,
-            )?)),
+        C::UpdateRejected {
+            protocol_instance_id,
+            failure,
+        } => Cmd::UpdateResponse(wc::UpdateResponse {
+            protocol_instance_id,
+            response: Some(wc::update_response::Response::Rejected(failure)),
         }),
-        "update_completed" => Cmd::UpdateResponse(wc::UpdateResponse {
-            protocol_instance_id: get(&f, 0)?,
-            response: Some(wc::update_response::Response::Completed(decode_payload(
-                field(&f, 1)?,
-            )?)),
+        C::UpdateCompleted {
+            protocol_instance_id,
+            result,
+        } => Cmd::UpdateResponse(wc::UpdateResponse {
+            protocol_instance_id,
+            response: Some(wc::update_response::Response::Completed(result)),
         }),
-        "schedule_nexus_operation" => Cmd::ScheduleNexusOperation(wc::ScheduleNexusOperation {
-            seq: get(&f, 0)?,
-            endpoint: get(&f, 1)?,
-            service: get(&f, 2)?,
-            operation: get(&f, 3)?,
-            input: Some(decode_payload(field(&f, 4)?)?),
-            schedule_to_close_timeout: decode_opt_ms(field(&f, 5)?)?,
-            cancellation_type: get(&f, 6)?,
+        C::ScheduleNexusOperation {
+            seq,
+            endpoint,
+            service,
+            operation,
+            input,
+            schedule_to_close_ms,
+            cancellation_type,
+        } => Cmd::ScheduleNexusOperation(wc::ScheduleNexusOperation {
+            seq: n(seq, "ScheduleNexusOperation.seq")?,
+            endpoint,
+            service,
+            operation,
+            input: Some(input),
+            schedule_to_close_timeout: opt_ms(
+                schedule_to_close_ms,
+                "ScheduleNexusOperation.schedule_to_close_ms",
+            )?,
+            cancellation_type: n(
+                cancellation_type,
+                "ScheduleNexusOperation.cancellation_type",
+            )?,
             ..Default::default()
         }),
-        "cancel_nexus_operation" => {
-            Cmd::RequestCancelNexusOperation(wc::RequestCancelNexusOperation { seq: get(&f, 0)? })
-        }
-        "upsert_search_attributes" => {
-            Cmd::UpsertWorkflowSearchAttributes(wc::UpsertWorkflowSearchAttributes {
-                search_attributes: decode_search_attributes(field(&f, 0)?)?,
+        C::CancelNexusOperation { seq } => {
+            Cmd::RequestCancelNexusOperation(wc::RequestCancelNexusOperation {
+                seq: n(seq, "CancelNexusOperation.seq")?,
             })
         }
-        "upsert_memo" => Cmd::ModifyWorkflowProperties(wc::ModifyWorkflowProperties {
-            upserted_memo: decode_memo(field(&f, 0)?)?,
-        }),
-        other => return Err(format!("unknown command {other}")),
+        C::UpsertSearchAttributes { attributes } => {
+            Cmd::UpsertWorkflowSearchAttributes(wc::UpsertWorkflowSearchAttributes {
+                search_attributes: search_attributes(attributes),
+            })
+        }
+        C::UpsertMemo { memo: fields } => {
+            Cmd::ModifyWorkflowProperties(wc::ModifyWorkflowProperties {
+                upserted_memo: memo(fields),
+            })
+        }
     };
     Ok(WorkflowCommand {
         variant: Some(variant),
@@ -744,32 +766,38 @@ fn decode_command(term: Term, namespace: &str) -> DecodeResult<WorkflowCommand> 
     })
 }
 
+/// `namespace` is the worker's: commands that name another workflow are addressed to it.
 pub fn decode_completion(
     term: Term,
     namespace: &str,
 ) -> DecodeResult<WorkflowActivationCompletion> {
     use workflow_completion::workflow_activation_completion::Status;
-    let (tag, f) = untag(term)?;
-    let status = match tag.as_str() {
-        "success" => {
-            let commands: Vec<Term> = get(&f, 1)?;
+    let (run_id, status) = match bridge::Completion::from_term(term)? {
+        bridge::Completion::Success {
+            run_id,
+            commands,
+            versioning_behavior,
+        } => (
+            run_id,
             Status::Successful(workflow_completion::Success {
                 commands: commands
                     .into_iter()
-                    .map(|c| decode_command(c, namespace))
+                    .map(|c| command(c, namespace))
                     .collect::<DecodeResult<_>>()?,
-                versioning_behavior: get(&f, 2)?,
+                versioning_behavior: n(versioning_behavior, "Success.versioning_behavior")?,
                 ..Default::default()
-            })
-        }
-        "task_failure" => Status::Failed(workflow_completion::Failure {
-            failure: Some(decode_failure(field(&f, 1)?)?),
-            ..Default::default()
-        }),
-        other => return Err(format!("unknown completion {other}")),
+            }),
+        ),
+        bridge::Completion::TaskFailure { run_id, failure } => (
+            run_id,
+            Status::Failed(workflow_completion::Failure {
+                failure: Some(failure),
+                ..Default::default()
+            }),
+        ),
     };
     Ok(WorkflowActivationCompletion {
-        run_id: get(&f, 0)?,
+        run_id,
         status: Some(status),
         ..Default::default()
     })
@@ -777,90 +805,31 @@ pub fn decode_completion(
 
 pub fn decode_activity_result(term: Term) -> DecodeResult<ActivityExecutionResult> {
     use activity_execution_result::Status;
-    let (tag, f) = untag(term)?;
-    let status = match tag.as_str() {
-        "activity_completed" => Status::Completed(ar::Success {
-            result: decode_opt_payload(field(&f, 0)?)?,
-        }),
-        "activity_failed" => Status::Failed(ar::Failure {
-            failure: Some(decode_failure(field(&f, 0)?)?),
+    let status = match bridge::ActivityResult::from_term(term)? {
+        bridge::ActivityResult::ActivityCompleted { result } => {
+            Status::Completed(ar::Success { result })
+        }
+        bridge::ActivityResult::ActivityFailed { failure } => Status::Failed(ar::Failure {
+            failure: Some(failure),
             ..Default::default()
         }),
-        "activity_cancelled" => Status::Cancelled(ar::Cancellation {
-            failure: Some(decode_failure(field(&f, 0)?)?),
-        }),
-        "activity_will_complete_async" => Status::WillCompleteAsync(ar::WillCompleteAsync {}),
-        other => return Err(format!("unknown activity result {other}")),
+        bridge::ActivityResult::ActivityCancelled { failure } => {
+            Status::Cancelled(ar::Cancellation {
+                failure: Some(failure),
+            })
+        }
+        bridge::ActivityResult::ActivityWillCompleteAsync => {
+            Status::WillCompleteAsync(ar::WillCompleteAsync {})
+        }
     };
     Ok(ActivityExecutionResult {
         status: Some(status),
     })
 }
 
-// ---- Nexus tasks ----
-
-fn encode_string_map<'a>(env: Env<'a>, m: &HashMap<String, String>) -> Term<'a> {
-    let mut map = Term::map_new(env);
-    for (k, v) in m {
-        map = map
-            .map_put(k.as_str(), v.as_str())
-            .expect("map_put on a map");
-    }
-    map
-}
-
-pub fn encode_nexus_task<'a>(
-    env: Env<'a>,
-    task: temporalio_common::protos::coresdk::nexus::NexusTask,
-) -> Term<'a> {
+pub fn decode_nexus_result(term: Term, task_token: Vec<u8>) -> DecodeResult<NexusTaskCompletion> {
     use temporalio_common::protos::{
-        coresdk::nexus::nexus_task::Variant, temporal::api::nexus::v1::request,
-    };
-    match task.variant {
-        Some(Variant::Task(t)) => {
-            let token = bin(env, &t.task_token);
-            let request = t.request.unwrap_or_default();
-            match request.variant {
-                Some(request::Variant::StartOperation(s)) => rec(
-                    env,
-                    "nexus_start_task",
-                    &[
-                        token,
-                        s.service.encode(env),
-                        s.operation.encode(env),
-                        s.request_id.encode(env),
-                        option(env, s.payload.as_ref().map(|p| encode_payload(env, p))),
-                        s.callback.encode(env),
-                        encode_string_map(env, &s.callback_header),
-                        encode_string_map(env, &request.header),
-                    ],
-                ),
-                Some(request::Variant::CancelOperation(c)) => rec(
-                    env,
-                    "nexus_cancel_task",
-                    &[
-                        token,
-                        c.service.encode(env),
-                        c.operation.encode(env),
-                        c.operation_token.encode(env),
-                    ],
-                ),
-                None => rec(env, "nexus_task_cancelled", &[token]),
-            }
-        }
-        Some(Variant::CancelTask(c)) => {
-            rec(env, "nexus_task_cancelled", &[bin(env, &c.task_token)])
-        }
-        None => rec(env, "nexus_task_cancelled", &[bin(env, &[])]),
-    }
-}
-
-pub fn decode_nexus_result(
-    term: Term,
-    task_token: Vec<u8>,
-) -> DecodeResult<temporalio_common::protos::coresdk::nexus::NexusTaskCompletion> {
-    use temporalio_common::protos::{
-        coresdk::nexus::{NexusTaskCompletion, nexus_task_completion::Status},
+        coresdk::nexus::nexus_task_completion::Status,
         temporal::api::{
             failure::v1::NexusHandlerFailureInfo,
             nexus::v1::{
@@ -876,45 +845,43 @@ pub fn decode_nexus_result(
             })),
         })
     };
-    let (tag, f) = untag(term)?;
-    let status = match tag.as_str() {
-        "nexus_sync_success" => start(start_operation_response::Variant::SyncSuccess(
-            start_operation_response::Sync {
-                payload: Some(decode_payload(field(&f, 0)?)?),
+    let status = match bridge::NexusResult::from_term(term)? {
+        bridge::NexusResult::NexusSyncSuccess { result } => start(
+            start_operation_response::Variant::SyncSuccess(start_operation_response::Sync {
+                payload: Some(result),
                 ..Default::default()
-            },
-        )),
-        "nexus_async_success" => start(start_operation_response::Variant::AsyncSuccess(
-            start_operation_response::Async {
-                operation_token: get(&f, 0)?,
+            }),
+        ),
+        bridge::NexusResult::NexusAsyncSuccess { operation_token } => start(
+            start_operation_response::Variant::AsyncSuccess(start_operation_response::Async {
+                operation_token,
                 ..Default::default()
-            },
-        )),
-        "nexus_operation_failed" => start(start_operation_response::Variant::Failure(
-            decode_failure(field(&f, 0)?)?,
-        )),
-        "nexus_handler_failed" => {
-            let cause = decode_failure(field(&f, 1)?)?;
-            Status::Failure(Failure {
-                message: cause.message.clone(),
-                source: "GleamSDK".to_string(),
-                cause: Some(Box::new(cause)),
-                failure_info: Some(FailureInfo::NexusHandlerFailureInfo(
-                    NexusHandlerFailureInfo {
-                        r#type: get(&f, 0)?,
-                        ..Default::default()
-                    },
-                )),
-                ..Default::default()
-            })
+            }),
+        ),
+        bridge::NexusResult::NexusOperationFailed { failure } => {
+            start(start_operation_response::Variant::Failure(failure))
         }
-        "nexus_cancel_acknowledged" => Status::Completed(Response {
+        bridge::NexusResult::NexusHandlerFailed {
+            error_type,
+            failure: cause,
+        } => Status::Failure(Failure {
+            message: cause.message.clone(),
+            source: "GleamSDK".to_string(),
+            cause: Some(Box::new(cause)),
+            failure_info: Some(FailureInfo::NexusHandlerFailureInfo(
+                NexusHandlerFailureInfo {
+                    r#type: error_type,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }),
+        bridge::NexusResult::NexusCancelAcknowledged => Status::Completed(Response {
             variant: Some(response::Variant::CancelOperation(
                 CancelOperationResponse {},
             )),
         }),
-        "nexus_task_cancel_acknowledged" => Status::AckCancel(true),
-        other => return Err(format!("unknown nexus result {other}")),
+        bridge::NexusResult::NexusTaskCancelAcknowledged => Status::AckCancel(true),
     };
     Ok(NexusTaskCompletion {
         task_token,

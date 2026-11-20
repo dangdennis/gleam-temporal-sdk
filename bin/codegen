@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Regenerate the Rust types for the Gleam-Rust boundary from temporal/internal/bridge.gleam.
+# Run it after changing a type there, then fix what the Rust compiler points at.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+(cd "$root/codegen" && gleam run)
+rustfmt --edition 2024 "$root/native/temporal_nif/src/bridge.rs"

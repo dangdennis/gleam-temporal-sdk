@@ -1,14 +1,15 @@
 //! Schedules: the `WorkflowService` schedule calls, exchanging `bridge.Schedule`.
 
 use crate::{
-    ConnectionRes, atoms,
-    client::{StartRequest, decode_start_request, invalid, rpc_err},
-    convert::*,
+    ConnectionRes, atoms, bridge,
+    client::{StartRequest, invalid, rpc_err},
+    convert::{count, duration_ms, millis, ms, n, opt_ms, timestamp},
     ok, spawn_reply,
+    wire::{Bytes, DecodeResult, Wire},
 };
 use rustler::{Atom, Encoder, Env, LocalPid, ResourceArc, Term};
 use temporalio_common::protos::temporal::api::{
-    common::v1::{Payloads, WorkflowType},
+    common::v1::{Payloads, RetryPolicy, WorkflowType},
     schedule::v1::{
         BackfillRequest, IntervalSpec, Range, Schedule, ScheduleAction, ScheduleInfo,
         SchedulePatch, SchedulePolicies, ScheduleSpec, ScheduleState, StructuredCalendarSpec,
@@ -23,109 +24,121 @@ use temporalio_common::protos::temporal::api::{
 };
 use tonic::IntoRequest;
 
-fn decode_ranges(term: Term) -> DecodeResult<Vec<Range>> {
-    let ranges: Vec<(i32, i32, i32)> = term.decode().map_err(|_| "expected a list of ranges")?;
-    Ok(ranges
-        .into_iter()
-        .map(|(start, end, step)| Range { start, end, step })
-        .collect())
-}
-
-fn encode_ranges<'a>(env: Env<'a>, ranges: &[Range]) -> Term<'a> {
+/// `{Start, End, Step}` ranges of one calendar field, named for the errors.
+fn ranges(ranges: Vec<(i64, i64, i64)>, name: &str) -> DecodeResult<Vec<Range>> {
     ranges
-        .iter()
-        // The server leaves out an end equal to the start, and a step of one.
-        .map(|r| (r.start, r.end.max(r.start), r.step.max(1)))
-        .collect::<Vec<_>>()
-        .encode(env)
+        .into_iter()
+        .map(|(start, end, step)| {
+            Ok(Range {
+                start: n(start, name)?,
+                end: n(end, name)?,
+                step: n(step, name)?,
+            })
+        })
+        .collect()
 }
 
-fn decode_calendar(term: Term) -> DecodeResult<StructuredCalendarSpec> {
-    let (_, f) = untag(term)?;
+fn to_ranges(ranges: Vec<Range>) -> Vec<(i64, i64, i64)> {
+    ranges
+        .into_iter()
+        // The server leaves out an end equal to the start, and a step of one.
+        .map(|r| {
+            (
+                i64::from(r.start),
+                i64::from(r.end.max(r.start)),
+                i64::from(r.step.max(1)),
+            )
+        })
+        .collect()
+}
+
+fn calendar(calendar: bridge::ScheduleCalendar) -> DecodeResult<StructuredCalendarSpec> {
+    let bridge::ScheduleCalendar {
+        second,
+        minute,
+        hour,
+        day_of_month,
+        month,
+        year,
+        day_of_week,
+        comment,
+    } = calendar;
     Ok(StructuredCalendarSpec {
-        second: decode_ranges(field(&f, 0)?)?,
-        minute: decode_ranges(field(&f, 1)?)?,
-        hour: decode_ranges(field(&f, 2)?)?,
-        day_of_month: decode_ranges(field(&f, 3)?)?,
-        month: decode_ranges(field(&f, 4)?)?,
-        year: decode_ranges(field(&f, 5)?)?,
-        day_of_week: decode_ranges(field(&f, 6)?)?,
-        comment: get(&f, 7)?,
+        second: ranges(second, "ScheduleCalendar.second")?,
+        minute: ranges(minute, "ScheduleCalendar.minute")?,
+        hour: ranges(hour, "ScheduleCalendar.hour")?,
+        day_of_month: ranges(day_of_month, "ScheduleCalendar.day_of_month")?,
+        month: ranges(month, "ScheduleCalendar.month")?,
+        year: ranges(year, "ScheduleCalendar.year")?,
+        day_of_week: ranges(day_of_week, "ScheduleCalendar.day_of_week")?,
+        comment,
     })
 }
 
-fn encode_calendar<'a>(env: Env<'a>, c: &StructuredCalendarSpec) -> Term<'a> {
-    rec(
-        env,
-        "schedule_calendar",
-        &[
-            encode_ranges(env, &c.second),
-            encode_ranges(env, &c.minute),
-            encode_ranges(env, &c.hour),
-            encode_ranges(env, &c.day_of_month),
-            encode_ranges(env, &c.month),
-            encode_ranges(env, &c.year),
-            encode_ranges(env, &c.day_of_week),
-            c.comment.encode(env),
-        ],
-    )
+fn to_calendar(c: StructuredCalendarSpec) -> bridge::ScheduleCalendar {
+    bridge::ScheduleCalendar {
+        second: to_ranges(c.second),
+        minute: to_ranges(c.minute),
+        hour: to_ranges(c.hour),
+        day_of_month: to_ranges(c.day_of_month),
+        month: to_ranges(c.month),
+        year: to_ranges(c.year),
+        day_of_week: to_ranges(c.day_of_week),
+        comment: c.comment,
+    }
 }
 
-fn decode_spec(term: Term) -> DecodeResult<ScheduleSpec> {
-    let (_, f) = untag(term)?;
-    let intervals: Vec<(u64, u64)> = get(&f, 0)?;
-    let calendars: Vec<Term> = get(&f, 1)?;
+fn spec(spec: bridge::ScheduleSpec) -> DecodeResult<ScheduleSpec> {
+    let bridge::ScheduleSpec {
+        intervals,
+        calendars,
+        cron_expressions,
+        timezone,
+        jitter_ms,
+    } = spec;
     Ok(ScheduleSpec {
         interval: intervals
             .into_iter()
-            .map(|(every, offset)| IntervalSpec {
-                interval: Some(duration(every)),
-                phase: Some(duration(offset)),
+            .map(|(every, offset)| {
+                Ok(IntervalSpec {
+                    interval: Some(ms(every, "ScheduleSpec.intervals")?),
+                    phase: Some(ms(offset, "ScheduleSpec.intervals")?),
+                })
             })
-            .collect(),
+            .collect::<DecodeResult<_>>()?,
         structured_calendar: calendars
             .into_iter()
-            .map(decode_calendar)
+            .map(calendar)
             .collect::<DecodeResult<_>>()?,
-        cron_string: get(&f, 2)?,
-        timezone_name: get(&f, 3)?,
-        jitter: decode_opt_ms(field(&f, 4)?)?,
+        cron_string: cron_expressions,
+        timezone_name: timezone,
+        jitter: opt_ms(jitter_ms, "ScheduleSpec.jitter_ms")?,
         ..Default::default()
     })
 }
 
-fn encode_spec<'a>(env: Env<'a>, s: &ScheduleSpec) -> Term<'a> {
-    let intervals: Vec<(i64, i64)> = s
-        .interval
-        .iter()
-        .map(|i| {
-            (
-                duration_ms(i.interval).unwrap_or(0),
-                duration_ms(i.phase).unwrap_or(0),
-            )
-        })
-        .collect();
-    let calendars: Vec<Term> = s
-        .structured_calendar
-        .iter()
-        .map(|c| encode_calendar(env, c))
-        .collect();
-    rec(
-        env,
-        "schedule_spec",
-        &[
-            intervals.encode(env),
-            calendars.encode(env),
-            s.cron_string.encode(env),
-            s.timezone_name.encode(env),
-            option(
-                env,
-                duration_ms(s.jitter)
-                    .filter(|ms| *ms > 0)
-                    .map(|ms| ms.encode(env)),
-            ),
-        ],
-    )
+/// A length of time the server reports as zero when it was never set.
+fn set_ms(d: Option<prost_wkt_types::Duration>) -> Option<i64> {
+    duration_ms(d).filter(|ms| *ms > 0)
+}
+
+fn to_spec(s: ScheduleSpec) -> bridge::ScheduleSpec {
+    bridge::ScheduleSpec {
+        intervals: s
+            .interval
+            .into_iter()
+            .map(|i| {
+                (
+                    duration_ms(i.interval).unwrap_or(0),
+                    duration_ms(i.phase).unwrap_or(0),
+                )
+            })
+            .collect(),
+        calendars: s.structured_calendar.into_iter().map(to_calendar).collect(),
+        cron_expressions: s.cron_string,
+        timezone: s.timezone_name,
+        jitter_ms: set_ms(s.jitter),
+    }
 }
 
 fn action(r: StartRequest) -> ScheduleAction {
@@ -153,135 +166,143 @@ fn action(r: StartRequest) -> ScheduleAction {
     }
 }
 
-/// `bridge.StartRequest` from a schedule's action.
-fn encode_action<'a>(env: Env<'a>, a: Option<ScheduleAction>) -> Term<'a> {
-    let Some(Action::StartWorkflow(w)) = a.and_then(|a| a.action) else {
-        return atoms::nil().encode(env);
-    };
-    let ms = |d| {
-        option(
-            env,
-            duration_ms(d).filter(|ms| *ms > 0).map(|ms| ms.encode(env)),
-        )
-    };
-    let retry = w.retry_policy.map(|r| {
-        rec(
-            env,
-            "retry_policy",
-            &[
-                duration_ms(r.initial_interval).unwrap_or(0).encode(env),
-                r.backoff_coefficient.encode(env),
-                ms(r.maximum_interval),
-                r.maximum_attempts.encode(env),
-                r.non_retryable_error_types.encode(env),
-            ],
-        )
-    });
-    rec(
-        env,
-        "start_request",
-        &[
-            w.workflow_id.encode(env),
-            w.workflow_type
-                .map(|t| t.name)
-                .unwrap_or_default()
-                .encode(env),
-            w.task_queue.map(|t| t.name).unwrap_or_default().encode(env),
-            encode_payloads(env, &w.input.map(|p| p.payloads).unwrap_or_default()),
-            w.workflow_id_reuse_policy.encode(env),
-            0.encode(env),
-            ms(w.workflow_execution_timeout),
-            ms(w.workflow_run_timeout),
-            ms(w.workflow_task_timeout),
-            option(env, retry),
-            encode_payload_map(env, &w.memo.map(|m| m.fields).unwrap_or_default()),
-            encode_payload_map(
-                env,
-                &w.search_attributes
-                    .map(|a| a.indexed_fields)
-                    .unwrap_or_default(),
-            ),
-            atoms::none().encode(env),
-            "".encode(env),
-            "".encode(env),
-            Vec::<Term>::new().encode(env),
-            encode_payload_map(env, &w.header.map(|h| h.fields).unwrap_or_default()),
-        ],
-    )
+fn to_retry_policy(r: RetryPolicy) -> bridge::RetryPolicy {
+    bridge::RetryPolicy {
+        initial_interval_ms: duration_ms(r.initial_interval).unwrap_or(0),
+        backoff_coefficient: r.backoff_coefficient,
+        maximum_interval_ms: set_ms(r.maximum_interval),
+        maximum_attempts: i64::from(r.maximum_attempts),
+        non_retryable_error_types: r.non_retryable_error_types,
+    }
 }
 
-fn decode_schedule(term: Term) -> DecodeResult<Schedule> {
-    let (_, f) = untag(term)?;
+/// `bridge.StartRequest` from a schedule's action. A schedule stores less than a start
+/// request holds, and the rest is left empty.
+fn to_start_request(a: Option<ScheduleAction>) -> Result<bridge::StartRequest, tonic::Status> {
+    let Some(Action::StartWorkflow(w)) = a.and_then(|a| a.action) else {
+        return Err(tonic::Status::internal(
+            "the schedule's action does not start a workflow",
+        ));
+    };
+    Ok(bridge::StartRequest {
+        workflow_id: w.workflow_id,
+        workflow_type: w.workflow_type.map(|t| t.name).unwrap_or_default(),
+        task_queue: w.task_queue.map(|t| t.name).unwrap_or_default(),
+        input: w.input.map(|p| p.payloads).unwrap_or_default(),
+        id_reuse_policy: i64::from(w.workflow_id_reuse_policy),
+        id_conflict_policy: 0,
+        execution_timeout_ms: set_ms(w.workflow_execution_timeout),
+        run_timeout_ms: set_ms(w.workflow_run_timeout),
+        task_timeout_ms: set_ms(w.workflow_task_timeout),
+        retry: w.retry_policy.map(to_retry_policy),
+        memo: w.memo.map(|m| m.fields).unwrap_or_default(),
+        search_attributes: w
+            .search_attributes
+            .map(|a| a.indexed_fields)
+            .unwrap_or_default(),
+        start_delay_ms: None,
+        cron_schedule: String::new(),
+        request_id: String::new(),
+        callbacks: vec![],
+        headers: w.header.map(|h| h.fields).unwrap_or_default(),
+    })
+}
+
+fn schedule(schedule: bridge::Schedule) -> DecodeResult<Schedule> {
+    let bridge::Schedule {
+        spec: schedule_spec,
+        action: start,
+        overlap_policy,
+        catchup_window_ms,
+        pause_on_failure,
+        paused,
+        note,
+    } = schedule;
     Ok(Schedule {
-        spec: Some(decode_spec(field(&f, 0)?)?),
-        action: Some(action(decode_start_request(field(&f, 1)?)?)),
+        spec: Some(spec(schedule_spec)?),
+        action: Some(action(start.try_into()?)),
         policies: Some(SchedulePolicies {
-            overlap_policy: get(&f, 2)?,
-            catchup_window: decode_opt_ms(field(&f, 3)?)?,
-            pause_on_failure: get(&f, 4)?,
+            overlap_policy: n(overlap_policy, "Schedule.overlap_policy")?,
+            catchup_window: opt_ms(catchup_window_ms, "Schedule.catchup_window_ms")?,
+            pause_on_failure,
             ..Default::default()
         }),
         state: Some(ScheduleState {
-            paused: get(&f, 5)?,
-            notes: get(&f, 6)?,
+            paused,
+            notes: note,
             ..Default::default()
         }),
     })
 }
 
-fn encode_schedule<'a>(env: Env<'a>, s: Schedule) -> Term<'a> {
+fn to_schedule(s: Schedule) -> Result<bridge::Schedule, tonic::Status> {
     let policies = s.policies.unwrap_or_default();
     let state = s.state.unwrap_or_default();
-    rec(
-        env,
-        "schedule",
-        &[
-            encode_spec(env, &s.spec.unwrap_or_default()),
-            encode_action(env, s.action),
-            policies.overlap_policy.encode(env),
-            option(
-                env,
-                duration_ms(policies.catchup_window)
-                    .filter(|ms| *ms > 0)
-                    .map(|ms| ms.encode(env)),
-            ),
-            policies.pause_on_failure.encode(env),
-            state.paused.encode(env),
-            state.notes.encode(env),
-        ],
-    )
+    Ok(bridge::Schedule {
+        spec: to_spec(s.spec.unwrap_or_default()),
+        action: to_start_request(s.action)?,
+        overlap_policy: i64::from(policies.overlap_policy),
+        catchup_window_ms: set_ms(policies.catchup_window),
+        pause_on_failure: policies.pause_on_failure,
+        paused: state.paused,
+        note: state.notes,
+    })
 }
 
-fn encode_info<'a>(env: Env<'a>, info: ScheduleInfo) -> Term<'a> {
-    let recent: Vec<Term> = info
-        .recent_actions
-        .iter()
-        .map(|a| {
-            (
-                millis(a.schedule_time),
-                a.start_workflow_result
-                    .as_ref()
-                    .map(|w| w.workflow_id.as_str())
-                    .unwrap_or(""),
-            )
-                .encode(env)
-        })
-        .collect();
-    let upcoming: Vec<i64> = info
-        .future_action_times
-        .into_iter()
-        .map(|t| millis(Some(t)))
-        .collect();
-    rec(
-        env,
-        "schedule_info",
-        &[
-            info.action_count.encode(env),
-            recent.encode(env),
-            upcoming.encode(env),
-            (info.running_workflows.len() as i64).encode(env),
-        ],
-    )
+fn to_info(info: ScheduleInfo) -> bridge::ScheduleInfo {
+    bridge::ScheduleInfo {
+        action_count: info.action_count,
+        recent_actions: info
+            .recent_actions
+            .into_iter()
+            .map(|a| {
+                (
+                    millis(a.schedule_time),
+                    a.start_workflow_result
+                        .map(|w| w.workflow_id)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect(),
+        next_action_times_ms: info
+            .future_action_times
+            .into_iter()
+            .map(|t| millis(Some(t)))
+            .collect(),
+        running_workflows: count(info.running_workflows.len()),
+    }
+}
+
+fn patch(patch: bridge::SchedulePatch) -> DecodeResult<SchedulePatch> {
+    Ok(match patch {
+        bridge::SchedulePatch::Pause { note } => SchedulePatch {
+            pause: note,
+            ..Default::default()
+        },
+        bridge::SchedulePatch::Unpause { note } => SchedulePatch {
+            unpause: note,
+            ..Default::default()
+        },
+        bridge::SchedulePatch::Trigger { overlap_policy } => SchedulePatch {
+            trigger_immediately: Some(TriggerImmediatelyRequest {
+                overlap_policy: n(overlap_policy, "Trigger.overlap_policy")?,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        bridge::SchedulePatch::Backfill {
+            from_ms,
+            to_ms,
+            overlap_policy,
+        } => SchedulePatch {
+            backfill_request: vec![BackfillRequest {
+                start_time: Some(timestamp(from_ms)),
+                end_time: Some(timestamp(to_ms)),
+                overlap_policy: n(overlap_policy, "Backfill.overlap_policy")?,
+            }],
+            ..Default::default()
+        },
+    })
 }
 
 fn unit<'a>(env: Env<'a>, r: Result<(), tonic::Status>) -> Term<'a> {
@@ -303,13 +324,14 @@ fn schedule_put<'a>(
     conflict_token: Term<'a>,
     trigger_immediately: bool,
 ) -> Term<'a> {
-    let schedule = match decode_schedule(schedule) {
+    let schedule = match bridge::Schedule::from_term(schedule).and_then(self::schedule) {
         Ok(s) => s,
         Err(e) => return invalid(env, format!("invalid schedule: {e}")),
     };
-    let conflict_token: Option<Vec<u8>> = opt(conflict_token)
-        .and_then(|t| t.decode::<rustler::Binary>().ok())
-        .map(|b| b.as_slice().to_vec());
+    let conflict_token = match Option::<Bytes>::from_term(conflict_token) {
+        Ok(token) => token.map(|token| token.0),
+        Err(e) => return invalid(env, format!("invalid conflict token: {e}")),
+    };
     let fut = async move {
         let mut service = conn.connection.workflow_service();
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -374,17 +396,18 @@ fn schedule_describe<'a>(
             .await
             .map(|r| r.into_inner())
     };
-    spawn_reply(pid, reference, fut, |env, r| match r {
-        Ok(d) => ok(
-            env,
-            (
-                encode_schedule(env, d.schedule.unwrap_or_default()),
-                encode_info(env, d.info.unwrap_or_default()),
-                bin(env, &d.conflict_token),
-            )
-                .encode(env),
-        ),
-        Err(s) => rpc_err(env, &s),
+    spawn_reply(pid, reference, fut, |env, r| {
+        let described = r.and_then(|d| {
+            Ok((
+                to_schedule(d.schedule.unwrap_or_default())?,
+                to_info(d.info.unwrap_or_default()),
+                Bytes(d.conflict_token),
+            ))
+        });
+        match described {
+            Ok(described) => ok(env, described.to_term(env)),
+            Err(s) => rpc_err(env, &s),
+        }
     });
     atoms::ok()
 }
@@ -425,44 +448,7 @@ fn schedule_patch<'a>(
     schedule_id: String,
     patch: Term<'a>,
 ) -> Term<'a> {
-    let patch = match untag(patch) {
-        Ok((tag, f)) => match tag.as_str() {
-            "pause" => get(&f, 0).map(|note| SchedulePatch {
-                pause: note,
-                ..Default::default()
-            }),
-            "unpause" => get(&f, 0).map(|note| SchedulePatch {
-                unpause: note,
-                ..Default::default()
-            }),
-            "trigger" => get(&f, 0).map(|overlap_policy| SchedulePatch {
-                trigger_immediately: Some(TriggerImmediatelyRequest {
-                    overlap_policy,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            "backfill" => (|| {
-                let from: i64 = get(&f, 0)?;
-                let to: i64 = get(&f, 1)?;
-                let timestamp = |ms: i64| prost_wkt_types::Timestamp {
-                    seconds: ms.div_euclid(1000),
-                    nanos: (ms.rem_euclid(1000) * 1_000_000) as i32,
-                };
-                Ok(SchedulePatch {
-                    backfill_request: vec![BackfillRequest {
-                        start_time: Some(timestamp(from)),
-                        end_time: Some(timestamp(to)),
-                        overlap_policy: get(&f, 2)?,
-                    }],
-                    ..Default::default()
-                })
-            })(),
-            other => Err(format!("unknown patch {other}")),
-        },
-        Err(e) => Err(e),
-    };
-    let patch = match patch {
+    let patch = match bridge::SchedulePatch::from_term(patch).and_then(self::patch) {
         Ok(p) => p,
         Err(e) => return invalid(env, e),
     };

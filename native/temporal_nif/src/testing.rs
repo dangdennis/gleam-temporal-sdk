@@ -1,6 +1,12 @@
 //! Test servers: start and stop one, and control the time-skipping server's clock.
 
-use crate::{ConnectionRes, atoms, client::rpc_err, convert::*, err, ok, spawn_reply};
+use crate::{
+    ConnectionRes, atoms, bridge,
+    client::{invalid, rpc_err},
+    convert::{millis, ms},
+    err, ok, spawn_reply,
+    wire::Wire,
+};
 use rustler::{Atom, Encoder, Env, LocalPid, ResourceArc, Term};
 use std::{process::Stdio, time::Duration};
 use temporalio_common::protos::temporal::api::testservice::v1::{
@@ -28,11 +34,18 @@ fn server_start<'a>(
     env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
-    kind: Atom,
+    kind: Term<'a>,
     exe: Term<'a>,
-) -> Atom {
-    let time_skipping = kind == Atom::from_str(env, "time_skipping").unwrap();
-    let exe = match opt(exe).and_then(|t| t.decode::<String>().ok()) {
+) -> Term<'a> {
+    let kind = match bridge::ServerKind::from_term(kind) {
+        Ok(kind) => kind,
+        Err(e) => return err(env, format!("invalid server kind: {e}")),
+    };
+    let exe = match Option::<String>::from_term(exe) {
+        Ok(exe) => exe,
+        Err(e) => return err(env, format!("invalid executable: {e}")),
+    };
+    let exe = match exe {
         Some(path) => EphemeralExe::ExistingPath(path),
         None => EphemeralExe::CachedDownload {
             version: EphemeralExeVersion::SDKDefault {
@@ -44,21 +57,24 @@ fn server_start<'a>(
         },
     };
     let fut = async move {
-        let started = if time_skipping {
-            TestServerConfig::builder()
-                .exe(exe)
-                .startup_timeout(Duration::from_secs(30))
-                .build()
-                .start_server_with_output(Stdio::null(), Stdio::null())
-                .await
-        } else {
-            TemporalDevServerConfig::builder()
-                .exe(exe)
-                .startup_timeout(Duration::from_secs(30))
-                .log(("pretty".to_string(), "error".to_string()))
-                .build()
-                .start_server_with_output(Stdio::null(), Stdio::null())
-                .await
+        let started = match kind {
+            bridge::ServerKind::TimeSkipping => {
+                TestServerConfig::builder()
+                    .exe(exe)
+                    .startup_timeout(Duration::from_secs(30))
+                    .build()
+                    .start_server_with_output(Stdio::null(), Stdio::null())
+                    .await
+            }
+            bridge::ServerKind::Dev => {
+                TemporalDevServerConfig::builder()
+                    .exe(exe)
+                    .startup_timeout(Duration::from_secs(30))
+                    .log(("pretty".to_string(), "error".to_string()))
+                    .build()
+                    .start_server_with_output(Stdio::null(), Stdio::null())
+                    .await
+            }
         };
         started.map_err(|e| format!("could not start the server: {e}"))
     };
@@ -72,7 +88,7 @@ fn server_start<'a>(
         }
         Err(e) => err(env, e),
     });
-    atoms::ok()
+    atoms::ok().encode(env)
 }
 
 #[rustler::nif]
@@ -86,11 +102,21 @@ fn server_stop<'a>(pid: LocalPid, reference: Term<'a>, server: ResourceArc<Serve
     atoms::ok()
 }
 
+/// `bridge.TimeOp`, with the time to sleep already checked.
 enum TimeOp {
     Lock,
     Unlock,
-    Sleep(u64),
+    Sleep(prost_wkt_types::Duration),
     Now,
+}
+
+fn time_op(op: bridge::TimeOp) -> Result<TimeOp, String> {
+    Ok(match op {
+        bridge::TimeOp::Lock => TimeOp::Lock,
+        bridge::TimeOp::Unlock => TimeOp::Unlock,
+        bridge::TimeOp::Sleep { ms: length } => TimeOp::Sleep(ms(length, "Sleep.ms")?),
+        bridge::TimeOp::Now => TimeOp::Now,
+    })
 }
 
 /// Control a time-skipping server's clock: `lock`, `unlock`, `{sleep, Ms}` (let that much
@@ -104,15 +130,9 @@ fn time_control<'a>(
     conn: ResourceArc<ConnectionRes>,
     op: Term<'a>,
 ) -> Term<'a> {
-    let op = match untag(op) {
-        Ok((tag, f)) => match (tag.as_str(), get::<u64>(&f, 0)) {
-            ("lock", _) => TimeOp::Lock,
-            ("unlock", _) => TimeOp::Unlock,
-            ("now", _) => TimeOp::Now,
-            ("sleep", Ok(ms)) => TimeOp::Sleep(ms),
-            _ => return err(env, "unknown time operation"),
-        },
-        Err(e) => return err(env, e),
+    let op = match bridge::TimeOp::from_term(op).and_then(time_op) {
+        Ok(op) => op,
+        Err(e) => return invalid(env, e),
     };
     let fut = async move {
         let mut service = conn.connection.test_service();
@@ -125,10 +145,10 @@ fn time_control<'a>(
                 .unlock_time_skipping(UnlockTimeSkippingRequest {}.into_request())
                 .await
                 .map(|_| 0),
-            TimeOp::Sleep(ms) => service
+            TimeOp::Sleep(length) => service
                 .unlock_time_skipping_with_sleep(
                     SleepRequest {
-                        duration: Some(duration(ms)),
+                        duration: Some(length),
                     }
                     .into_request(),
                 )

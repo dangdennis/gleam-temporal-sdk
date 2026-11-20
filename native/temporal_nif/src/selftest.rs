@@ -1,8 +1,16 @@
-//! Checks of the term layout shared with `temporal/internal/bridge`, used by the test suite.
-//! The two sides are matched by hand, so the tests send every kind of value across in both
+//! Checks of what crosses to and from `temporal/internal/bridge`, used by the test suite.
+//! The term layout is generated, but which of core's fields goes into which Gleam field is
+//! written by hand in `convert.rs`, so the tests send every kind of value across in both
 //! directions and compare what arrives with what was sent.
 
-use crate::{convert::*, err, ok};
+use crate::{
+    convert::{
+        decode_activity_result, decode_completion, decode_nexus_result, duration, to_activation,
+        to_activity_task,
+    },
+    err, ok,
+    wire::Wire,
+};
 use rustler::{Encoder, Env, Term};
 use temporalio_common::protos::{
     coresdk::{
@@ -194,51 +202,47 @@ fn sample_activation(env: Env) -> Term {
             reason: 3,
         }),
     ];
-    encode_activation(
-        env,
-        WorkflowActivation {
-            run_id: "run".to_string(),
-            timestamp: Some(timestamp(1234)),
-            is_replaying: true,
-            history_length: 9,
-            jobs: jobs
-                .into_iter()
-                .map(|variant| WorkflowActivationJob {
-                    variant: Some(variant),
-                })
-                .collect(),
-            continue_as_new_suggested: true,
-            ..Default::default()
-        },
-    )
+    to_activation(WorkflowActivation {
+        run_id: "run".to_string(),
+        timestamp: Some(timestamp(1234)),
+        is_replaying: true,
+        history_length: 9,
+        jobs: jobs
+            .into_iter()
+            .map(|variant| WorkflowActivationJob {
+                variant: Some(variant),
+            })
+            .collect(),
+        continue_as_new_suggested: true,
+        ..Default::default()
+    })
+    .to_term(env)
 }
 
 /// An activity task with each field set to a value of its own.
 #[rustler::nif]
 fn sample_activity_task(env: Env) -> Term {
-    encode_activity_task(
-        env,
-        ActivityTask {
-            task_token: b"token".to_vec(),
-            variant: Some(activity_task::Variant::Start(Start {
-                workflow_type: "workflow-type".to_string(),
-                workflow_execution: Some(WorkflowExecution {
-                    workflow_id: "workflow-id".to_string(),
-                    run_id: "ignored".to_string(),
-                }),
-                activity_id: "activity-id".to_string(),
-                activity_type: "activity-type".to_string(),
-                input: vec![payload("1")],
-                heartbeat_details: vec![payload("2")],
-                scheduled_time: Some(timestamp(4321)),
-                attempt: 5,
-                start_to_close_timeout: Some(duration(6000)),
-                heartbeat_timeout: Some(duration(700)),
-                is_local: true,
-                header_fields: [("trace".to_string(), payload("3"))].into(),
-                run_id: "run-id".to_string(),
-                ..Default::default()
-            })),
-        },
-    )
+    to_activity_task(ActivityTask {
+        task_token: b"token".to_vec(),
+        variant: Some(activity_task::Variant::Start(Start {
+            workflow_type: "workflow-type".to_string(),
+            workflow_execution: Some(WorkflowExecution {
+                workflow_id: "workflow-id".to_string(),
+                run_id: "ignored".to_string(),
+            }),
+            activity_id: "activity-id".to_string(),
+            activity_type: "activity-type".to_string(),
+            input: vec![payload("1")],
+            heartbeat_details: vec![payload("2")],
+            scheduled_time: Some(timestamp(4321)),
+            attempt: 5,
+            start_to_close_timeout: Some(duration(6000)),
+            heartbeat_timeout: Some(duration(700)),
+            is_local: true,
+            header_fields: [("trace".to_string(), payload("3"))].into(),
+            run_id: "run-id".to_string(),
+            ..Default::default()
+        })),
+    })
+    .to_term(env)
 }

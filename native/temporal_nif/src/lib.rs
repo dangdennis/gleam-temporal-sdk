@@ -2,18 +2,24 @@
 //!
 //! Every blocking operation is spawned on core's Tokio runtime and answers the calling process
 //! with `{temporal_nif, Ref, Result}`; `temporal_nif.erl` turns that back into a blocking call.
-//! Terms are encoded directly in the shape of the Gleam types in `temporal/internal/bridge`.
+//! What crosses is a type from `temporal/internal/bridge`: `bridge.rs` has the same types,
+//! generated from the Gleam ones, and `convert.rs` maps them to and from core's messages.
 
 // NIF arguments are positional and mirror the Erlang call, so they cannot be grouped.
 #![allow(clippy::too_many_arguments)]
 
+mod bridge;
 mod client;
 mod convert;
 mod schedule;
 mod selftest;
 mod testing;
+mod wire;
 
-use convert::*;
+use convert::{
+    decode_activity_result, decode_completion, decode_nexus_result, n, to_activation,
+    to_activity_task, to_nexus_task,
+};
 use futures_util::stream;
 use prost::Message;
 use rustler::{Atom, Binary, Encoder, Env, LocalPid, OwnedEnv, ResourceArc, Term};
@@ -37,7 +43,7 @@ use temporalio_common::{
                 self, WorkflowActivationCompletion, workflow_activation_completion::Status,
             },
         },
-        temporal::api::{failure::v1::Failure, history::v1::History},
+        temporal::api::{common::v1::Payload, failure::v1::Failure, history::v1::History},
     },
     worker::{
         VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes,
@@ -48,9 +54,10 @@ use temporalio_sdk_core::{
     WorkerConfig, WorkerVersioningStrategy,
     replay::{HistoryForReplay, ReplayWorkerInput},
 };
+use wire::{DecodeResult, Wire};
 
 mod atoms {
-    rustler::atoms! { ok, error, nil, temporal_nif, shutdown, some, none }
+    rustler::atoms! { ok, error, nil, temporal_nif }
 }
 
 pub struct ConnectionRes {
@@ -225,9 +232,12 @@ fn connect<'a>(
     api_key: Term<'a>,
     tls: Term<'a>,
 ) -> Term<'a> {
-    let api_key: Option<String> = opt(api_key).and_then(|t| t.decode().ok());
-    let tls = match opt(tls).map(decode_tls).transpose() {
-        Ok(tls) => tls,
+    let api_key = match Option::<String>::from_term(api_key) {
+        Ok(key) => key,
+        Err(e) => return err(env, format!("invalid API key: {e}")),
+    };
+    let tls = match Option::<bridge::Tls>::from_term(tls) {
+        Ok(tls) => tls.map(tls_options),
         Err(e) => return err(env, format!("invalid TLS options: {e}")),
     };
     let fut = async move {
@@ -255,40 +265,26 @@ fn connect<'a>(
 
 /// `bridge.Tls`: an optional root CA, an optional server name and an optional client
 /// certificate and key, all PEM.
-fn decode_tls(term: Term) -> DecodeResult<TlsOptions> {
-    let (_, f) = untag(term)?;
-    let bytes = |t: Term| -> DecodeResult<Vec<u8>> {
-        let b: Binary = t.decode().map_err(|_| "expected a BitArray".to_string())?;
-        Ok(b.as_slice().to_vec())
-    };
-    let root = opt(field(&f, 0)?).map(bytes).transpose()?;
-    let domain: Option<String> = opt(field(&f, 1)?)
-        .map(|t| {
-            t.decode()
-                .map_err(|_| "domain must be a String".to_string())
-        })
-        .transpose()?;
-    let client = opt(field(&f, 2)?)
-        .map(|t| {
-            let (cert, key): (Term, Term) = t
-                .decode()
-                .map_err(|_| "bad client certificate".to_string())?;
-            Ok::<_, String>(
-                ClientTlsOptions::builder()
-                    .client_cert(bytes(cert)?)
-                    .client_private_key(bytes(key)?)
-                    .build(),
-            )
-        })
-        .transpose()?;
-    Ok(TlsOptions::builder()
-        .maybe_server_root_ca_cert(root)
+fn tls_options(tls: bridge::Tls) -> TlsOptions {
+    let bridge::Tls {
+        server_root_ca,
+        domain,
+        client_certificate,
+    } = tls;
+    let client = client_certificate.map(|(certificate, key)| {
+        ClientTlsOptions::builder()
+            .client_cert(certificate.0)
+            .client_private_key(key.0)
+            .build()
+    });
+    TlsOptions::builder()
+        .maybe_server_root_ca_cert(server_root_ca.map(|ca| ca.0))
         .maybe_domain(domain)
         .maybe_client_tls_options(client)
-        .build())
+        .build()
 }
 
-/// Mirrors `bridge.WorkerOptions`.
+/// What core is told from `bridge.WorkerOptions`.
 struct WorkerOptions {
     max_cached_workflows: usize,
     max_workflow_tasks: usize,
@@ -300,31 +296,48 @@ struct WorkerOptions {
     shutdown_grace: Duration,
 }
 
-fn decode_worker_options(term: Term) -> DecodeResult<WorkerOptions> {
-    let (_, f) = untag(term)?;
-    let rate = |i: usize| -> DecodeResult<Option<f64>> {
-        opt(field(&f, i)?)
-            .map(|t| t.decode().map_err(|_| "rate must be a Float".to_string()))
-            .transpose()
-    };
+fn worker_options(options: bridge::WorkerOptions) -> DecodeResult<WorkerOptions> {
+    let bridge::WorkerOptions {
+        max_cached_workflows,
+        max_concurrent_workflow_tasks,
+        max_concurrent_activities,
+        max_task_queue_activities_per_second,
+        max_activities_per_second,
+        enable_workflows,
+        enable_activities,
+        enable_nexus,
+        deployment,
+        shutdown_grace_ms,
+    } = options;
     Ok(WorkerOptions {
-        max_cached_workflows: get(&f, 0)?,
-        max_workflow_tasks: get(&f, 1)?,
-        max_activities: get(&f, 2)?,
-        task_queue_activities_per_second: rate(3)?,
-        worker_activities_per_second: rate(4)?,
+        max_cached_workflows: n(max_cached_workflows, "WorkerOptions.max_cached_workflows")?,
+        max_workflow_tasks: n(
+            max_concurrent_workflow_tasks,
+            "WorkerOptions.max_concurrent_workflow_tasks",
+        )?,
+        max_activities: n(
+            max_concurrent_activities,
+            "WorkerOptions.max_concurrent_activities",
+        )?,
+        task_queue_activities_per_second: max_task_queue_activities_per_second,
+        worker_activities_per_second: max_activities_per_second,
         task_types: WorkerTaskTypes {
-            enable_workflows: get(&f, 5)?,
+            enable_workflows,
             // Local activities run in the worker that runs the workflow.
-            enable_local_activities: get(&f, 5)?,
-            enable_remote_activities: get(&f, 6)?,
-            enable_nexus: get(&f, 7)?,
+            enable_local_activities: enable_workflows,
+            enable_remote_activities: enable_activities,
+            enable_nexus,
         },
-        versioning: match opt(field(&f, 8)?) {
+        versioning: match deployment {
             None => unversioned(),
             Some(deployment) => {
-                let (_, d) = untag(deployment)?;
-                let behavior = match get::<i32>(&d, 3)? {
+                let bridge::Deployment {
+                    name,
+                    build_id,
+                    use_versioning,
+                    default_behavior,
+                } = deployment;
+                let behavior = match n::<i32>(default_behavior, "Deployment.default_behavior")? {
                     1 => Some(VersioningBehavior::Pinned),
                     2 => Some(VersioningBehavior::AutoUpgrade),
                     _ => None,
@@ -332,17 +345,20 @@ fn decode_worker_options(term: Term) -> DecodeResult<WorkerOptions> {
                 WorkerVersioningStrategy::WorkerDeploymentBased(
                     WorkerDeploymentOptions::new(
                         WorkerDeploymentVersion::builder()
-                            .deployment_name(get::<String>(&d, 0)?)
-                            .build_id(get::<String>(&d, 1)?)
+                            .deployment_name(name)
+                            .build_id(build_id)
                             .build(),
                     )
-                    .use_worker_versioning(get(&d, 2)?)
+                    .use_worker_versioning(use_versioning)
                     .maybe_default_versioning_behavior(behavior)
                     .build(),
                 )
             }
         },
-        shutdown_grace: Duration::from_millis(get(&f, 9)?),
+        shutdown_grace: Duration::from_millis(n(
+            shutdown_grace_ms,
+            "WorkerOptions.shutdown_grace_ms",
+        )?),
     })
 }
 
@@ -384,7 +400,7 @@ fn worker_new<'a>(
     task_queue: String,
     options: Term<'a>,
 ) -> Term<'a> {
-    let options = match decode_worker_options(options) {
+    let options = match bridge::WorkerOptions::from_term(options).and_then(worker_options) {
         Ok(o) => o,
         Err(e) => return err(env, format!("invalid worker options: {e}")),
     };
@@ -464,10 +480,13 @@ fn replay_worker_new<'a>(
 }
 
 fn poll_error<'a>(env: Env<'a>, e: PollError) -> Term<'a> {
-    match e {
-        PollError::ShutDown => (atoms::error(), atoms::shutdown()).encode(env),
-        other => (atoms::error(), (atoms::error(), other.to_string())).encode(env),
-    }
+    let error = match e {
+        PollError::ShutDown => bridge::PollError::Shutdown,
+        other => bridge::PollError::PollFailed {
+            message: other.to_string(),
+        },
+    };
+    (atoms::error(), error.to_term(env)).encode(env)
 }
 
 #[rustler::nif]
@@ -479,7 +498,7 @@ fn worker_poll_workflow<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<W
         reference,
         fut,
         |env, r| match r {
-            Ok(activation) => ok(env, encode_activation(env, activation)),
+            Ok(activation) => ok(env, to_activation(activation).to_term(env)),
             Err(e) => poll_error(env, e),
         },
         // The run id, and whether the activation only evicts the run.
@@ -545,7 +564,7 @@ fn worker_poll_activity<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<W
         reference,
         fut,
         |env, r| match r {
-            Ok(task) => ok(env, encode_activity_task(env, task)),
+            Ok(task) => ok(env, to_activity_task(task).to_term(env)),
             Err(e) => poll_error(env, e),
         },
         // The token of a task that starts an activity.
@@ -605,7 +624,7 @@ fn worker_heartbeat<'a>(
     task_token: Binary<'a>,
     details: Term<'a>,
 ) -> Atom {
-    if let Ok(details) = decode_payloads(details) {
+    if let Ok(details) = Vec::<Payload>::from_term(details) {
         let _guard = runtime().tokio_handle().enter();
         w.worker.record_activity_heartbeat(ActivityHeartbeat {
             task_token: task_token.as_slice().to_vec(),
@@ -624,7 +643,7 @@ fn worker_poll_nexus<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<Work
         reference,
         fut,
         |env, r| match r {
-            Ok(task) => ok(env, encode_nexus_task(env, task)),
+            Ok(task) => ok(env, to_nexus_task(task).to_term(env)),
             Err(e) => poll_error(env, e),
         },
         |r| match r {

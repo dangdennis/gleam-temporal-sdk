@@ -57,7 +57,7 @@ poll_update(Conn, Id, RunId, UpdateId) ->
     call(fun(P, R) -> temporal_nif:poll_update(P, R, Conn, Id, RunId, UpdateId) end).
 
 poll_nexus(Worker) ->
-    poll_error(call(fun(P, R) -> temporal_nif:worker_poll_nexus(P, R, Worker) end)).
+    call(fun(P, R) -> temporal_nif:worker_poll_nexus(P, R, Worker) end).
 
 complete_nexus(Worker, Token, Result) ->
     call(fun(P, R) -> temporal_nif:worker_complete_nexus(P, R, Worker, Token, Result) end).
@@ -82,17 +82,14 @@ worker_new(Conn, TaskQueue, Options) ->
 replay_worker_new(TaskQueue, Histories) ->
     temporal_nif:replay_worker_new(TaskQueue, Histories).
 
-poll_error({error, {error, Message}}) -> {error, {poll_failed, Message}};
-poll_error(Other) -> Other.
-
 poll_workflow(Worker) ->
-    poll_error(call(fun(P, R) -> temporal_nif:worker_poll_workflow(P, R, Worker) end)).
+    call(fun(P, R) -> temporal_nif:worker_poll_workflow(P, R, Worker) end).
 
 complete_workflow(Worker, Completion) ->
     call(fun(P, R) -> temporal_nif:worker_complete_workflow(P, R, Worker, Completion) end).
 
 poll_activity(Worker) ->
-    poll_error(call(fun(P, R) -> temporal_nif:worker_poll_activity(P, R, Worker) end)).
+    call(fun(P, R) -> temporal_nif:worker_poll_activity(P, R, Worker) end).
 
 complete_activity(Worker, Token, Result) ->
     call(fun(P, R) -> temporal_nif:worker_complete_activity(P, R, Worker, Token, Result) end).

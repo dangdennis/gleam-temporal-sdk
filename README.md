@@ -393,13 +393,14 @@ bin/build-nif   # compile the Rust NIF into priv/
 bin/test        # build, start a dev server if none is running, run every test
 bin/conformance # bin/test, then replay this SDK's histories on the TypeScript SDK
 bin/load        # thousands of workflows while workers are killed
+bin/codegen     # regenerate the Rust boundary types after changing bridge.gleam
 ```
 
 ## How correctness is checked
 
 | Layer | What it shows | Where |
 |---|---|---|
-| Boundary layout | Every job, command, activity result and Nexus result crosses the Gleam–Rust boundary and arrives with each field in place; nothing else checks that hand-matched layout | `test/bridge_test.gleam` |
+| Boundary layout | Every job, command, activity result and Nexus result crosses the Gleam–Rust boundary and arrives with each field in place. The Rust types are generated from the Gleam ones, so this mainly guards the mapping to core's messages | `test/bridge_test.gleam` |
 | Runtime unit tests | For hand-written activations, the runtime emits exactly the expected commands, in order. No server or NIF involved | `test/runtime_test.gleam` |
 | End-to-end scenarios | Each feature works against a real Temporal server | `test/integration_test.gleam`, `test/features_test.gleam`, `test/advanced_test.gleam`, `test/schedule_test.gleam` |
 | Replay on every task | Every workflow scenario also runs with the workflow cache disabled, so each workflow task replays the run from the start; core fails the task on any divergence | same files |

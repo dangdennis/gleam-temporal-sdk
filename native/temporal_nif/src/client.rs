@@ -1,8 +1,13 @@
 //! Client operations: raw `WorkflowService` calls over the shared connection.
 
-use crate::{ConnectionRes, atoms, convert::*, ok, spawn_reply};
+use crate::{
+    ConnectionRes, atoms, bridge,
+    convert::{decode_activity_result, memo, millis, n, opt_ms, retry_policy, search_attributes},
+    ok, spawn_reply,
+    wire::{Bytes, Wire},
+};
 use rustler::{Atom, Encoder, Env, LocalPid, ResourceArc, Term};
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 use temporalio_common::protos::temporal::api::{
     common::v1::{
         Callback, Header, Memo, Payload, Payloads, RetryPolicy, SearchAttributes,
@@ -34,7 +39,7 @@ fn execution(workflow_id: String, run_id: String) -> Option<WorkflowExecution> {
 }
 
 fn payloads_arg<'a>(env: Env<'a>, term: Term<'a>) -> Result<Vec<Payload>, Term<'a>> {
-    decode_payloads(term).map_err(|e| invalid(env, format!("invalid payloads: {e}")))
+    Vec::<Payload>::from_term(term).map_err(|e| invalid(env, format!("invalid payloads: {e}")))
 }
 
 fn unit_reply<'a>(env: Env<'a>, r: Result<(), tonic::Status>) -> Term<'a> {
@@ -46,15 +51,11 @@ fn unit_reply<'a>(env: Env<'a>, r: Result<(), tonic::Status>) -> Term<'a> {
 
 /// A gRPC failure as `bridge.RpcError`.
 pub fn rpc_err<'a>(env: Env<'a>, s: &tonic::Status) -> Term<'a> {
-    (
-        atoms::error(),
-        rec(
-            env,
-            "rpc_error",
-            &[(s.code() as i32).encode(env), s.message().encode(env)],
-        ),
-    )
-        .encode(env)
+    let error = bridge::RpcError {
+        code: i64::from(s.code() as i32),
+        message: s.message().to_string(),
+    };
+    (atoms::error(), error.to_term(env)).encode(env)
 }
 
 /// A request rejected before it was sent, reported like the server's `InvalidArgument`.
@@ -62,7 +63,7 @@ pub fn invalid<'a>(env: Env<'a>, message: impl AsRef<str>) -> Term<'a> {
     rpc_err(env, &tonic::Status::invalid_argument(message.as_ref()))
 }
 
-/// Mirrors `bridge.StartRequest`.
+/// `bridge.StartRequest` in the messages the server takes.
 pub struct StartRequest {
     pub workflow_id: String,
     pub workflow_type: String,
@@ -83,39 +84,65 @@ pub struct StartRequest {
     pub header: Option<Header>,
 }
 
-pub fn decode_start_request(term: Term) -> DecodeResult<StartRequest> {
-    let (_, f) = untag(term)?;
-    Ok(StartRequest {
-        workflow_id: get(&f, 0)?,
-        workflow_type: get(&f, 1)?,
-        task_queue: get(&f, 2)?,
-        input: decode_payloads(field(&f, 3)?)?,
-        id_reuse_policy: get(&f, 4)?,
-        id_conflict_policy: get(&f, 5)?,
-        execution_timeout: decode_opt_ms(field(&f, 6)?)?,
-        run_timeout: decode_opt_ms(field(&f, 7)?)?,
-        task_timeout: decode_opt_ms(field(&f, 8)?)?,
-        retry: opt(field(&f, 9)?).map(decode_retry).transpose()?,
-        memo: decode_memo(field(&f, 10)?)?,
-        search_attributes: decode_search_attributes(field(&f, 11)?)?,
-        start_delay: decode_opt_ms(field(&f, 12)?)?,
-        cron_schedule: get(&f, 13)?,
-        request_id: match get::<String>(&f, 14)? {
-            id if id.is_empty() => uuid::Uuid::new_v4().to_string(),
-            id => id,
-        },
-        callbacks: get::<Vec<(String, HashMap<String, String>)>>(&f, 15)?
-            .into_iter()
-            .map(|(url, header)| Callback {
-                variant: Some(callback::Variant::Nexus(callback::Nexus { url, header })),
-                ..Default::default()
-            })
-            .collect(),
-        header: {
-            let fields = decode_payload_map(field(&f, 16)?)?;
-            (!fields.is_empty()).then_some(Header { fields })
-        },
-    })
+impl TryFrom<bridge::StartRequest> for StartRequest {
+    type Error = String;
+
+    fn try_from(request: bridge::StartRequest) -> Result<Self, String> {
+        let bridge::StartRequest {
+            workflow_id,
+            workflow_type,
+            task_queue,
+            input,
+            id_reuse_policy,
+            id_conflict_policy,
+            execution_timeout_ms,
+            run_timeout_ms,
+            task_timeout_ms,
+            retry,
+            memo: memo_fields,
+            search_attributes: attributes,
+            start_delay_ms,
+            cron_schedule,
+            request_id,
+            callbacks,
+            headers,
+        } = request;
+        Ok(StartRequest {
+            workflow_id,
+            workflow_type,
+            task_queue,
+            input,
+            id_reuse_policy: n(id_reuse_policy, "StartRequest.id_reuse_policy")?,
+            id_conflict_policy: n(id_conflict_policy, "StartRequest.id_conflict_policy")?,
+            execution_timeout: opt_ms(execution_timeout_ms, "StartRequest.execution_timeout_ms")?,
+            run_timeout: opt_ms(run_timeout_ms, "StartRequest.run_timeout_ms")?,
+            task_timeout: opt_ms(task_timeout_ms, "StartRequest.task_timeout_ms")?,
+            retry: retry.map(retry_policy).transpose()?,
+            memo: memo(memo_fields),
+            search_attributes: search_attributes(attributes),
+            start_delay: opt_ms(start_delay_ms, "StartRequest.start_delay_ms")?,
+            cron_schedule,
+            request_id: if request_id.is_empty() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                request_id
+            },
+            callbacks: callbacks
+                .into_iter()
+                .map(|(url, header)| Callback {
+                    variant: Some(callback::Variant::Nexus(callback::Nexus { url, header })),
+                    ..Default::default()
+                })
+                .collect(),
+            header: (!headers.is_empty()).then_some(Header { fields: headers }),
+        })
+    }
+}
+
+fn start_request_arg<'a>(env: Env<'a>, term: Term<'a>) -> Result<StartRequest, Term<'a>> {
+    bridge::StartRequest::from_term(term)
+        .and_then(StartRequest::try_from)
+        .map_err(|e| invalid(env, format!("invalid start request: {e}")))
 }
 
 /// Start a workflow, or, when `signal` is `{some, {Name, Input}}`, signal it and start it
@@ -129,20 +156,13 @@ fn start_workflow<'a>(
     request: Term<'a>,
     signal: Term<'a>,
 ) -> Term<'a> {
-    let r = match decode_start_request(request) {
+    let r = match start_request_arg(env, request) {
         Ok(r) => r,
-        Err(e) => return invalid(env, format!("invalid start request: {e}")),
+        Err(e) => return e,
     };
-    let signal: Option<(String, Vec<Payload>)> = match opt(signal) {
-        None => None,
-        Some(t) => match t
-            .decode::<(String, Term)>()
-            .map_err(|_| "bad signal".to_string())
-            .and_then(|(name, input)| Ok((name, decode_payloads(input)?)))
-        {
-            Ok(s) => Some(s),
-            Err(e) => return invalid(env, format!("invalid signal: {e}")),
-        },
+    let signal = match Option::<(String, Vec<Payload>)>::from_term(signal) {
+        Ok(signal) => signal,
+        Err(e) => return invalid(env, format!("invalid signal: {e}")),
     };
     let fut = async move {
         let mut service = conn.connection.workflow_service();
@@ -224,15 +244,13 @@ fn start_workflow<'a>(
     atoms::ok().encode(env)
 }
 
-fn encode_update_outcome<'a>(env: Env<'a>, outcome: Option<UpdateOutcome>) -> Term<'a> {
+fn to_update_outcome(outcome: Option<UpdateOutcome>) -> bridge::UpdateOutcome {
     match outcome.and_then(|o| o.value) {
-        Some(outcome::Value::Success(p)) => rec(
-            env,
-            "update_succeeded",
-            &[encode_payloads(env, &p.payloads)],
-        ),
-        Some(outcome::Value::Failure(f)) => rec(env, "update_failed", &[encode_failure(env, &f)]),
-        None => atom(env, "update_pending"),
+        Some(outcome::Value::Success(p)) => {
+            bridge::UpdateOutcome::UpdateSucceeded { result: p.payloads }
+        }
+        Some(outcome::Value::Failure(failure)) => bridge::UpdateOutcome::UpdateFailed { failure },
+        None => bridge::UpdateOutcome::UpdatePending,
     }
 }
 
@@ -312,7 +330,7 @@ fn update_workflow<'a>(
     spawn_reply(pid, reference, fut, |env, r| match r {
         Ok((run_id, update_id, outcome)) => ok(
             env,
-            (run_id, update_id, encode_update_outcome(env, outcome)).encode(env),
+            (run_id, update_id, to_update_outcome(outcome)).to_term(env),
         ),
         Err(s) => rpc_err(env, &s),
     });
@@ -358,42 +376,31 @@ fn poll_update<'a>(
         }
     };
     spawn_reply(pid, reference, fut, |env, r| match r {
-        Ok(outcome) => ok(env, encode_update_outcome(env, outcome)),
+        Ok(outcome) => ok(env, to_update_outcome(outcome).to_term(env)),
         Err(s) => rpc_err(env, &s),
     });
     atoms::ok()
 }
 
 /// `bridge.Execution` from the server's description of a run.
-fn encode_execution<'a>(env: Env<'a>, info: WorkflowExecutionInfo) -> Term<'a> {
+fn to_execution(info: WorkflowExecutionInfo) -> bridge::Execution {
     let execution = info.execution.unwrap_or_default();
-    let close = info.close_time.map(|t| millis(Some(t)).encode(env));
-    rec(
-        env,
-        "execution",
-        &[
-            execution.workflow_id.encode(env),
-            execution.run_id.encode(env),
-            info.r#type.map(|t| t.name).unwrap_or_default().encode(env),
-            info.task_queue.encode(env),
-            info.status.encode(env),
-            millis(info.start_time).encode(env),
-            option(env, close),
-            info.history_length.encode(env),
-            encode_payload_map(env, &info.memo.map(|m| m.fields).unwrap_or_default()),
-            encode_payload_map(
-                env,
-                &info
-                    .search_attributes
-                    .map(|a| a.indexed_fields)
-                    .unwrap_or_default(),
-            ),
-            option(
-                env,
-                info.parent_execution.map(|p| p.workflow_id.encode(env)),
-            ),
-        ],
-    )
+    bridge::Execution {
+        workflow_id: execution.workflow_id,
+        run_id: execution.run_id,
+        workflow_type: info.r#type.map(|t| t.name).unwrap_or_default(),
+        task_queue: info.task_queue,
+        status: i64::from(info.status),
+        start_time_ms: millis(info.start_time),
+        close_time_ms: info.close_time.map(|t| millis(Some(t))),
+        history_length: info.history_length,
+        memo: info.memo.map(|m| m.fields).unwrap_or_default(),
+        search_attributes: info
+            .search_attributes
+            .map(|a| a.indexed_fields)
+            .unwrap_or_default(),
+        parent_workflow_id: info.parent_execution.map(|p| p.workflow_id),
+    }
 }
 
 #[rustler::nif]
@@ -416,7 +423,7 @@ fn describe_workflow<'a>(
             .map(|r| r.into_inner().workflow_execution_info.unwrap_or_default())
     };
     spawn_reply(pid, reference, fut, |env, r| match r {
-        Ok(info) => ok(env, encode_execution(env, info)),
+        Ok(info) => ok(env, to_execution(info).to_term(env)),
         Err(s) => rpc_err(env, &s),
     });
     atoms::ok()
@@ -457,11 +464,8 @@ fn list_workflows<'a>(
     };
     spawn_reply(pid, reference, fut, |env, r| match r {
         Ok(found) => {
-            let terms: Vec<Term> = found
-                .into_iter()
-                .map(|info| encode_execution(env, info))
-                .collect();
-            ok(env, terms.encode(env))
+            let found: Vec<bridge::Execution> = found.into_iter().map(to_execution).collect();
+            ok(env, found.to_term(env))
         }
         Err(s) => rpc_err(env, &s),
     });
@@ -561,10 +565,7 @@ fn query_workflow<'a>(
             .map(|r| r.into_inner().query_result.unwrap_or_default().payloads)
     };
     spawn_reply(pid, reference, fut, |env, r| match r {
-        Ok(payloads) => {
-            let terms: Vec<Term> = payloads.iter().map(|p| encode_payload(env, p)).collect();
-            ok(env, terms.encode(env))
-        }
+        Ok(payloads) => ok(env, payloads.to_term(env)),
         Err(s) => rpc_err(env, &s),
     });
     atoms::ok().encode(env)
@@ -721,22 +722,18 @@ fn workflow_result<'a>(
         }
     };
     spawn_reply(pid, reference, fut, |env, r| {
-        let tag = |name: &str| Atom::from_str(env, name).unwrap();
-        match r {
-            Ok(Outcome::Completed(payloads)) => {
-                let terms: Vec<Term> = payloads.iter().map(|p| encode_payload(env, p)).collect();
-                ok(env, (tag("outcome_completed"), terms).encode(env))
+        let outcome = match r {
+            Ok(Outcome::Completed(result)) => bridge::Outcome::OutcomeCompleted { result },
+            Ok(Outcome::Failed(failure)) => bridge::Outcome::OutcomeFailed { failure: *failure },
+            Ok(Outcome::Cancelled) => bridge::Outcome::OutcomeCancelled,
+            Ok(Outcome::Terminated) => bridge::Outcome::OutcomeTerminated,
+            Ok(Outcome::TimedOut) => bridge::Outcome::OutcomeTimedOut,
+            Ok(Outcome::Continued) => {
+                return invalid(env, "continued run has no successor run id");
             }
-            Ok(Outcome::Failed(f)) => ok(
-                env,
-                (tag("outcome_failed"), encode_failure(env, &f)).encode(env),
-            ),
-            Ok(Outcome::Cancelled) => ok(env, tag("outcome_cancelled").encode(env)),
-            Ok(Outcome::Terminated) => ok(env, tag("outcome_terminated").encode(env)),
-            Ok(Outcome::TimedOut) => ok(env, tag("outcome_timed_out").encode(env)),
-            Ok(Outcome::Continued) => invalid(env, "continued run has no successor run id"),
-            Err(s) => rpc_err(env, &s),
-        }
+            Err(s) => return rpc_err(env, &s),
+        };
+        ok(env, outcome.to_term(env))
     });
     atoms::ok()
 }
@@ -774,7 +771,7 @@ fn fetch_history<'a>(
         }
     };
     spawn_reply(pid, reference, fut, |env, r| match r {
-        Ok(bytes) => ok(env, bin(env, &bytes)),
+        Ok(bytes) => ok(env, Bytes(bytes).to_term(env)),
         Err(s) => rpc_err(env, &s),
     });
     atoms::ok()
@@ -825,9 +822,9 @@ fn update_with_start<'a>(
         execute_multi_operation_request::{Operation, operation},
         execute_multi_operation_response::response,
     };
-    let r = match decode_start_request(request) {
+    let r = match start_request_arg(env, request) {
         Ok(r) => r,
-        Err(e) => return invalid(env, format!("invalid start request: {e}")),
+        Err(e) => return e,
     };
     let args = match payloads_arg(env, input) {
         Ok(p) => p,
@@ -892,7 +889,7 @@ fn update_with_start<'a>(
     spawn_reply(pid, reference, fut, |env, r| match r {
         Ok((run_id, update_id, outcome)) => ok(
             env,
-            (run_id, update_id, encode_update_outcome(env, outcome)).encode(env),
+            (run_id, update_id, to_update_outcome(outcome)).to_term(env),
         ),
         Err(s) => rpc_err(env, &s),
     });
