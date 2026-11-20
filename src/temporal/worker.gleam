@@ -53,6 +53,8 @@ pub type Config {
     /// How long activities in flight carry on undisturbed after the worker is asked to
     /// stop, before they are told to cancel.
     shutdown_grace: Duration,
+    /// Whether the worker stops gracefully when the operating system sends SIGTERM.
+    drain_on_shutdown_signal: Bool,
   )
 }
 
@@ -76,6 +78,9 @@ pub opaque type Worker {
 
 type Control {
   Stop(reply: Subject(Nil))
+  /// Stop as `Stop` does, but leave the manager process alive and idle afterwards, so
+  /// that a supervisor does not start the worker again in a program that is exiting.
+  Drain(reply: Subject(Nil))
 }
 
 /// A worker for one task queue, with nothing registered yet.
@@ -99,8 +104,9 @@ pub fn new(client: Client, task_queue: String) -> Config {
     outbound: middleware.none(),
     nexus_handlers: [],
     deployment: None,
-    activity_cancellation_grace: Some(duration.seconds(30)),
+    activity_cancellation_grace: Some(duration.seconds(15)),
     shutdown_grace: duration.seconds(10),
+    drain_on_shutdown_signal: True,
   )
 }
 
@@ -257,16 +263,18 @@ pub fn with_deployment(config: Config, deployment: Deployment) -> Config {
 }
 
 /// Kill an activity that is still running this long after it was asked to stop, and report
-/// it as cancelled. The default is thirty seconds. An activity that checks
-/// `activity.is_cancelled` stops well within that; the limit is for one that is stuck, which
-/// would otherwise hold its slot on the worker for good.
+/// it as cancelled. The default is fifteen seconds, which with the default shutdown grace
+/// lets a worker stop within the thirty seconds that process managers allow. An activity
+/// that checks `activity.is_cancelled` stops well within that; the limit is for one that
+/// is stuck, which would otherwise hold its slot on the worker for good.
 ///
 /// An activity is asked to stop when its workflow cancels it, when the worker's shutdown
 /// grace runs out, and when one of its timeouts has passed: an activity that hangs is
 /// killed this long after its start-to-close or heartbeat timeout, plus the five seconds
 /// the worker allows the server's clock.
 ///
-/// `None` never kills. `stop` then waits for as long as the slowest activity takes.
+/// `None` never kills. `stop`, and a drain on SIGTERM, then wait for as long as the
+/// slowest activity takes.
 pub fn with_activity_cancellation_grace(
   config: Config,
   grace: Option(Duration),
@@ -276,9 +284,21 @@ pub fn with_activity_cancellation_grace(
 
 /// How long activities in flight carry on undisturbed once the worker is asked to stop,
 /// ten seconds by default. Set it to what a typical activity needs to finish. See `stop`
-/// for everything that happens, in order.
+/// for everything that happens, in order, and for what the two graces ask of the
+/// platform's kill timeout.
 pub fn with_shutdown_grace(config: Config, grace: Duration) -> Config {
   Config(..config, shutdown_grace: grace)
+}
+
+/// Leave SIGTERM alone: the worker is not stopped when the signal comes. For programs
+/// that handle SIGTERM themselves, with their own signal handler or a release's shutdown
+/// sequence, and call `stop` or shut the worker's supervisor down from there. Without
+/// that, SIGTERM stops the VM within milliseconds and every activity in flight is
+/// abandoned until its timeout.
+///
+/// A worker started with `run` waits for the signal whatever this says.
+pub fn without_shutdown_signal_handling(config: Config) -> Config {
+  Config(..config, drain_on_shutdown_signal: False)
 }
 
 /// Start the worker, linked to the calling process. Returns once the server has accepted
@@ -293,6 +313,16 @@ pub fn with_shutdown_grace(config: Config, grace: Duration) -> Config {
 /// long as it takes. If the service answers polls with an error that retrying does not
 /// cure for over a minute, the worker logs it and registers afresh, again and again until
 /// that succeeds.
+///
+/// When the operating system sends SIGTERM, which is what Kubernetes, `docker stop` and
+/// systemd do on every deploy, every started worker stops gracefully, as `stop` describes,
+/// and then the VM stops as it always does on SIGTERM. The worker says so in a log line
+/// when it starts. `without_shutdown_signal_handling` turns this off. A second SIGTERM
+/// changes nothing; SIGKILL and a crash cannot be answered, and the server's timeouts and
+/// retries cover what they cut off.
+///
+/// The calling process must stay alive, since the worker stops when it exits: a `main`
+/// that returns ends the program. Use `run`, or end `main` with `process.sleep_forever()`.
 pub fn start(config: Config) -> Result(Worker, client.Error) {
   let started = process.new_subject()
   let parent = process.self()
@@ -307,14 +337,14 @@ pub fn start(config: Config) -> Result(Worker, client.Error) {
 /// restarts it if it gives up.
 ///
 /// When the supervisor shuts down, the worker stops as `stop` describes, and the
-/// supervisor waits for it: the shutdown grace, the activity cancellation grace and
-/// fifteen seconds more. With no activity cancellation grace it waits for thirty seconds
-/// in its place and then kills the worker.
+/// supervisor waits for it: the shutdown grace, the activity cancellation grace and four
+/// seconds more. With no activity cancellation grace it waits for thirty seconds in its
+/// place and then kills the worker.
 ///
-/// The VM answers SIGTERM with `init:stop()`, which shuts down supervisors that belong to
-/// an OTP application and kills every other process. A worker supervised under an
-/// application's supervision tree therefore drains on SIGTERM as it is; anywhere else, use
-/// `run` or `await_shutdown_signal`.
+/// On SIGTERM a supervised worker drains like any other, whether its supervisor belongs
+/// to an OTP application or was started from a plain `main`: see `start`. The worker's
+/// process stays alive and idle once it has drained, so the supervisor does not start it
+/// again while the VM stops.
 pub fn supervised(config: Config) -> supervision.ChildSpecification(Worker) {
   supervision.worker(fn() {
     case start(config) {
@@ -329,13 +359,15 @@ pub fn supervised(config: Config) -> supervision.ChildSpecification(Worker) {
       + 30_000
       + stop_margin_ms
       + loops_margin_ms
-    limit -> limit + loops_margin_ms
+      + supervisor_margin_ms
+    limit -> limit + loops_margin_ms + supervisor_margin_ms
   })
 }
 
 /// Start the worker and run it until the operating system asks the program to stop with
 /// SIGTERM, which is what `docker stop`, Kubernetes and systemd send. Then stop it
-/// gracefully, as `stop` describes, and return. This is how to run a worker in production:
+/// gracefully, as `stop` describes, and return. This is the simplest way to run a worker
+/// in production, because `main` does not return while the worker works:
 ///
 /// ```gleam
 /// pub fn main() {
@@ -347,21 +379,23 @@ pub fn supervised(config: Config) -> supervision.ChildSpecification(Worker) {
 /// }
 /// ```
 ///
-/// Without this, SIGTERM stops the VM within milliseconds and every activity in flight is
-/// abandoned until its timeout. The process manager has to allow the time a graceful stop
-/// takes: the shutdown grace plus the activity cancellation grace at most.
+/// The process manager has to allow the time a graceful stop takes, or it kills the
+/// program in the middle of it: see `stop` for the numbers and the settings.
 ///
-/// For several workers in one program, use `start`, `await_shutdown_signal` and `stop`.
+/// For several workers in one program, `start` each: they all drain on SIGTERM. To do
+/// something of your own between the signal and the exit, use `await_shutdown_signal`.
 pub fn run(config: Config) -> Result(Nil, client.Error) {
   // Before the worker starts, so that a signal during start-up is not lost.
   bridge.trap_shutdown_signal()
   use worker <- result.map(start(config))
   await_shutdown_signal()
   stop(worker)
+  // `main` usually returns next and the VM halts: the worker's last lines must be out.
+  bridge.flush_logs()
 }
 
 /// Block until the operating system asks the program to stop with SIGTERM, for programs
-/// that stop their workers themselves:
+/// that have more to do than stop their workers before they exit:
 ///
 /// ```gleam
 /// let assert Ok(orders) = worker.start(orders_config)
@@ -369,12 +403,15 @@ pub fn run(config: Config) -> Result(Nil, client.Error) {
 /// worker.await_shutdown_signal()
 /// worker.stop(orders)
 /// worker.stop(billing)
+/// close_the_database()
 /// ```
 ///
-/// The first call takes SIGTERM over from the VM, which would otherwise stop at once; from
-/// then on the program is responsible for exiting. Once the signal has arrived every call
-/// returns immediately, and further SIGTERMs change nothing. Other signals keep their
-/// usual effect. SIGINT cannot be waited for: the VM does not hand it to Erlang code.
+/// Started workers drain on SIGTERM by themselves, and `stop` returns when its worker has
+/// drained. What the first call changes is who ends the program: the VM no longer stops
+/// once the workers have drained, so the program is responsible for exiting, by returning
+/// from `main` or halting. Once the signal has arrived every call returns immediately,
+/// and further SIGTERMs change nothing. Other signals keep their usual effect. SIGINT
+/// cannot be waited for: the VM does not hand it to Erlang code.
 pub fn await_shutdown_signal() -> Nil {
   bridge.await_shutdown_signal()
 }
@@ -400,12 +437,26 @@ pub fn manager(worker: Worker) -> Pid {
 ///    and retried on another worker by its retry policy. One that finishes its work
 ///    instead is reported with its result.
 /// 5. Activities still running the activity cancellation grace later
-///    (`with_activity_cancellation_grace`, thirty seconds by default) are killed, and
+///    (`with_activity_cancellation_grace`, fifteen seconds by default) are killed, and
 ///    reported and retried the same way.
 ///
-/// So `stop` takes at most the two graces and a little more, and usually as long as the
-/// slowest activity. The same happens when the process that started the worker exits, or
-/// its supervisor shuts down.
+/// So `stop` usually takes as long as the slowest activity, and at most the two graces,
+/// 25 seconds by default, plus up to three seconds for core to report what it killed and
+/// close its polls when the server is slow to answer: 28 seconds at worst by default. The
+/// worker then logs one line with how many activities were in flight, how each ended and
+/// how long it took. The same happens when the worker drains on SIGTERM, when the process
+/// that started it exits, and when its supervisor shuts down.
+///
+/// Whatever stops the program on a deploy must wait longer than the two graces before
+/// it kills, or activities are cut off without being reported and wait for their
+/// timeouts. Kubernetes waits `terminationGracePeriodSeconds`, 30 by default, which fits
+/// the defaults. `docker stop` waits 10 seconds: pass `--time 30`, or set
+/// `stop_grace_period: 30s` in Compose. systemd waits `TimeoutStopSec`, 90 seconds by
+/// default. Raise the setting whenever you raise a grace.
+///
+/// An activity that needs longer than the graces cannot be saved by waiting: have it
+/// heartbeat its progress, watch `activity.is_worker_shutting_down`, and pick up from
+/// `activity.heartbeat_details` on its next attempt.
 pub fn stop(worker: Worker) -> Nil {
   case process.is_alive(worker.manager) {
     True -> process.call_forever(worker.control, Stop)
@@ -426,6 +477,8 @@ type Manager {
     nif: bridge.NifWorker,
     /// What the worker's activities read to learn that it is shutting down.
     shutting_down: bridge.Flag,
+    /// How the activities that ended while it was shutting down ended.
+    tally: bridge.Tally,
     /// How many times the worker has registered with core. A loop reports a failed poll
     /// with the registration it polled for, so that a late report about an earlier one is
     /// not taken for news about this one.
@@ -455,11 +508,18 @@ const restart_window_ms = 60_000
 /// The longest wait between attempts to register again after polling failed.
 const max_register_wait_ms = 30_000
 
-/// How long stopping waits for core beyond the two grace periods.
-const stop_margin_ms = 10_000
+/// How long stopping waits for core beyond the two grace periods: the time core has to
+/// report the activities killed at the end of them and to close its polls. Both take
+/// milliseconds unless the server is slow to answer. With `loops_margin_ms` it keeps a
+/// default worker's longest stop under the thirty seconds process managers allow.
+const stop_margin_ms = 2000
 
 /// How long stopping waits for the polling loops to end once core has shut down.
-const loops_margin_ms = 5000
+const loops_margin_ms = 1000
+
+/// How much longer a supervisor waits than the worker's longest stop, so that it does not
+/// kill a worker that is just finishing.
+const supervisor_margin_ms = 1000
 
 @external(erlang, "temporal_ffi", "system_time_ms")
 fn now_ms() -> Int
@@ -492,13 +552,25 @@ fn manage(
             failures:,
             nif:,
             shutting_down: bridge.new_flag(),
+            tally: bridge.new_tally(),
             registration: 1,
             loops: dict.new(),
             restarts: [],
           ),
         )
+      case config.drain_on_shutdown_signal {
+        True -> {
+          bridge.drain_on_shutdown_signal(process.self(), fn() {
+            process.call_forever(control, Drain)
+          })
+          announce(config)
+        }
+        False -> Nil
+      }
       process.send(started, Ok(control))
       supervise(manager)
+      // A worker that leaves any other way is dropped when the next one registers.
+      bridge.forget_on_shutdown_signal(process.self())
     }
   }
 }
@@ -527,7 +599,7 @@ fn register(config: Config, attempts: Int) -> Result(bridge.NifWorker, String) {
 
 fn start_loops(manager: Manager) -> Manager {
   let loops =
-    loops(manager.config, manager.nif, manager.shutting_down)
+    loops(manager.config, manager.nif, manager.shutting_down, manager.tally)
     |> list.map(fn(loop) { #(start_loop(manager, loop), loop) })
     |> dict.from_list
   Manager(..manager, loops:)
@@ -560,6 +632,11 @@ fn supervise(manager: Manager) -> Nil {
       shut_down(manager)
       process.send(reply, Nil)
     }
+    Control(Drain(reply)) -> {
+      shut_down(manager)
+      process.send(reply, Nil)
+      drained(manager)
+    }
     PollingFailed(registration:, ..) if registration != manager.registration ->
       supervise(manager)
     // Core gives up on polling only after retrying for as long as it thinks worthwhile,
@@ -582,7 +659,12 @@ fn supervise(manager: Manager) -> Nil {
       )
       // The old loops end by themselves, and are no longer this worker's to restart.
       register_again(
-        Manager(..manager, loops: dict.new(), shutting_down: bridge.new_flag()),
+        Manager(
+          ..manager,
+          loops: dict.new(),
+          shutting_down: bridge.new_flag(),
+          tally: bridge.new_tally(),
+        ),
         1000,
       )
     }
@@ -635,13 +717,97 @@ fn supervise(manager: Manager) -> Nil {
   }
 }
 
+/// What a worker that has drained does: nothing, until it is stopped or the process that
+/// started it goes away. Its loops have ended and nothing starts them again.
+fn drained(manager: Manager) -> Nil {
+  case process.selector_receive_forever(manager.events) {
+    Control(Stop(reply)) -> process.send(reply, Nil)
+    Control(Drain(reply)) -> {
+      process.send(reply, Nil)
+      drained(manager)
+    }
+    Exited(process.ExitMessage(pid, reason)) if pid == manager.parent ->
+      leave(reason)
+    Exited(_) | PollingFailed(..) -> drained(manager)
+  }
+}
+
 /// Stop the worker in core and wait until it has stopped: see `stop`.
 fn shut_down(manager: Manager) -> Nil {
+  let asked = now_ms()
   bridge.raise_flag(manager.shutting_down)
   bridge.worker_shutdown(manager.nif, stop_limit_ms(manager.config))
   // Core is done once every poll has been answered with a shutdown, which is what ends
   // the loops. They are given a moment to be gone before this returns.
   await_loops(manager, now_ms() + loops_margin_ms)
+  summarise(manager, now_ms() - asked)
+}
+
+/// Say at start what SIGTERM will do, and how long the platform has to allow for it.
+fn announce(config: Config) -> Nil {
+  let shutdown_ms = duration.to_milliseconds(config.shutdown_grace)
+  let cancellation_ms =
+    option.map(config.activity_cancellation_grace, duration.to_milliseconds)
+  bridge.log_notice(
+    "temporal: worker on task queue "
+      <> config.task_queue
+      <> " drains on SIGTERM, "
+      <> case cancellation_ms {
+      Some(ms) -> "for up to " <> seconds(shutdown_ms + ms)
+      None -> "for as long as its activities take"
+    },
+    [
+      #("task_queue", dynamic.string(config.task_queue)),
+      #("shutdown_grace_ms", dynamic.int(shutdown_ms)),
+      ..case cancellation_ms {
+        Some(ms) -> [
+          #("activity_cancellation_grace_ms", dynamic.int(ms)),
+          #("drain_ms", dynamic.int(shutdown_ms + ms)),
+        ]
+        None -> []
+      }
+    ],
+  )
+}
+
+/// Say how a stop went: what became of the activities that were in flight.
+fn summarise(manager: Manager, took_ms: Int) -> Nil {
+  let #(finished, cancelled, killed) = bridge.tallied(manager.tally)
+  let in_flight = finished + cancelled + killed
+  bridge.log_notice(
+    "temporal: worker on task queue "
+      <> manager.config.task_queue
+      <> " stopped in "
+      <> seconds(took_ms)
+      <> ", activities: "
+      <> int.to_string(in_flight)
+      <> " in flight, "
+      <> int.to_string(finished)
+      <> " finished, "
+      <> int.to_string(cancelled)
+      <> " accepted cancellation, "
+      <> int.to_string(killed)
+      <> " killed",
+    [
+      #("task_queue", dynamic.string(manager.config.task_queue)),
+      #("activities_in_flight", dynamic.int(in_flight)),
+      #("activities_finished", dynamic.int(finished)),
+      #("activities_cancelled", dynamic.int(cancelled)),
+      #("activities_killed", dynamic.int(killed)),
+      #("duration_ms", dynamic.int(took_ms)),
+    ],
+  )
+}
+
+/// Milliseconds as seconds to one decimal place, without the decimal when it is zero.
+fn seconds(ms: Int) -> String {
+  let tenths = { ms + 50 } / 100
+  int.to_string(tenths / 10)
+  <> case tenths % 10 {
+    0 -> ""
+    tenth -> "." <> int.to_string(tenth)
+  }
+  <> "s"
 }
 
 /// The longest a graceful stop can take in core: both grace periods and a margin. Zero,
@@ -721,6 +887,10 @@ fn wait_to_register(manager: Manager, until: Int, next_wait_ms: Int) -> Nil {
   case process.selector_receive(manager.events, remaining) {
     Error(Nil) -> register_again(manager, next_wait_ms)
     Ok(Control(Stop(reply))) -> process.send(reply, Nil)
+    Ok(Control(Drain(reply))) -> {
+      process.send(reply, Nil)
+      drained(manager)
+    }
     Ok(Exited(process.ExitMessage(pid, reason))) if pid == manager.parent ->
       leave(reason)
     Ok(_) -> wait_to_register(manager, until, next_wait_ms)
@@ -769,6 +939,7 @@ fn loops(
   config: Config,
   nif: bridge.NifWorker,
   shutting_down: bridge.Flag,
+  tally: bridge.Tally,
 ) -> List(Loop) {
   let codec = client.payload_codec(config.client)
   let workflows =
@@ -810,6 +981,7 @@ fn loops(
         codec,
         option.map(config.activity_cancellation_grace, duration.to_milliseconds),
         fn() { bridge.flag_raised(shutting_down) },
+        tally,
       )
     })
   let nexus_loop =

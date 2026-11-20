@@ -97,7 +97,7 @@ pub fn main() {
 
 That starts a worker, uses it and stops it, as a script or a test does. A worker that
 serves a task queue for real ends its pipeline with `worker.run` instead of
-`worker.start`: see [Running a worker](#running-a-worker).
+`worker.start`, so that `main` does not return: see [Running a worker](#running-a-worker).
 
 Options are always built the same way: a constructor that takes what is required, then one
 `with_` function for each thing to change, as with `workflow.activity_options` and the
@@ -168,8 +168,8 @@ So is passing a bare number where a length of time is wanted: every timeout and 
   that is running, summaries, priorities, and completion callbacks
 - Enforcement of determinism: nothing stops workflow code from calling a clock or spawning a
   process. Replay tests are how such mistakes are found.
-- Waiting for SIGINT (Ctrl-C): the VM does not hand it to Erlang code. `worker.run` and
-  `worker.await_shutdown_signal` wait for SIGTERM.
+- Draining on SIGINT (Ctrl-C): the VM does not hand it to Erlang code. Workers drain on
+  SIGTERM, and `worker.run` and `worker.await_shutdown_signal` wait for it.
 - Integers beyond 2^53 for JavaScript: Gleam's integers have no size limit, but a
   TypeScript workflow or activity reads every JSON number as a 64-bit float, so a larger
   integer arrives there rounded. Send such values as strings.
@@ -493,9 +493,14 @@ polls it takes to keep a worker busy.
 
 ## Running a worker
 
-`worker.run` starts the worker and keeps it going until the operating system asks the
-program to stop with SIGTERM, which is what `docker stop`, Kubernetes and systemd send.
-Then it stops the worker gracefully and returns:
+Every deploy stops the program with SIGTERM: it is what Kubernetes, `docker stop` and
+systemd send. A started worker answers it by draining: it stops taking tasks, lets its
+activities finish within two graces, and only then does the VM stop. That holds however
+the worker was started, with `worker.start`, `worker.supervised` or `worker.run`, and
+for every worker in the program.
+
+`worker.run` is the simplest way to run one, because it keeps `main` from returning. It
+starts the worker, waits for SIGTERM, stops the worker gracefully and returns:
 
 ```gleam
 pub fn main() {
@@ -508,12 +513,35 @@ pub fn main() {
 }
 ```
 
-Left alone, the VM answers SIGTERM by stopping within milliseconds, and every activity in
-flight is abandoned until its timeout passes. A program with several workers starts each
-with `worker.start`, calls `worker.await_shutdown_signal()`, then stops each with
-`worker.stop`. Under an OTP application's supervision tree, `worker.supervised` needs
-neither: the VM shuts the tree down on SIGTERM and the worker drains as its supervisor
-stops it.
+A program with several workers starts each with `worker.start`, or puts
+`worker.supervised` in its supervision tree, and keeps `main` alive with
+`process.sleep_forever()`: they all drain at the same time, and then the VM stops as it
+always does on SIGTERM. A program with more to do before it exits, such as closing a
+database, calls `worker.await_shutdown_signal()`, stops its workers with `worker.stop`,
+does the rest and returns from `main`: once a program asks for the signal, exiting is
+its own job. A program that handles SIGTERM entirely by itself opts out with
+`worker.without_shutdown_signal_handling`.
+
+**Set the platform's kill timeout above the two graces.** Whatever sends SIGTERM sends
+SIGKILL some time later, and a drain that is killed halfway reports nothing. With the
+defaults the two graces are 10 + 15 = 25 seconds, and a stop takes 28 seconds at the very
+worst:
+
+| Platform | Setting | Default | With the default graces |
+|---|---|---|---|
+| Kubernetes | `terminationGracePeriodSeconds` | 30 s | Fits |
+| Docker | `docker stop --time`, Compose `stop_grace_period` | 10 s | Raise it to 30 s |
+| systemd | `TimeoutStopSec` | 90 s | Fits |
+
+Raise the setting whenever you raise a grace. A worker logs its budget when it starts,
+and what became of its activities when it has stopped:
+
+```
+temporal: worker on task queue orders drains on SIGTERM, for up to 25s
+temporal: worker on task queue orders stopped in 3.2s, activities: 2 in flight, 1 finished, 1 accepted cancellation, 0 killed
+```
+
+Both are `notice` lines, with the numbers as metadata as well.
 
 A graceful stop, however it is asked for, goes in this order:
 
@@ -528,12 +556,22 @@ A graceful stop, however it is asked for, goes in this order:
    failed by the shutdown and retried by its retry policy; one that finishes is reported
    with its result.
 5. Those still running after the activity cancellation grace,
-   `worker.with_activity_cancellation_grace`, thirty seconds by default, are killed, and
+   `worker.with_activity_cancellation_grace`, fifteen seconds by default, are killed, and
    retried the same way.
 
-`worker.stop` returns when all of that is over, so give whatever stops the process at
-least the two graces together: Kubernetes' `terminationGracePeriodSeconds` is thirty
-seconds unless set.
+`worker.stop` returns when all of that is over. The workflow never sees a cancellation it
+did not ask for: an activity cut off in step 4 or 5 runs again on another worker as its
+next attempt, at once, not when its timeout is up.
+
+What draining cannot cover:
+
+- **SIGKILL, a crash, a lost machine.** Nothing runs. The server notices through the
+  activity's timeouts and retries it, so give long activities a heartbeat timeout.
+- **SIGINT (Ctrl-C).** The VM does not hand it to Erlang code.
+- **Activities longer than the graces.** Waiting cannot save them. Have them heartbeat
+  their progress, watch `activity.is_worker_shutting_down`, and resume from
+  `activity.heartbeat_details` on the next attempt.
+- **A second SIGTERM.** It changes nothing; the drain carries on.
 
 An activity always answers for its slot on the worker. If its process is killed, or dies
 with a process it was linked to, the activity fails with a retryable

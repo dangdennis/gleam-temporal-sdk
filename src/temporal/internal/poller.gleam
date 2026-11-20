@@ -197,6 +197,7 @@ pub fn activity_loop(
   codec: Option(PayloadCodec),
   cancellation_grace_ms: Option(Int),
   shutting_down: fn() -> Bool,
+  tally: bridge.Tally,
 ) -> Result(Nil, String) {
   do_activity_loop(
     ActivityLoop(
@@ -206,6 +207,7 @@ pub fn activity_loop(
       codec:,
       cancellation_grace_ms:,
       shutting_down:,
+      tally:,
     ),
     dict.new(),
   )
@@ -219,6 +221,8 @@ type ActivityLoop {
     codec: Option(PayloadCodec),
     cancellation_grace_ms: Option(Int),
     shutting_down: fn() -> Bool,
+    /// Where the activities that end while the worker is shutting down are counted.
+    tally: bridge.Tally,
   )
 }
 
@@ -381,11 +385,16 @@ fn watch_activity(watcher: Watcher, grace_running: Bool) -> Nil {
   case process.selector_receive_forever(selector) {
     Finished(result) -> {
       gone()
+      tally(loop, case result {
+        bridge.ActivityCancelled(..) -> 2
+        _ -> 1
+      })
       report(result)
     }
     // Killed from outside, or taken down by a process it was linked to. The failure is
     // retryable: the server runs the activity again by its retry policy.
-    Exited(down) ->
+    Exited(down) -> {
+      tally(loop, 1)
       report(bridge.ActivityFailed(
         failure.new(
           "the activity process exited before reporting a result: "
@@ -393,6 +402,7 @@ fn watch_activity(watcher: Watcher, grace_running: Bool) -> Nil {
         )
         |> failure.with_type("ActivityProcessExited"),
       ))
+    }
     CancelRequested(reason) -> {
       bridge.send_activity_cancel(activity, reason)
       case loop.cancellation_grace_ms, grace_running {
@@ -412,8 +422,17 @@ fn watch_activity(watcher: Watcher, grace_running: Bool) -> Nil {
         "temporal: killed an activity that was still running after its cancellation grace",
         [#("activity_id", dynamic.string(activity_id))],
       )
+      tally(loop, 3)
       report(bridge.ActivityCancelled(failure.cancelled()))
     }
+  }
+}
+
+/// Count how an activity ended, for the summary of a worker that is stopping.
+fn tally(loop: ActivityLoop, index: Int) -> Nil {
+  case loop.shutting_down() {
+    True -> bridge.tally(loop.tally, index)
+    False -> Nil
   }
 }
 

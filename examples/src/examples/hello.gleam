@@ -64,8 +64,8 @@ pub fn run(client: Client) -> Result(String, client.Error) {
 
 /// How a worker runs for real: `worker.run` serves the task queue until the operating
 /// system asks the program to stop with SIGTERM, as a deploy does, then lets the
-/// activities in flight finish and returns. Never keep a worker alive with
-/// `process.sleep_forever`: SIGTERM would stop the VM under its activities.
+/// activities in flight finish and returns. Give the platform's kill timeout more than
+/// the worker's two graces, 25 seconds by default: `docker stop` allows only 10.
 pub fn main() -> Nil {
   let assert Ok(client) = client.connect(client.local())
   let assert Ok(Nil) = worker.run(worker_config(client))

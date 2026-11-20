@@ -10,10 +10,10 @@
 //// reason `WorkerShutdown`, and killed if they outstay the activity cancellation grace
 //// too. Work that is not finished is not lost: the server retries it on another worker.
 ////
-//// A deploy stops the program with SIGTERM. In an OTP application the VM answers by
-//// shutting down the supervision tree, and a supervised worker drains as described. A
-//// program that is not an application has to wait for the signal itself: `worker.run`
-//// for one worker, as in `hello.gleam`, or `main` below for a supervisor.
+//// A deploy stops the program with SIGTERM. Every started worker answers it by draining
+//// as described, supervised or not, in an OTP application or in a plain `main`, and
+//// then the VM stops. The program only has to stay alive until then, as `main` below
+//// does, and its platform has to wait longer than the two graces before it kills.
 
 import gleam/erlang/process
 import gleam/otp/actor
@@ -61,7 +61,9 @@ fn worker_config(
     }),
   ])
   // How long activities in flight are left to finish before they are told to cancel.
-  // The default is ten seconds.
+  // The default is ten seconds. With the activity cancellation grace of fifteen this
+  // worker can take 35 seconds to stop, so its platform's kill timeout must be longer:
+  // Kubernetes' `terminationGracePeriodSeconds`, `docker stop --time`.
   |> worker.with_shutdown_grace(duration.seconds(20))
 }
 
@@ -113,13 +115,14 @@ pub fn run(client: Client) -> Result(#(String, Int), client.Error) {
   outcome
 }
 
-/// A program that is not an OTP application: supervise the worker, wait until the
-/// operating system asks the program to stop with SIGTERM, then shut the tree down.
+/// A program that is not an OTP application: supervise the worker and stay alive. When
+/// the operating system asks the program to stop with SIGTERM the worker drains, and
+/// then the VM stops. A program with more to do before it exits waits for the signal
+/// with `worker.await_shutdown_signal()`, shuts its tree down and returns from `main`.
 pub fn main() -> Nil {
   let assert Ok(client) = client.connect(client.local())
-  let assert Ok(supervisor) = start_supervisor(client, process.new_subject())
-  worker.await_shutdown_signal()
-  stop_supervisor(supervisor)
+  let assert Ok(_) = start_supervisor(client, process.new_subject())
+  process.sleep_forever()
 }
 
 fn count(started: process.Subject(String), seen: Int) -> Int {

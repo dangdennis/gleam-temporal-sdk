@@ -645,6 +645,15 @@ pub fn log(
   metadata: List(#(String, Dynamic)),
 ) -> Nil
 
+/// Log at `notice`, the lowest level `logger` shows as it comes: for what an operator
+/// should see without configuring anything.
+@external(erlang, "temporal_ffi", "log_notice")
+pub fn log_notice(message: String, metadata: List(#(String, Dynamic))) -> Nil
+
+/// Wait until what has been logged is written, before the program halts.
+@external(erlang, "temporal_ffi", "flush_logs")
+pub fn flush_logs() -> Nil
+
 pub type LogLevel {
   Debug
   Info
@@ -670,14 +679,42 @@ pub fn raise_flag(flag: Flag) -> Nil
 @external(erlang, "temporal_ffi", "flag_raised")
 pub fn flag_raised(flag: Flag) -> Bool
 
+/// How the activities of a worker that is stopping ended: three counts that any process
+/// can add to.
+pub type Tally
+
+@external(erlang, "temporal_ffi", "new_tally")
+pub fn new_tally() -> Tally
+
+/// Add one to the count at `index`: 1 for an activity that finished, 2 for one that
+/// accepted cancellation, 3 for one that was killed.
+@external(erlang, "temporal_ffi", "tally")
+pub fn tally(tally: Tally, index: Int) -> Nil
+
+/// The counts, in the order of their indexes.
+@external(erlang, "temporal_ffi", "tallied")
+pub fn tallied(tally: Tally) -> #(Int, Int, Int)
+
 /// Block until the operating system asks the VM to stop with SIGTERM. Returns at once if
-/// it already has.
+/// it already has. The program then has to exit by itself.
 @external(erlang, "temporal_signal", "await")
 pub fn await_shutdown_signal() -> Nil
 
-/// Take SIGTERM over from the VM's default handler, which would stop the VM at once.
+/// Take SIGTERM over for a program that exits by itself once the signal has come: the VM
+/// is no longer stopped when the registered workers have drained.
 @external(erlang, "temporal_signal", "install")
 pub fn trap_shutdown_signal() -> Nil
+
+/// Have `drain` called when the operating system sends SIGTERM, for as long as `worker`
+/// is alive. `drain` returns once the worker has stopped working and must leave `worker`
+/// alive. When every registered worker has drained the VM is stopped as SIGTERM stops it
+/// by default, unless the program asked for the signal itself.
+@external(erlang, "temporal_signal", "register_worker")
+pub fn drain_on_shutdown_signal(worker: Pid, drain: fn() -> Nil) -> Nil
+
+/// `worker` has stopped: there is nothing left to drain on SIGTERM.
+@external(erlang, "temporal_signal", "forget_worker")
+pub fn forget_on_shutdown_signal(worker: Pid) -> Nil
 
 /// Start a workflow and return its run id. With `signal`, signal the workflow instead,
 /// starting it first if it is not running.

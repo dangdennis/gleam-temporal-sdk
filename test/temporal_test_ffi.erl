@@ -1,6 +1,6 @@
 -module(temporal_test_ffi).
 -export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, capture_log_metadata/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1, memory_mb/0, env_int/2, tcp_proxy/1, tcp_proxy_mode/2, silent_listener/0, run_only/1, await_log/2, record_self/1, recorded_pid/1, os_pid/0,
-         start_application/2]).
+         start_application/2, workers_drained_on_sigterm/0, signal_handlers/0, quiet_notices/0]).
 
 unique() ->
     integer_to_binary(erlang:system_time(microsecond)).
@@ -346,4 +346,22 @@ start_application(Name, StartSupervisor) ->
                             {applications, [kernel, stdlib]},
                             {mod, {temporal_test_app, StartSupervisor}}]}),
     ok = application:start(App),
+    nil.
+
+%% How many workers the SDK's SIGTERM handler holds, zero if it is not installed.
+workers_drained_on_sigterm() ->
+    case lists:keyfind(temporal_signal, 1, sys:get_state(erl_signal_server)) of
+        {_, _, #{workers := Workers}} -> map_size(Workers);
+        false -> 0
+    end.
+
+%% The handlers the VM delivers signals to.
+signal_handlers() ->
+    unicode:characters_to_binary(
+      io_lib:format("~0p", [gen_event:which_handlers(erl_signal_server)])).
+
+%% Print warnings and errors only: every worker logs a notice when it starts and when it
+%% stops, and the suite starts hundreds.
+quiet_notices() ->
+    ok = logger:set_handler_config(default, level, warning),
     nil.

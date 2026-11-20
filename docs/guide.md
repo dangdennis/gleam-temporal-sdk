@@ -132,7 +132,7 @@ survives deploys and crashes.
 
 A worker polls a task queue and runs what it is given. `worker.run` keeps it going until
 the operating system asks the program to stop with SIGTERM, as every deploy does, then
-lets the activities in flight finish and returns.
+lets the activities in flight finish and returns, so `main` lasts as long as the worker.
 
 ```gleam
 import temporal/client
@@ -151,11 +151,15 @@ pub fn main() {
 }
 ```
 
-Do not keep a worker alive with `process.sleep_forever()`: the VM stops within
-milliseconds of a SIGTERM, and every activity in flight is abandoned until its timeout.
-In an OTP application, add `worker.supervised(config)` to the supervision tree instead;
-the README's [Running a worker](../README.md#running-a-worker) says what a graceful stop
-does, step by step.
+Every started worker drains on SIGTERM, whether it was started with `worker.run`,
+`worker.start` or `worker.supervised(config)` in a supervision tree: activities in flight
+get the shutdown grace to finish (10 seconds) and then the activity cancellation grace to
+stop (15 seconds). Set your platform's kill timeout above the two together: Kubernetes'
+`terminationGracePeriodSeconds` of 30 fits the defaults, `docker stop` needs `--time 30`.
+An activity that runs longer should heartbeat its progress and watch
+`activity.is_worker_shutting_down`. The README's
+[Running a worker](../README.md#running-a-worker) says what a graceful stop does, step by
+step, and what it cannot cover.
 
 ## Start a workflow
 

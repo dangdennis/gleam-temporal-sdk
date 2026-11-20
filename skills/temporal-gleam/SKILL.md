@@ -27,7 +27,7 @@ temporal server start-dev       # a local service, from the Temporal CLI
 | `temporal/workflow` | Definitions, workflow code: activities, timers, futures, scopes, `now`, `random_int`, `uuid4`, logging, `patched`, `continue_as_new` |
 | `temporal/workflow/{signal,query,update,child,local_activity,operation,continue_as_new}` | One module per thing a workflow does besides activities |
 | `temporal/activity` | Activity definitions and code: info, heartbeats, cancellation, `is_worker_shutting_down`, logging |
-| `temporal/worker` | Running workflows and activities: `run`, `start`/`stop`, `await_shutdown_signal`, `supervised`; middleware |
+| `temporal/worker` | Running workflows and activities: `run`, `start`/`stop`, `await_shutdown_signal`, `supervised`, `without_shutdown_signal_handling`; middleware |
 | `temporal/client` | Connect; start, execute, signal, query, update, cancel, describe, list |
 | `temporal/client/standalone_activity` | Run an activity from a client with no workflow: start, execute, result, describe, cancel, terminate, list |
 | `temporal/retry`, `temporal/failure` | Retry policies; the `Failure` type |
@@ -99,8 +99,8 @@ pub fn run(client: Client) -> Result(String, client.Error) {
 
 /// How a worker runs for real: `worker.run` serves the task queue until the operating
 /// system asks the program to stop with SIGTERM, as a deploy does, then lets the
-/// activities in flight finish and returns. Never keep a worker alive with
-/// `process.sleep_forever`: SIGTERM would stop the VM under its activities.
+/// activities in flight finish and returns. Give the platform's kill timeout more than
+/// the worker's two graces, 25 seconds by default: `docker stop` allows only 10.
 pub fn main() -> Nil {
   let assert Ok(client) = client.connect(client.local())
   let assert Ok(Nil) = worker.run(worker_config(client))
@@ -109,10 +109,15 @@ pub fn main() -> Nil {
 ```
 
 `run` is for scripts and tests. A deployed worker is `main`: `worker.run(config)` serves
-until SIGTERM and then stops gracefully. Never keep a worker alive with
-`process.sleep_forever()`; a deploy would abandon every activity in flight. For several
-workers use `worker.start` on each, `worker.await_shutdown_signal()`, then `worker.stop`
-on each; in an OTP application's supervision tree use `worker.supervised(config)`.
+until SIGTERM and then stops gracefully, and keeps `main` from returning. Every started
+worker drains on SIGTERM, whichever of `worker.run`, `worker.start` and
+`worker.supervised(config)` started it; for several workers `worker.start` each, or
+supervise them, and end `main` with `process.sleep_forever()`. Set the platform's kill
+timeout above the worker's two graces, 10 s + 15 s by default: Kubernetes'
+`terminationGracePeriodSeconds` (30 s) fits, `docker stop` (10 s) needs `--time 30`. To
+do more before exiting, `worker.await_shutdown_signal()`, `worker.stop` each worker, then
+return from `main`. `worker.without_shutdown_signal_handling(config)` is only for a
+program that handles SIGTERM itself.
 
 The client comes from `client.connect(client.local())`. Workflow and activity functions
 always have the shape `fn(Context, input) -> Result(output, Failure)`. One input, one
@@ -242,16 +247,20 @@ An activity learns of cancellation only by heartbeating: call `activity.heartbea
 check `activity.is_cancelled(ctx)`, and return `Error(failure.cancelled())`. See
 [`heartbeats.gleam`](../../examples/src/examples/heartbeats.gleam).
 
-**Worker shutdown.** When a worker is asked to stop (`worker.stop`, SIGTERM under
-`worker.run`, a supervisor shutting down), in order: polling stops and
+**Worker shutdown.** When a worker is asked to stop (`worker.stop`, SIGTERM, a
+supervisor shutting down), in order: polling stops and
 `activity.is_worker_shutting_down(ctx)` turns true; workflow tasks in flight finish;
 activities run on for the shutdown grace (`worker.with_shutdown_grace`, 10 s); those left
 are told to cancel with `activity.cancel_reason(ctx) == Some(activity.WorkerShutdown)`;
 those left after the activity cancellation grace
-(`worker.with_activity_cancellation_grace`, 30 s) are killed. An activity cancelled or
-killed this way is retried on another worker. `worker.stop` returns when all of it is
-over. A long activity should check `is_worker_shutting_down`, heartbeat its progress
-with `activity.heartbeat_with` and return an error, so a deploy does not wait for it.
+(`worker.with_activity_cancellation_grace`, 15 s) are killed. An activity cancelled or
+killed this way is retried on another worker as its next attempt; its workflow sees no
+cancellation. `worker.stop` returns when all of it is over, and the worker logs how many
+activities finished, accepted cancellation and were killed. A long activity should check
+`is_worker_shutting_down`, heartbeat its progress with `activity.heartbeat_with` and
+return an error, so a deploy does not wait for it. Draining cannot cover SIGKILL or a
+crash (the server's timeouts and retries do), SIGINT (the VM does not deliver it), or an
+activity longer than the two graces (heartbeat and resume from the details).
 
 **Standalone activities** run an activity from a client with no workflow around it, for
 one durable step that needs no orchestration. Same `activity.Definition`, same handler,
@@ -395,7 +404,7 @@ replays every workflow task.
 | `could not decode the input: argument 2: expected Int, found Nil`, or `... the result: expected String, found Nil` | The other side sent nothing: a TypeScript `undefined`, or an argument left out. Make that value `schema.optional(..)`, or the result `codec.nil()` |
 | Activity failure `the activity process exited before reporting a result: killed` (type `ActivityProcessExited`, retried) | The activity's process was killed, or died with a process it had linked to (`process.spawn`, a port, a pool). Use `process.spawn_unlinked` and monitors, or trap exits |
 | Log warning `temporal: killed an activity that was still running after its cancellation grace` | An activity ignored a cancellation, a timeout or the worker's shutdown for the whole `worker.with_activity_cancellation_grace`. Heartbeat and check `activity.is_cancelled(ctx)` in long activities |
-| Every deploy makes activities time out and run again | The worker is kept alive with `process.sleep_forever()`, so SIGTERM stops the VM at once. Use `worker.run`, or `worker.await_shutdown_signal()` then `worker.stop` |
+| Every deploy makes activities time out and run again | The platform kills the program before the worker has drained: set its kill timeout (Kubernetes `terminationGracePeriodSeconds`, `docker stop --time`) above the shutdown grace plus the activity cancellation grace, which the worker logs at start. Or the activities run longer than the graces: heartbeat and check `activity.is_worker_shutting_down(ctx)`. Or the worker was configured with `worker.without_shutdown_signal_handling` |
 | `workflow.log_info` lines do not show | Erlang's `logger` starts at level `notice`. Lower it: `logger:set_primary_config(level, info)`, or the `logging` package's `configure`. Warnings and errors show as they are; SDK lines carry the metadata `temporal => true` |
 | `client.DecodeFailed(..)` from `client.result` or `client.query` | The handle's definition has the wrong output codec, or the client lacks the payload codec the worker uses |
 | Crash `temporal_not_in_workflow`: `This function works only in workflow code, in the process the worker runs the workflow in. Activities, tests and processes a workflow spawns cannot call it.` | A `workflow.*` function called from an activity, a test or a spawned process |
