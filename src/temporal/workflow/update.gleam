@@ -18,7 +18,7 @@ import gleam/result
 import temporal/codec.{type Codec, type Payload}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
-import temporal/internal/runtime
+import temporal/internal/runtime/updates
 import temporal/workflow.{type Context, type Future, type UpdateDefinition}
 
 /// An update a client sent, taken by the workflow and awaiting its answer.
@@ -54,7 +54,7 @@ pub fn set_validator(
   definition: UpdateDefinition(argument, result),
   validator: fn(argument) -> Result(Nil, String),
 ) -> Nil {
-  runtime.register_update(
+  updates.register(
     definition.name,
     fn(input) {
       case codec.decode_arguments(definition.argument, input) {
@@ -72,14 +72,14 @@ pub fn next(
   _ctx: Context,
   definition: UpdateDefinition(argument, result),
 ) -> Future(Update(argument, result)) {
-  runtime.register_update(definition.name, decodes(definition), False)
+  updates.register(definition.name, decodes(definition), False)
   workflow.once(fn() { take(definition) })
 }
 
 fn take(
   definition: UpdateDefinition(argument, result),
 ) -> Option(Update(argument, result)) {
-  case runtime.take_update(definition.name) {
+  case updates.take(definition.name) {
     None -> None
     Some(pending) ->
       case codec.decode_arguments(definition.argument, pending.input) {
@@ -92,7 +92,7 @@ fn take(
           ))
         // Only on replay of an update accepted by different code: fail it and move on.
         Error(reason) -> {
-          runtime.answer_update(
+          updates.answer(
             pending.protocol_instance_id,
             bridge.UpdateRejected(
               pending.protocol_instance_id,
@@ -118,7 +118,7 @@ pub fn try_receive(
   _ctx: Context,
   definition: UpdateDefinition(argument, result),
 ) -> Option(Update(argument, result)) {
-  runtime.register_update(definition.name, decodes(definition), False)
+  updates.register(definition.name, decodes(definition), False)
   take(definition)
 }
 
@@ -140,7 +140,7 @@ pub fn complete(
   update: Update(argument, result),
   outcome: Result(result, Failure),
 ) -> Nil {
-  runtime.answer_update(update.protocol_instance_id, case outcome {
+  updates.answer(update.protocol_instance_id, case outcome {
     Ok(value) ->
       bridge.UpdateCompleted(
         update.protocol_instance_id,

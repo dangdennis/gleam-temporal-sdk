@@ -14,6 +14,7 @@ import temporal/codec
 import temporal/failure
 import temporal/internal/bridge.{type Completion, Activation}
 import temporal/internal/runtime
+import temporal/internal/runtime/run_state
 import temporal/middleware
 import temporal/workflow
 import temporal/workflow/child
@@ -1130,7 +1131,8 @@ pub fn a_scope_forgets_operations_that_have_settled_test() {
           let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(1))
           Nil
         })
-        let assert Ok(root) = dict.get(runtime.get().scopes, runtime.root_scope)
+        let assert Ok(root) =
+          dict.get(run_state.get().scopes, run_state.root_scope)
         Ok(list.length(root.ops))
       }),
     )

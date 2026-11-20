@@ -14,7 +14,10 @@ import temporal/activity
 import temporal/codec
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
-import temporal/internal/runtime
+import temporal/internal/runtime/determinism
+import temporal/internal/runtime/local_activities
+import temporal/internal/runtime/run_state
+import temporal/internal/runtime/scopes
 import temporal/internal/time
 import temporal/middleware
 import temporal/workflow.{
@@ -57,14 +60,14 @@ pub fn start(
   input: input,
   options: Options,
 ) -> Future(Result(output, Failure)) {
-  case runtime.scope_cancelled(workflow.scope_of(ctx)) {
+  case scopes.cancelled(workflow.scope_of(ctx)) {
     Some(_) -> {
       // A sequence number is used even when nothing is scheduled, as the other SDKs do.
-      let _ = runtime.next_activity()
+      let _ = determinism.next_activity()
       workflow.ready(Error(failure.cancelled()))
     }
     None -> {
-      let state = runtime.get()
+      let state = run_state.get()
       let call =
         state.outbound.activity(middleware.ActivityCall(
           activity_type: definition.name,
@@ -73,7 +76,7 @@ pub fn start(
           headers: state.headers,
         ))
       let seq =
-        runtime.start_local(fn(seq) {
+        local_activities.start(fn(seq) {
           bridge.ScheduleLocalActivity(
             seq:,
             activity_id: int.to_string(seq),
@@ -96,9 +99,9 @@ pub fn start(
             headers: call.headers,
           )
         })
-      runtime.register(workflow.scope_of(ctx), runtime.ActivityOp(seq))
+      scopes.register(workflow.scope_of(ctx), run_state.ActivityOp(seq))
       workflow.resolution(
-        fn() { dict.get(runtime.get().activities, seq) },
+        fn() { dict.get(run_state.get().activities, seq) },
         definition.output,
       )
     }

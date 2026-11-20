@@ -37,7 +37,11 @@ import temporal/activity
 import temporal/codec.{type Codec, type Payload}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
-import temporal/internal/runtime.{State}
+import temporal/internal/runtime
+import temporal/internal/runtime/determinism
+import temporal/internal/runtime/run_state.{State}
+import temporal/internal/runtime/scopes
+import temporal/internal/runtime/updates
 import temporal/internal/time
 import temporal/middleware
 import temporal/search_attributes
@@ -219,7 +223,7 @@ pub fn handler(
   Handler(definition.name, fn(arguments) {
     case codec.decode_arguments(definition.input, arguments) {
       Ok(input) ->
-        run(Context(runtime.root_scope), input)
+        run(Context(run_state.root_scope), input)
         |> result.map(fn(output) {
           Some(codec.encode(definition.output, output))
         })
@@ -257,13 +261,13 @@ pub fn fail_on_crash(handler: Handler) -> Handler {
 /// Run `middleware` around the handler. The first middleware applied is the innermost.
 pub fn wrap(handler: Handler, middleware: Middleware) -> Handler {
   Handler(handler.name, fn(arguments) {
-    middleware(Context(runtime.root_scope), fn() { handler.run(arguments) })
+    middleware(Context(run_state.root_scope), fn() { handler.run(arguments) })
   })
 }
 
 /// The run's identity and how far it has got.
 pub fn info(_ctx: Context) -> Info {
-  let state = runtime.get()
+  let state = run_state.get()
   Info(
     workflow_id: state.workflow_id,
     run_id: state.run_id,
@@ -283,7 +287,7 @@ pub fn info(_ctx: Context) -> Info {
 /// A value from the memo the workflow was started with. `None` if the key is absent or its
 /// value does not decode.
 pub fn memo(_ctx: Context, key: String, value_codec: Codec(a)) -> Option(a) {
-  case dict.get(runtime.get().memo, key) {
+  case dict.get(run_state.get().memo, key) {
     Ok(payload) -> option.from_result(codec.decode(value_codec, payload))
     Error(Nil) -> None
   }
@@ -293,24 +297,24 @@ pub fn memo(_ctx: Context, key: String, value_codec: Codec(a)) -> Option(a) {
 /// beside the arguments. They are passed on to the activities and child workflows the
 /// workflow starts unless outbound middleware changes them.
 pub fn headers(_ctx: Context) -> Dict(String, Payload) {
-  runtime.get().headers
+  run_state.get().headers
 }
 
 /// The workflow's current time in milliseconds since the Unix epoch. It is the time of the
 /// workflow task being processed, so it is the same on replay.
 pub fn now(_ctx: Context) -> Timestamp {
-  time.timestamp(runtime.get().now_ms)
+  time.timestamp(run_state.get().now_ms)
 }
 
 /// A deterministic random integer in `0..max` (exclusive). `max` must be positive.
 pub fn random_int(_ctx: Context, max: Int) -> Int {
-  runtime.random_bits() % max
+  determinism.random_bits() % max
 }
 
 /// A deterministic random version 4 UUID.
 pub fn uuid4(_ctx: Context) -> String {
-  let high = runtime.random_bits()
-  let low = runtime.random_bits()
+  let high = determinism.random_bits()
+  let low = determinism.random_bits()
   let assert <<a:32, b:16, _:4, c:12, _:2, d:14, e:48>> = <<high:64, low:64>>
   let hex =
     bit_array.base16_encode(<<a:32, b:16, 4:4, c:12, 2:2, d:14, e:48>>)
@@ -329,14 +333,14 @@ pub fn uuid4(_ctx: Context) -> String {
 /// Whether the workflow is replaying history rather than making new progress. Only for
 /// suppressing side effects that are safe to skip; prefer `unless_replaying`.
 pub fn is_replaying(_ctx: Context) -> Bool {
-  runtime.get().is_replaying
+  run_state.get().is_replaying
 }
 
 /// Run a side effect the first time the workflow reaches this point and skip it on replay.
 /// For effects whose loss is acceptable, such as metrics and error reports: the effect is
 /// not recorded in history and a crash in it is ignored.
 pub fn unless_replaying(_ctx: Context, effect: fn() -> Nil) -> Nil {
-  case runtime.get().is_replaying {
+  case run_state.get().is_replaying {
     True -> Nil
     False -> {
       let _ = bridge.rescue_all(effect)
@@ -348,7 +352,7 @@ pub fn unless_replaying(_ctx: Context, effect: fn() -> Nil) -> Nil {
 // ---- logging ----
 
 fn log(level: bridge.LogLevel, message: String) -> Nil {
-  let state = runtime.get()
+  let state = run_state.get()
   case state.is_replaying {
     True -> Nil
     False ->
@@ -492,18 +496,18 @@ pub fn await_cancellable(
 /// Run `body` in a scope of its own, which `cancel` can cancel without cancelling the rest
 /// of the workflow. Cancelling `ctx` cancels the new scope too.
 pub fn with_scope(ctx: Context, body: fn(Context) -> a) -> a {
-  let scope = runtime.open_scope(ctx.scope, False)
+  let scope = scopes.open(ctx.scope, False)
   let value = body(Context(scope))
-  runtime.close_scope(scope)
+  scopes.close(scope)
   value
 }
 
 /// Run `body` shielded from cancellation: cancelling `ctx`, or the workflow, does not reach
 /// what `body` starts. For cleanup that must finish after a cancellation.
 pub fn non_cancellable(ctx: Context, body: fn(Context) -> a) -> a {
-  let scope = runtime.open_scope(ctx.scope, True)
+  let scope = scopes.open(ctx.scope, True)
   let value = body(Context(scope))
-  runtime.close_scope(scope)
+  scopes.close(scope)
   value
 }
 
@@ -514,24 +518,24 @@ pub fn with_timeout(
   within: Duration,
   body: fn(Context) -> Result(a, Failure),
 ) -> Result(a, Failure) {
-  let scope = runtime.open_scope(ctx.scope, False)
+  let scope = scopes.open(ctx.scope, False)
   // The deadline timer is the scope's first operation, as in the TypeScript SDK.
-  let seq = runtime.next_timer()
-  case runtime.scope_cancelled(scope) {
+  let seq = determinism.next_timer()
+  case scopes.cancelled(scope) {
     Some(_) -> Nil
     None -> {
-      runtime.push(bridge.StartTimer(seq, timer_ms(within)))
-      runtime.register(scope, runtime.TimerOp(seq))
-      runtime.set_deadline(seq, scope)
+      run_state.push(bridge.StartTimer(seq, timer_ms(within)))
+      scopes.register(scope, run_state.TimerOp(seq))
+      scopes.set_deadline(seq, scope)
     }
   }
   let outcome = body(Context(scope))
-  let timed_out = set.contains(runtime.get().fired_timers, seq)
-  case runtime.scope_cancelled(scope) {
+  let timed_out = set.contains(run_state.get().fired_timers, seq)
+  case scopes.cancelled(scope) {
     Some(_) -> Nil
-    None -> runtime.cancel_timer(seq)
+    None -> scopes.cancel_timer(seq)
   }
-  runtime.close_scope(scope)
+  scopes.close(scope)
   case outcome, timed_out {
     Error(cause), True ->
       Error(
@@ -547,19 +551,19 @@ pub fn with_timeout(
 /// Cancel the context's scope: everything pending that was started with it, or with a
 /// context derived from it, is asked to cancel.
 pub fn cancel(ctx: Context) -> Nil {
-  runtime.cancel_scope(ctx.scope, "cancelled by workflow code")
+  scopes.cancel(ctx.scope, "cancelled by workflow code")
 }
 
 /// Whether the context has been cancelled.
 pub fn is_cancelled(ctx: Context) -> Bool {
-  option.is_some(runtime.scope_cancelled(ctx.scope))
+  option.is_some(scopes.cancelled(ctx.scope))
 }
 
 /// A future that resolves, with the reason given, when the context is cancelled. For the
 /// context a workflow function receives, that is when cancellation of the workflow is
 /// requested.
 pub fn cancellation(ctx: Context) -> Future(String) {
-  Future(fn() { runtime.scope_cancelled(ctx.scope) })
+  Future(fn() { scopes.cancelled(ctx.scope) })
 }
 
 // ---- timers ----
@@ -569,14 +573,14 @@ pub fn cancellation(ctx: Context) -> Future(String) {
 pub fn timer(ctx: Context, lasting: Duration) -> Future(Result(Nil, Failure)) {
   // A sequence number is used even when nothing is scheduled, as the other SDKs do, so
   // that later timers are numbered the same.
-  let seq = runtime.next_timer()
-  case runtime.scope_cancelled(ctx.scope) {
+  let seq = determinism.next_timer()
+  case scopes.cancelled(ctx.scope) {
     Some(_) -> ready(Error(failure.cancelled()))
     None -> {
-      runtime.push(bridge.StartTimer(seq, timer_ms(lasting)))
-      runtime.register(ctx.scope, runtime.TimerOp(seq))
+      run_state.push(bridge.StartTimer(seq, timer_ms(lasting)))
+      scopes.register(ctx.scope, run_state.TimerOp(seq))
       Future(fn() {
-        let state = runtime.get()
+        let state = run_state.get()
         case
           set.contains(state.fired_timers, seq),
           set.contains(state.cancelled_timers, seq)
@@ -660,11 +664,11 @@ pub fn start_activity(
   input: input,
   options: ActivityOptions,
 ) -> Future(Result(output, Failure)) {
-  let seq = runtime.next_activity()
-  case runtime.scope_cancelled(ctx.scope) {
+  let seq = determinism.next_activity()
+  case scopes.cancelled(ctx.scope) {
     Some(_) -> ready(Error(failure.cancelled()))
     None -> {
-      let state = runtime.get()
+      let state = run_state.get()
       let call =
         state.outbound.activity(middleware.ActivityCall(
           activity_type: definition.name,
@@ -672,7 +676,7 @@ pub fn start_activity(
           arguments: codec.encode_arguments(definition.input, input),
           headers: state.headers,
         ))
-      runtime.push(bridge.ScheduleActivity(
+      run_state.push(bridge.ScheduleActivity(
         seq:,
         activity_id: option.unwrap(options.activity_id, int.to_string(seq)),
         activity_type: call.activity_type,
@@ -690,9 +694,9 @@ pub fn start_activity(
         },
         headers: call.headers,
       ))
-      runtime.register(ctx.scope, runtime.ActivityOp(seq))
+      scopes.register(ctx.scope, run_state.ActivityOp(seq))
       resolution(
-        fn() { dict.get(runtime.get().activities, seq) },
+        fn() { dict.get(run_state.get().activities, seq) },
         definition.output,
       )
     }
@@ -780,7 +784,7 @@ pub fn set_query_handler(
       codec.encode(definition.result, handler(argument))
     })
   }
-  runtime.update(fn(state) {
+  run_state.update(fn(state) {
     State(
       ..state,
       query_handlers: dict.insert(state.query_handlers, definition.name, erased),
@@ -796,10 +800,10 @@ pub fn continue_as_new(
   definition: Definition(input, output),
   input: input,
 ) -> Result(output, Failure) {
-  runtime.abandon_updates()
-  runtime.push(bridge.ContinueAsNew(
+  updates.abandon()
+  run_state.push(bridge.ContinueAsNew(
     definition.name,
-    runtime.get().task_queue,
+    run_state.get().task_queue,
     codec.encode_arguments(definition.input, input),
   ))
   runtime.serve()
@@ -815,14 +819,14 @@ pub fn continue_as_new(
 /// }
 /// ```
 pub fn patched(_ctx: Context, patch_id: String) -> Bool {
-  runtime.patched(patch_id)
+  determinism.patched(patch_id)
 }
 
 /// The second step of retiring a patch. Once no run that took the old path can still
 /// replay, replace the `patched` call with this and delete the old path; once no run that
 /// recorded the patch can still replay, delete this too.
 pub fn deprecate_patch(_ctx: Context, patch_id: String) -> Nil {
-  runtime.deprecate_patch(patch_id)
+  determinism.deprecate_patch(patch_id)
 }
 
 // ---- other workflows ----
@@ -847,18 +851,18 @@ pub fn send_signal(
   definition: SignalDefinition(a),
   value: a,
 ) -> Future(Result(Nil, Failure)) {
-  let seq = runtime.next_signal()
-  case runtime.scope_cancelled(ctx.scope) {
+  let seq = determinism.next_signal()
+  case scopes.cancelled(ctx.scope) {
     Some(_) -> ready(Error(failure.cancelled()))
     None -> {
-      runtime.push(bridge.SignalExternal(
+      run_state.push(bridge.SignalExternal(
         seq,
         target,
         definition.name,
         codec.encode_arguments(definition.codec, value),
       ))
-      runtime.register(ctx.scope, runtime.SignalOp(seq))
-      external_outcome(fn() { dict.get(runtime.get().external_signals, seq) })
+      scopes.register(ctx.scope, run_state.SignalOp(seq))
+      external_outcome(fn() { dict.get(run_state.get().external_signals, seq) })
     }
   }
 }
@@ -880,14 +884,14 @@ pub fn cancel_external(
   _ctx: Context,
   workflow_id: String,
 ) -> Future(Result(Nil, Failure)) {
-  let seq = runtime.next_cancel()
-  runtime.push(bridge.CancelExternal(
+  let seq = determinism.next_cancel()
+  run_state.push(bridge.CancelExternal(
     seq,
     workflow_id,
     "",
     "cancelled by workflow",
   ))
-  external_outcome(fn() { dict.get(runtime.get().external_cancels, seq) })
+  external_outcome(fn() { dict.get(run_state.get().external_cancels, seq) })
 }
 
 // ---- changing what the server knows about this run ----
@@ -900,10 +904,10 @@ pub fn upsert_memo(
   value: a,
 ) -> Nil {
   let payload = codec.encode(value_codec, value)
-  runtime.update(fn(state) {
+  run_state.update(fn(state) {
     State(..state, memo: dict.insert(state.memo, key, payload))
   })
-  runtime.push(bridge.UpsertMemo(dict.from_list([#(key, payload)])))
+  run_state.push(bridge.UpsertMemo(dict.from_list([#(key, payload)])))
 }
 
 /// Set or replace search attributes on the running workflow.
@@ -911,7 +915,7 @@ pub fn upsert_search_attributes(
   _ctx: Context,
   attributes: Dict(String, search_attributes.Value),
 ) -> Nil {
-  runtime.push(
+  run_state.push(
     bridge.UpsertSearchAttributes(search_attributes.encode(attributes)),
   )
 }
@@ -935,7 +939,7 @@ pub fn with_versioning(
   behavior: VersioningBehavior,
 ) -> Handler {
   Handler(handler.name, fn(arguments) {
-    runtime.update(fn(state) {
+    run_state.update(fn(state) {
       State(..state, versioning_behavior: case behavior {
         Pinned -> 1
         AutoUpgrade -> 2

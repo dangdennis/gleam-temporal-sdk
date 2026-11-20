@@ -12,7 +12,9 @@ import gleam/time/duration.{type Duration}
 import temporal/codec
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
-import temporal/internal/runtime
+import temporal/internal/runtime/determinism
+import temporal/internal/runtime/run_state
+import temporal/internal/runtime/scopes
 import temporal/internal/time
 import temporal/workflow.{type Context, type Future, type NexusOperation}
 
@@ -58,15 +60,15 @@ pub fn start(
   input: input,
   options: Options,
 ) -> Operation(output) {
-  let seq = runtime.next_nexus()
-  case runtime.scope_cancelled(workflow.scope_of(ctx)) {
+  let seq = determinism.next_nexus()
+  case scopes.cancelled(workflow.scope_of(ctx)) {
     Some(_) ->
       Operation(
         started: workflow.ready(Error(failure.cancelled())),
         result: workflow.ready(Error(failure.cancelled())),
       )
     None -> {
-      runtime.push(
+      run_state.push(
         bridge.ScheduleNexusOperation(
           seq:,
           endpoint:,
@@ -82,10 +84,10 @@ pub fn start(
           },
         ),
       )
-      runtime.register(workflow.scope_of(ctx), runtime.NexusOp(seq))
+      scopes.register(workflow.scope_of(ctx), run_state.NexusOp(seq))
       let started =
         workflow.future(fn() {
-          case dict.get(runtime.get().nexus_starts, seq) {
+          case dict.get(run_state.get().nexus_starts, seq) {
             Ok(bridge.NexusStartedAsync(token)) -> Some(Ok(Some(token)))
             Ok(bridge.NexusStartedSync) -> Some(Ok(None))
             Ok(bridge.NexusStartFailed(failure)) -> Some(Error(failure))
@@ -94,7 +96,7 @@ pub fn start(
         })
       let finished =
         workflow.resolution(
-          fn() { dict.get(runtime.get().nexus_results, seq) },
+          fn() { dict.get(run_state.get().nexus_results, seq) },
           operation.output,
         )
       Operation(

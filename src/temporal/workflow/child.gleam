@@ -11,7 +11,9 @@ import gleam/time/duration.{type Duration}
 import temporal/codec.{type Payload}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
-import temporal/internal/runtime
+import temporal/internal/runtime/determinism
+import temporal/internal/runtime/run_state
+import temporal/internal/runtime/scopes
 import temporal/internal/time
 import temporal/middleware
 import temporal/workflow.{
@@ -100,8 +102,8 @@ pub fn start(
   input: input,
   options: Options,
 ) -> Child(output) {
-  let seq = runtime.next_child()
-  case runtime.scope_cancelled(workflow.scope_of(ctx)) {
+  let seq = determinism.next_child()
+  case scopes.cancelled(workflow.scope_of(ctx)) {
     Some(_) ->
       Child(
         workflow_id: options.workflow_id,
@@ -109,7 +111,7 @@ pub fn start(
         result: workflow.ready(Error(failure.cancelled())),
       )
     None -> {
-      let state = runtime.get()
+      let state = run_state.get()
       let call =
         state.outbound.child(middleware.ChildCall(
           workflow_type: definition.name,
@@ -118,7 +120,7 @@ pub fn start(
           arguments: codec.encode_arguments(definition.input, input),
           headers: state.headers,
         ))
-      runtime.push(bridge.StartChildWorkflow(
+      run_state.push(bridge.StartChildWorkflow(
         seq:,
         workflow_id: call.workflow_id,
         workflow_type: call.workflow_type,
@@ -150,10 +152,10 @@ pub fn start(
           headers: call.headers,
         ),
       ))
-      runtime.register(workflow.scope_of(ctx), runtime.ChildOp(seq))
+      scopes.register(workflow.scope_of(ctx), run_state.ChildOp(seq))
       let started =
         workflow.future(fn() {
-          case dict.get(runtime.get().child_starts, seq) {
+          case dict.get(run_state.get().child_starts, seq) {
             Ok(bridge.ChildStarted(run_id)) -> Some(Ok(run_id))
             Ok(bridge.ChildStartFailed(workflow_id, cause)) ->
               Some(Error(start_failure(workflow_id, cause)))
@@ -163,7 +165,7 @@ pub fn start(
         })
       let finished =
         workflow.resolution(
-          fn() { dict.get(runtime.get().children, seq) },
+          fn() { dict.get(run_state.get().children, seq) },
           definition.output,
         )
       Child(
