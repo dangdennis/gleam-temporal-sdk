@@ -2,8 +2,8 @@
 %% runtime needs that Gleam cannot express.
 -module(temporal_ffi).
 
--export([connect/5, update_with_start/4, complete_activity_async/3, defer_activity/0,
-         activity_deferred/0, follow/1, new_cell/0, read_cell/1, write_cell/2, update_workflow/4, poll_update/4, poll_nexus/1, complete_nexus/3, aes_gcm_encrypt/2, aes_gcm_decrypt/2, schedule_put/5, schedule_describe/2, schedule_delete/2,
+-export([connect/1, schedule_create/4, schedule_update/5, update_with_start/4, complete_activity_async/3, defer_activity/0,
+         activity_deferred/0, follow/1, new_cell/0, read_cell/1, write_cell/2, update_workflow/4, poll_update/4, poll_nexus/1, complete_nexus/3, aes_gcm_encrypt/2, aes_gcm_decrypt/2, schedule_describe/2, schedule_delete/2,
          schedule_patch/3, schedule_list/1, system_time_ms/0, server_start/2, server_stop/1, time_control/2, worker_new/3, replay_worker_new/2, poll_workflow/1, complete_workflow/2,
          poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/3, worker_shutdown/1,
          start_workflow/3, describe_workflow/3, list_workflows/3, count_workflows/2, signal_workflow/5, query_workflow/5, cancel_workflow/3,
@@ -20,8 +20,8 @@ call(Start) ->
         Error -> Error
     end.
 
-connect(Target, Namespace, Identity, ApiKey, Tls) ->
-    call(fun(P, R) -> temporal_nif:connect(P, R, Target, Namespace, Identity, ApiKey, Tls) end).
+connect(Options) ->
+    call(fun(P, R) -> temporal_nif:connect(P, R, Options) end).
 
 system_time_ms() ->
     erlang:system_time(millisecond).
@@ -35,8 +35,11 @@ server_stop(Server) ->
 time_control(Conn, Op) ->
     call(fun(P, R) -> temporal_nif:time_control(P, R, Conn, Op) end).
 
-schedule_put(Conn, Id, Schedule, Token, Trigger) ->
-    call(fun(P, R) -> temporal_nif:schedule_put(P, R, Conn, Id, Schedule, Token, Trigger) end).
+schedule_create(Conn, Id, Schedule, Trigger) ->
+    call(fun(P, R) -> temporal_nif:schedule_create(P, R, Conn, Id, Schedule, Trigger) end).
+
+schedule_update(Conn, Id, Stored, Described, Changed) ->
+    call(fun(P, R) -> temporal_nif:schedule_update(P, R, Conn, Id, Stored, Described, Changed) end).
 
 schedule_describe(Conn, Id) ->
     call(fun(P, R) -> temporal_nif:schedule_describe(P, R, Conn, Id) end).

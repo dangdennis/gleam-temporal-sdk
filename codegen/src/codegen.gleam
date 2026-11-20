@@ -155,7 +155,7 @@ fn rust_struct(variant: Variant) -> String {
     list.map(variant.fields, fn(field) {
       "self." <> field.name <> ".to_term(env)"
     })
-  "\n#[derive(Debug, Clone)]\npub struct "
+  "\n#[derive(Debug, Clone, PartialEq)]\npub struct "
   <> name
   <> " {\n"
   <> string.concat(declared)
@@ -210,7 +210,7 @@ fn rust_enum(name: String, variants: List(Variant)) -> String {
     list.map(variants, fn(variant) {
       "            " <> read("Self::" <> variant.name, variant)
     })
-  "\n#[derive(Debug, Clone)]\npub enum "
+  "\n#[derive(Debug, Clone, PartialEq)]\npub enum "
   <> name
   <> " {\n"
   <> string.concat(declared)

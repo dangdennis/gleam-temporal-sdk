@@ -35,7 +35,7 @@ pub opaque type Client {
 
 /// How to reach the service. Start from `local()` or `cloud(..)` and the `with_` functions
 /// that take one: `with_target`, `with_namespace`, `with_identity`, `with_api_key`,
-/// `with_tls` and `with_codec`.
+/// `with_tls`, `with_codec`, `with_keep_alive` and `with_connect_timeout`.
 pub type Options {
   Options(
     /// The frontend address, such as `http://localhost:7233`.
@@ -51,7 +51,17 @@ pub type Options {
     /// Applied to every payload this client, and any worker started with it, sends or
     /// receives. See `codec.PayloadCodec` and `temporal/encryption`.
     codec: Option(PayloadCodec),
+    /// The pings that tell a dead connection from a quiet one. `None` sends none.
+    keep_alive: Option(KeepAlive),
+    /// The longest `connect` waits for the service.
+    connect_timeout: Duration,
   )
+}
+
+/// HTTP/2 keep-alive: a ping every `interval`, and a connection whose ping goes
+/// unanswered for `timeout` is dropped and opened again.
+pub type KeepAlive {
+  KeepAlive(interval: Duration, timeout: Duration)
 }
 
 /// TLS settings. Build with `tls()` and the `with_` functions that take one.
@@ -199,7 +209,13 @@ pub fn local() -> Options {
     api_key: None,
     tls: None,
     codec: None,
+    keep_alive: Some(default_keep_alive()),
+    connect_timeout: duration.seconds(10),
   )
+}
+
+fn default_keep_alive() -> KeepAlive {
+  KeepAlive(interval: duration.seconds(30), timeout: duration.seconds(15))
 }
 
 /// Options for Temporal Cloud with an API key: TLS with the system's root certificates.
@@ -217,6 +233,8 @@ pub fn cloud(
     api_key: Some(api_key),
     tls: Some(tls()),
     codec: None,
+    keep_alive: Some(default_keep_alive()),
+    connect_timeout: duration.seconds(10),
   )
 }
 
@@ -251,6 +269,33 @@ pub fn with_codec(options: Options, codec: PayloadCodec) -> Options {
   Options(..options, codec: Some(codec))
 }
 
+/// Ping the service every `interval` and reconnect when a ping is not answered within
+/// `timeout`. The default is every 30 seconds with 15 seconds to answer.
+///
+/// A connection can die without either end being told: a NAT entry or a load balancer
+/// forgets it, a route goes away. Without pings a worker's polls would wait on it for good
+/// and the worker would take no more tasks. Shorten the interval if something between you
+/// and the service drops idle connections sooner than every 30 seconds.
+pub fn with_keep_alive(
+  options: Options,
+  interval interval: Duration,
+  timeout timeout: Duration,
+) -> Options {
+  Options(..options, keep_alive: Some(KeepAlive(interval:, timeout:)))
+}
+
+/// Send no keep-alive pings. A connection that goes silent is then only noticed when the
+/// operating system gives up on it, which can take many minutes; see `with_keep_alive`.
+pub fn without_keep_alive(options: Options) -> Options {
+  Options(..options, keep_alive: None)
+}
+
+/// How long `connect` waits for the service before failing with `ConnectionFailed`, ten
+/// seconds by default. It also bounds each later attempt to reconnect.
+pub fn with_connect_timeout(options: Options, timeout: Duration) -> Options {
+  Options(..options, connect_timeout: timeout)
+}
+
 /// TLS with the system's root certificates and no client certificate.
 pub fn tls() -> Tls {
   Tls(server_root_ca: None, domain: None, client_certificate: None)
@@ -275,17 +320,22 @@ pub fn with_client_certificate(
   Tls(..tls, client_certificate: Some(#(certificate, private_key)))
 }
 
-/// Connect to the service. Fails if it cannot be reached or refuses the credentials.
+/// Connect to the service. Fails with `ConnectionFailed` if it cannot be reached within
+/// the connect timeout or refuses the credentials.
 pub fn connect(options: Options) -> Result(Client, Error) {
-  bridge.connect(
-    options.target,
-    options.namespace,
-    options.identity,
-    options.api_key,
-    option.map(options.tls, fn(tls) {
+  bridge.connect(bridge.ConnectOptions(
+    target: options.target,
+    namespace: options.namespace,
+    identity: options.identity,
+    api_key: options.api_key,
+    tls: option.map(options.tls, fn(tls) {
       bridge.Tls(tls.server_root_ca, tls.domain, tls.client_certificate)
     }),
-  )
+    keep_alive: option.map(options.keep_alive, fn(keep_alive) {
+      #(time.to_ms(keep_alive.interval), time.to_ms(keep_alive.timeout))
+    }),
+    connect_timeout_ms: time.to_ms(options.connect_timeout),
+  ))
   |> result.map(Client(_, options.codec, options.namespace))
   |> result.map_error(ConnectionFailed)
 }

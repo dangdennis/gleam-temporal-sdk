@@ -63,6 +63,8 @@ fn config(task_queue: String) -> worker.Config {
   |> worker.with_activities([activity.handler(double(), fn(_, n) { Ok(n * 2) })])
   // Small enough that runs are evicted and replayed throughout.
   |> worker.with_max_cached_workflows(100)
+  |> worker.with_max_concurrent_workflow_task_polls(env_int("LOAD_POLLS", 10))
+  |> worker.with_max_concurrent_activity_task_polls(env_int("LOAD_POLLS", 10))
 }
 
 /// Keep a worker running: start one, and start another whenever it dies. Each worker has

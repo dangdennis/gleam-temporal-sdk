@@ -3,10 +3,12 @@
 import gleam/dict.{type Dict}
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
+import gleam/result
 import gleam/string
 import gleam/time/duration.{type Duration}
 import temporal/activity
@@ -32,6 +34,11 @@ pub type Config {
     max_cached_workflows: Int,
     max_concurrent_workflow_tasks: Int,
     max_concurrent_activities: Int,
+    max_concurrent_nexus_tasks: Int,
+    /// How many requests for each kind of task the worker keeps open with the server.
+    max_concurrent_workflow_task_polls: Int,
+    max_concurrent_activity_task_polls: Int,
+    max_concurrent_nexus_task_polls: Int,
     /// A limit the server enforces across every worker on the task queue.
     max_task_queue_activities_per_second: Option(Float),
     /// A limit on this worker alone.
@@ -82,6 +89,10 @@ pub fn new(client: Client, task_queue: String) -> Config {
     max_cached_workflows: 1000,
     max_concurrent_workflow_tasks: 100,
     max_concurrent_activities: 100,
+    max_concurrent_nexus_tasks: 100,
+    max_concurrent_workflow_task_polls: 10,
+    max_concurrent_activity_task_polls: 10,
+    max_concurrent_nexus_task_polls: 10,
     max_task_queue_activities_per_second: None,
     max_activities_per_second: None,
     workflow_middleware: [],
@@ -124,6 +135,43 @@ pub fn with_max_concurrent_workflow_tasks(config: Config, max: Int) -> Config {
 /// How many activities this worker runs at once.
 pub fn with_max_concurrent_activities(config: Config, max: Int) -> Config {
   Config(..config, max_concurrent_activities: max)
+}
+
+/// How many Nexus tasks this worker handles at once.
+pub fn with_max_concurrent_nexus_tasks(config: Config, max: Int) -> Config {
+  Config(..config, max_concurrent_nexus_tasks: max)
+}
+
+/// How many requests for workflow tasks the worker keeps open with the server, 10 by
+/// default. Each returns one task, so this bounds how fast the worker can take them:
+/// raise it when workflow tasks wait in the queue while the worker has slots free, which
+/// shows first where a round trip to the server is slow. It is never more than
+/// `max_concurrent_workflow_tasks`, and at least 2 for a worker that caches workflows.
+pub fn with_max_concurrent_workflow_task_polls(
+  config: Config,
+  max: Int,
+) -> Config {
+  Config(..config, max_concurrent_workflow_task_polls: max)
+}
+
+/// How many requests for activity tasks the worker keeps open with the server, 10 by
+/// default and never more than `max_concurrent_activities`. Raise it when activities are
+/// short and wait in the queue while the worker has slots free.
+pub fn with_max_concurrent_activity_task_polls(
+  config: Config,
+  max: Int,
+) -> Config {
+  Config(..config, max_concurrent_activity_task_polls: max)
+}
+
+/// How many requests for Nexus tasks the worker keeps open with the server, 10 by default
+/// and never more than `max_concurrent_nexus_tasks`. Raise it when Nexus requests wait
+/// while the worker has slots free.
+pub fn with_max_concurrent_nexus_task_polls(
+  config: Config,
+  max: Int,
+) -> Config {
+  Config(..config, max_concurrent_nexus_task_polls: max)
 }
 
 /// Limit how fast the task queue hands out activities, across all its workers. The server
@@ -233,6 +281,11 @@ pub fn with_shutdown_grace(config: Config, grace: Duration) -> Config {
 /// times in a minute, the worker gives up and exits abnormally, which takes the calling
 /// process with it unless it traps exits: a worker that cannot work should not look
 /// healthy. Under a supervisor, use `supervised` instead.
+///
+/// A worker outlasts an outage of the service or the network: polling is retried for as
+/// long as it takes. If the service answers polls with an error that retrying does not
+/// cure for over a minute, the worker logs it and registers afresh, again and again until
+/// that succeeds.
 pub fn start(config: Config) -> Result(Worker, client.Error) {
   let started = process.new_subject()
   let parent = process.self()
@@ -276,7 +329,17 @@ pub fn stop(worker: Worker) -> Nil {
 
 type Manager {
   Manager(
+    config: Config,
+    /// The process that started the worker.
+    parent: Pid,
+    events: process.Selector(Event),
+    /// Where a loop reports that polling failed.
+    failures: Subject(Event),
     nif: bridge.NifWorker,
+    /// How many times the worker has registered with core. A loop reports a failed poll
+    /// with the registration it polled for, so that a late report about an earlier one is
+    /// not taken for news about this one.
+    registration: Int,
     /// What each running loop is, by its process.
     loops: Dict(Pid, Loop),
     /// When recent restarts happened, in milliseconds, newest first.
@@ -285,17 +348,22 @@ type Manager {
 }
 
 type Loop {
-  Loop(name: String, run: fn() -> Nil)
+  /// `run` returns when the worker shuts down, and with an error when polling fails.
+  Loop(name: String, run: fn() -> Result(Nil, String))
 }
 
 type Event {
   Control(Control)
   Exited(process.ExitMessage)
+  PollingFailed(registration: Int, loop: String, message: String)
 }
 
 const max_restarts = 5
 
 const restart_window_ms = 60_000
+
+/// The longest wait between attempts to register again after polling failed.
+const max_register_wait_ms = 30_000
 
 @external(erlang, "temporal_ffi", "system_time_ms")
 fn now_ms() -> Int
@@ -313,16 +381,18 @@ fn manage(
     Error(reason) -> process.send(started, Error(reason))
     Ok(nif) -> {
       let control = process.new_subject()
-      let loops =
-        loops(config, nif)
-        |> list.map(fn(loop) { #(process.spawn(loop.run), loop) })
-        |> dict.from_list
-      process.send(started, Ok(control))
+      let failures = process.new_subject()
       let events =
         process.new_selector()
         |> process.select_map(control, Control)
+        |> process.select(failures)
         |> process.select_trapped_exits(Exited)
-      supervise(Manager(nif, loops, []), parent, events)
+      let manager =
+        start_loops(
+          Manager(config, parent, events, failures, nif, 1, dict.new(), []),
+        )
+      process.send(started, Ok(control))
+      supervise(manager)
     }
   }
 }
@@ -349,37 +419,70 @@ fn register(config: Config, attempts: Int) -> Result(bridge.NifWorker, String) {
   }
 }
 
-fn supervise(
-  manager: Manager,
-  parent: Pid,
-  events: process.Selector(Event),
-) -> Nil {
-  case process.selector_receive_forever(events) {
+fn start_loops(manager: Manager) -> Manager {
+  let loops =
+    loops(manager.config, manager.nif)
+    |> list.map(fn(loop) { #(start_loop(manager, loop), loop) })
+    |> dict.from_list
+  Manager(..manager, loops:)
+}
+
+fn start_loop(manager: Manager, loop: Loop) -> Pid {
+  let Manager(failures:, registration:, ..) = manager
+  process.spawn(fn() {
+    case loop.run() {
+      Ok(Nil) -> Nil
+      Error(message) ->
+        process.send(failures, PollingFailed(registration, loop.name, message))
+    }
+  })
+}
+
+/// Stop for good, as the process that started the worker, or its supervisor, goes away.
+fn leave(reason: process.ExitReason) -> Nil {
+  // A supervisor that asks its child to shut down expects it to leave with the reason it
+  // was asked with, and reports anything else as an error.
+  case reason {
+    process.Abnormal(asked) -> exit(asked)
+    _ -> Nil
+  }
+}
+
+fn supervise(manager: Manager) -> Nil {
+  case process.selector_receive_forever(manager.events) {
     Control(Stop(reply)) -> {
       bridge.worker_shutdown(manager.nif)
       process.send(reply, Nil)
     }
+    PollingFailed(registration:, ..) if registration != manager.registration ->
+      supervise(manager)
+    // Core gives up on polling only after retrying for as long as it thinks worthwhile,
+    // and then shuts its worker down: this one will never take another task. Carrying
+    // on needs a new registration.
+    PollingFailed(loop:, message:, ..) -> {
+      report(config_error(
+        loop
+        <> " polling on task queue \""
+        <> manager.config.task_queue
+        <> "\" failed, registering the worker again: "
+        <> message,
+      ))
+      bridge.worker_shutdown(manager.nif)
+      // The old loops end by themselves, and are no longer this worker's to restart.
+      register_again(Manager(..manager, loops: dict.new()), 1000)
+    }
     Exited(process.ExitMessage(pid, reason)) ->
       case dict.get(manager.loops, pid), reason {
-        // The process that started the worker, or its supervisor, is going away.
-        Error(Nil), _ if pid == parent -> {
+        Error(Nil), _ if pid == manager.parent -> {
           bridge.worker_shutdown(manager.nif)
-          // A supervisor that asks its child to shut down expects it to leave with the
-          // reason it was asked with, and reports anything else as an error.
-          case reason {
-            process.Abnormal(asked) -> exit(asked)
-            _ -> Nil
-          }
+          leave(reason)
         }
         // Something else that was linked to this process.
-        Error(Nil), _ -> supervise(manager, parent, events)
-        // A loop ends normally only when the worker is shutting down.
+        Error(Nil), _ -> supervise(manager)
+        // A loop ends normally when the worker is shutting down, or after reporting
+        // that polling failed.
         Ok(_), process.Normal ->
-          supervise(
-            Manager(..manager, loops: dict.delete(manager.loops, pid)),
-            parent,
-            events,
-          )
+          supervise(Manager(..manager, loops: dict.delete(manager.loops, pid)))
         Ok(loop), _ -> {
           let now = now_ms()
           let recent =
@@ -392,6 +495,11 @@ fn supervise(
           case list.length(recent) >= max_restarts {
             True -> {
               bridge.worker_shutdown(manager.nif)
+              report(config_error(
+                "giving up on task queue \""
+                <> manager.config.task_queue
+                <> "\": its polling loops keep crashing",
+              ))
               panic as "temporal worker gave up: its polling loops keep crashing"
             }
             False ->
@@ -400,15 +508,63 @@ fn supervise(
                   ..manager,
                   loops: manager.loops
                     |> dict.delete(pid)
-                    |> dict.insert(process.spawn(loop.run), loop),
+                    |> dict.insert(start_loop(manager, loop), loop),
                   restarts: [now, ..recent],
                 ),
-                parent,
-                events,
               )
           }
         }
       }
+  }
+}
+
+/// Register with core afresh and start polling again. While the service cannot be reached
+/// this fails, so it is tried for as long as it takes, less and less often, each failure
+/// logged: the worker should be working again as soon as the service is.
+fn register_again(manager: Manager, wait_ms: Int) -> Nil {
+  case register(manager.config, 30) {
+    Ok(nif) -> {
+      bridge.log(
+        bridge.Info,
+        config_error(
+          "registered again and polling task queue \""
+          <> manager.config.task_queue
+          <> "\"",
+        ),
+        [],
+      )
+      let manager =
+        Manager(..manager, nif:, registration: manager.registration + 1)
+      supervise(start_loops(manager))
+    }
+    Error(reason) -> {
+      report(config_error(
+        "could not register on task queue \""
+        <> manager.config.task_queue
+        <> "\", trying again in "
+        <> int.to_string(wait_ms)
+        <> "ms: "
+        <> reason,
+      ))
+      wait_to_register(
+        manager,
+        now_ms() + wait_ms,
+        int.min(wait_ms * 2, max_register_wait_ms),
+      )
+    }
+  }
+}
+
+/// Wait until `until`, still answering `stop` and the exit of the worker's owner. The
+/// worker in core is already shut down.
+fn wait_to_register(manager: Manager, until: Int, next_wait_ms: Int) -> Nil {
+  let remaining = int.max(until - now_ms(), 0)
+  case process.selector_receive(manager.events, remaining) {
+    Error(Nil) -> register_again(manager, next_wait_ms)
+    Ok(Control(Stop(reply))) -> process.send(reply, Nil)
+    Ok(Exited(process.ExitMessage(pid, reason))) if pid == manager.parent ->
+      leave(reason)
+    Ok(_) -> wait_to_register(manager, until, next_wait_ms)
   }
 }
 
@@ -425,6 +581,10 @@ fn worker_options(config: Config) -> bridge.WorkerOptions {
     max_cached_workflows: config.max_cached_workflows,
     max_concurrent_workflow_tasks: config.max_concurrent_workflow_tasks,
     max_concurrent_activities: config.max_concurrent_activities,
+    max_concurrent_nexus_tasks: config.max_concurrent_nexus_tasks,
+    max_concurrent_workflow_task_polls: config.max_concurrent_workflow_task_polls,
+    max_concurrent_activity_task_polls: config.max_concurrent_activity_task_polls,
+    max_concurrent_nexus_task_polls: config.max_concurrent_nexus_task_polls,
     max_task_queue_activities_per_second: config.max_task_queue_activities_per_second,
     max_activities_per_second: config.max_activities_per_second,
     enable_workflows: config.workflows != [],
@@ -445,8 +605,7 @@ fn worker_options(config: Config) -> bridge.WorkerOptions {
   )
 }
 
-/// The polling loops this worker needs. Each returns when the worker shuts down and
-/// crashes if polling fails.
+/// The polling loops this worker needs.
 fn loops(config: Config, nif: bridge.NifWorker) -> List(Loop) {
   let codec = client.payload_codec(config.client)
   let workflows =
@@ -467,16 +626,15 @@ fn loops(config: Config, nif: bridge.NifWorker) -> List(Loop) {
     )
   let workflow_loop =
     Loop("workflow", fn() {
-      let assert Ok(_) =
-        poller.workflow_loop(
-          nif,
-          workflows,
-          config.task_queue,
-          config.outbound,
-          codec,
-          False,
-        )
-      Nil
+      poller.workflow_loop(
+        nif,
+        workflows,
+        config.task_queue,
+        config.outbound,
+        codec,
+        False,
+      )
+      |> result.replace(Nil)
     })
   // The activity poller also delivers local activities, which core issues to any worker
   // that runs workflows.

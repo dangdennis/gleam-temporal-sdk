@@ -4,12 +4,14 @@
 //! directions and compare what arrives with what was sent.
 
 use crate::{
+    bridge,
     convert::{
         decode_activity_result, decode_completion, decode_nexus_result, duration, to_activation,
         to_activity_task,
     },
     err, ok,
-    wire::Wire,
+    schedule::{overwrite, to_schedule},
+    wire::{Bytes, Wire},
 };
 use rustler::{Encoder, Env, Term};
 use temporalio_common::protos::{
@@ -25,8 +27,13 @@ use temporalio_common::protos::{
         },
     },
     temporal::api::{
-        common::v1::{Memo, Payload, WorkflowExecution},
-        failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+        common::v1::{ActivityType, Memo, Payload, Payloads, RetryPolicy, WorkflowExecution},
+        enums::v1::{RetryState, TimeoutType},
+        failure::v1::{
+            ActivityFailureInfo, ApplicationFailureInfo, Failure, TimeoutFailureInfo,
+            failure::FailureInfo,
+        },
+        workflowservice::v1::UpdateScheduleRequest,
     },
 };
 
@@ -50,6 +57,40 @@ fn failure(message: &str) -> Failure {
         )),
         ..Default::default()
     }
+}
+
+/// An activity that timed out, as the server reports it to a workflow: full of fields
+/// `failure.Failure` has no place for.
+#[rustler::nif]
+fn sample_activity_failure(env: Env) -> Term {
+    Failure {
+        message: "Activity task timed out".to_string(),
+        source: "Server".to_string(),
+        cause: Some(Box::new(Failure {
+            message: "activity StartToClose timeout".to_string(),
+            source: "Server".to_string(),
+            stack_trace: "the-stack".to_string(),
+            failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
+                timeout_type: TimeoutType::StartToClose as i32,
+                last_heartbeat_details: Some(Payloads {
+                    payloads: vec![payload("\"progress\"")],
+                }),
+            })),
+            ..Default::default()
+        })),
+        failure_info: Some(FailureInfo::ActivityFailureInfo(ActivityFailureInfo {
+            scheduled_event_id: 5,
+            started_event_id: 6,
+            identity: "the-worker".to_string(),
+            activity_type: Some(ActivityType {
+                name: "the-activity-type".to_string(),
+            }),
+            activity_id: "the-activity-id".to_string(),
+            retry_state: RetryState::NonRetryableFailure as i32,
+        })),
+        ..Default::default()
+    }
+    .to_term(env)
 }
 
 fn timestamp(ms: i64) -> prost_wkt_types::Timestamp {
@@ -228,7 +269,7 @@ fn sample_activity_task(env: Env) -> Term {
             workflow_type: "workflow-type".to_string(),
             workflow_execution: Some(WorkflowExecution {
                 workflow_id: "workflow-id".to_string(),
-                run_id: "ignored".to_string(),
+                run_id: "run-id".to_string(),
             }),
             activity_id: "activity-id".to_string(),
             activity_type: "activity-type".to_string(),
@@ -240,9 +281,122 @@ fn sample_activity_task(env: Env) -> Term {
             heartbeat_timeout: Some(duration(700)),
             is_local: true,
             header_fields: [("trace".to_string(), payload("3"))].into(),
-            run_id: "run-id".to_string(),
+            // Names a standalone activity's own run, not the workflow's.
+            run_id: "ignored".to_string(),
+            retry_policy: Some(RetryPolicy {
+                initial_interval: Some(duration(1000)),
+                backoff_coefficient: 2.5,
+                maximum_interval: Some(duration(9000)),
+                maximum_attempts: 7,
+                non_retryable_error_types: vec!["Fatal".to_string()],
+            }),
             ..Default::default()
         })),
     })
     .to_term(env)
+}
+
+/// A schedule as another SDK or the CLI might have made it, with a value in every field
+/// `bridge.Schedule` has no place for: as Gleam is shown it, and as the server has it.
+#[rustler::nif]
+fn sample_stored_schedule(env: Env) -> Term {
+    use temporalio_common::protos::temporal::api::{
+        common::v1::{Header, Payloads, WorkflowType},
+        enums::v1::WorkflowIdReusePolicy,
+        schedule::v1::{
+            IntervalSpec, Range, Schedule, ScheduleAction, SchedulePolicies, ScheduleSpec,
+            ScheduleState, StructuredCalendarSpec, schedule_action::Action,
+        },
+        taskqueue::v1::TaskQueue,
+        workflow::v1::NewWorkflowExecutionInfo,
+    };
+    let stored = Schedule {
+        spec: Some(ScheduleSpec {
+            interval: vec![IntervalSpec {
+                interval: Some(duration(3_600_000)),
+                phase: Some(duration(60_000)),
+            }],
+            exclude_structured_calendar: vec![StructuredCalendarSpec {
+                hour: vec![Range {
+                    start: 3,
+                    end: 4,
+                    step: 1,
+                }],
+                comment: "maintenance".to_string(),
+                ..Default::default()
+            }],
+            start_time: Some(timestamp(1_000_000)),
+            end_time: Some(timestamp(2_000_000)),
+            jitter: Some(duration(1500)),
+            timezone_name: "Europe/Lisbon".to_string(),
+            ..Default::default()
+        }),
+        action: Some(ScheduleAction {
+            action: Some(Action::StartWorkflow(NewWorkflowExecutionInfo {
+                workflow_id: "stored-id".to_string(),
+                workflow_type: Some(WorkflowType {
+                    name: "stored-type".to_string(),
+                }),
+                task_queue: Some(TaskQueue {
+                    name: "stored-queue".to_string(),
+                    ..Default::default()
+                }),
+                input: Some(Payloads {
+                    payloads: vec![payload("1")],
+                }),
+                workflow_run_timeout: Some(duration(90_000)),
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::RejectDuplicate as i32,
+                header: Some(Header {
+                    fields: [("trace".to_string(), payload("2"))].into(),
+                }),
+                ..Default::default()
+            })),
+        }),
+        policies: Some(SchedulePolicies {
+            overlap_policy: 2,
+            catchup_window: Some(duration(600_000)),
+            pause_on_failure: true,
+            keep_original_workflow_id: true,
+        }),
+        state: Some(ScheduleState {
+            notes: "stored note".to_string(),
+            paused: false,
+            limited_actions: true,
+            remaining_actions: 5,
+        }),
+    };
+    let request = UpdateScheduleRequest {
+        schedule: Some(stored.clone()),
+        conflict_token: b"token".to_vec(),
+        ..Default::default()
+    };
+    match to_schedule(stored) {
+        Ok(described) => (described, Bytes(prost::Message::encode_to_vec(&request))).to_term(env),
+        Err(status) => err(env, status.message()),
+    }
+}
+
+/// The debug form of the schedule an update would send, or why it could not be made.
+#[rustler::nif]
+fn debug_schedule_update<'a>(
+    env: Env<'a>,
+    stored: Term<'a>,
+    described: Term<'a>,
+    changed: Term<'a>,
+) -> Term<'a> {
+    let updated = (|| {
+        let stored = Bytes::from_term(stored)?;
+        let mut request: UpdateScheduleRequest =
+            prost::Message::decode(stored.0.as_slice()).map_err(|e| e.to_string())?;
+        overwrite(
+            request.schedule.get_or_insert_default(),
+            bridge::Schedule::from_term(described)?,
+            bridge::Schedule::from_term(changed)?,
+        )?;
+        Ok::<_, String>(format!("{request:?}"))
+    })();
+    match updated {
+        Ok(updated) => ok(env, updated.encode(env)),
+        Err(e) => err(env, e),
+    }
 }

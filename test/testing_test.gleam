@@ -2,7 +2,7 @@
 
 import gleam/int
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{None, Some}
 import gleam/order
 import gleam/result
 import gleam/string
@@ -14,6 +14,7 @@ import temporal/client
 import temporal/codec
 import temporal/failure.{type Failure}
 import temporal/log
+import temporal/retry
 import temporal/testing
 import temporal/worker
 import temporal/workflow.{type Context}
@@ -141,6 +142,24 @@ pub fn an_activity_can_be_tested_without_a_server_test() {
   let assert Error(failure.Failure(kind: failure.Cancelled, ..)) =
     counting(testing.activity_context(env), 3)
   assert testing.heartbeat_count(env) == 0
+}
+
+pub fn the_final_attempt_is_the_one_the_retry_policy_ends_on_test() {
+  let on_attempt = fn(attempt, retry) {
+    activity.Info(..testing.activity_info(), attempt:, retry:)
+    |> testing.activity_env
+    |> testing.activity_context
+    |> activity.is_final_attempt
+  }
+  let three = Some(retry.policy(maximum_attempts: 3))
+  assert !on_attempt(1, three)
+  assert !on_attempt(2, three)
+  assert on_attempt(3, three)
+  assert on_attempt(1, Some(retry.policy(maximum_attempts: 1)))
+  // Zero is no limit, and so is a task that came without a policy.
+  assert !on_attempt(1000, Some(retry.policy(maximum_attempts: 0)))
+  assert !on_attempt(1000, None)
+  assert testing.activity_info().retry == None
 }
 
 @external(erlang, "temporal_test_ffi", "capture_log_metadata")

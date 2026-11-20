@@ -232,6 +232,8 @@ pub type ActivityTask {
     scheduled_time_ms: Int,
     is_local: Bool,
     headers: Dict(String, Payload),
+    /// The policy the server retries the activity with.
+    retry: Option(RetryPolicy),
   )
   ActivityCancel(task_token: BitArray, reason: Int)
 }
@@ -241,6 +243,11 @@ pub type WorkerOptions {
     max_cached_workflows: Int,
     max_concurrent_workflow_tasks: Int,
     max_concurrent_activities: Int,
+    max_concurrent_nexus_tasks: Int,
+    /// How many polls for each kind of task may be open at once.
+    max_concurrent_workflow_task_polls: Int,
+    max_concurrent_activity_task_polls: Int,
+    max_concurrent_nexus_task_polls: Int,
     max_task_queue_activities_per_second: Option(Float),
     max_activities_per_second: Option(Float),
     enable_workflows: Bool,
@@ -327,6 +334,15 @@ pub type RpcError {
   RpcError(code: Int, message: String)
 }
 
+/// The least severe of core's own log lines to print.
+pub type CoreLogLevel {
+  CoreLogOff
+  CoreLogError
+  CoreLogWarning
+  CoreLogInfo
+  CoreLogDebug
+}
+
 pub type Tls {
   Tls(
     server_root_ca: Option(BitArray),
@@ -398,14 +414,21 @@ pub type Outcome {
   OutcomeTimedOut
 }
 
+pub type ConnectOptions {
+  ConnectOptions(
+    target: String,
+    namespace: String,
+    identity: String,
+    api_key: Option(String),
+    tls: Option(Tls),
+    /// HTTP/2 keep-alive pings: `#(interval_ms, timeout_ms)`.
+    keep_alive: Option(#(Int, Int)),
+    connect_timeout_ms: Int,
+  )
+}
+
 @external(erlang, "temporal_ffi", "connect")
-pub fn connect(
-  target: String,
-  namespace: String,
-  identity: String,
-  api_key: Option(String),
-  tls: Option(Tls),
-) -> Result(Connection, String)
+pub fn connect(options: ConnectOptions) -> Result(Connection, String)
 
 pub type ScheduleCalendar {
   /// Each field is a list of `#(start, end, step)` ranges.
@@ -463,21 +486,35 @@ pub type SchedulePatch {
   Backfill(from_ms: Int, to_ms: Int, overlap_policy: Int)
 }
 
-/// Create the schedule, or replace it when given the conflict token of a description.
-@external(erlang, "temporal_ffi", "schedule_put")
-pub fn schedule_put(
+/// Create the schedule.
+@external(erlang, "temporal_ffi", "schedule_create")
+pub fn schedule_create(
   connection: Connection,
   schedule_id: String,
   schedule: Schedule,
-  conflict_token: Option(BitArray),
   trigger_immediately: Bool,
 ) -> Result(Nil, RpcError)
 
+/// The schedule, what it has done, and the schedule as the server stores it: opaque bytes
+/// for `schedule_update`.
 @external(erlang, "temporal_ffi", "schedule_describe")
 pub fn schedule_describe(
   connection: Connection,
   schedule_id: String,
 ) -> Result(#(Schedule, ScheduleInfo, BitArray), RpcError)
+
+/// Store `changed` in place of `described`, the schedule `schedule_describe` answered with
+/// `stored`. Only the fields that differ between the two are written; everything else,
+/// including what `Schedule` does not model, stays as the server has it. Rejected if the
+/// schedule changed since it was described.
+@external(erlang, "temporal_ffi", "schedule_update")
+pub fn schedule_update(
+  connection: Connection,
+  schedule_id: String,
+  stored: BitArray,
+  described: Schedule,
+  changed: Schedule,
+) -> Result(Nil, RpcError)
 
 @external(erlang, "temporal_ffi", "schedule_delete")
 pub fn schedule_delete(

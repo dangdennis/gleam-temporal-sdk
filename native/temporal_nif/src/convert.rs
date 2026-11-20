@@ -15,6 +15,7 @@ use crate::{
     bridge,
     wire::{Bytes, DecodeResult, Wire, at, atom, binary, record, untag},
 };
+use prost::Message;
 use rustler::{Encoder, Env, Term};
 use std::collections::HashMap;
 use temporalio_common::protos::{
@@ -124,7 +125,8 @@ pub fn decode_payload(term: Term) -> DecodeResult<Payload> {
     })
 }
 
-pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
+/// The kind, error type and non-retryable flag Gleam sees for a failure.
+fn failure_summary(f: &Failure) -> (&'static str, Option<&str>, bool) {
     let (kind, error_type, non_retryable) = match &f.failure_info {
         Some(FailureInfo::ApplicationFailureInfo(i)) => {
             ("application", i.r#type.as_str(), i.non_retryable)
@@ -141,7 +143,14 @@ pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
         }
         _ => ("other", "", false),
     };
-    let error_type = (!error_type.is_empty()).then(|| error_type.to_string());
+    let error_type = (!error_type.is_empty()).then_some(error_type);
+    (kind, error_type, non_retryable)
+}
+
+/// The last field, `original`, is the failure itself, encoded: `decode_failure` sends it
+/// back as it is when Gleam returns the failure unchanged.
+pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
+    let (kind, error_type, non_retryable) = failure_summary(f);
     let details = match &f.failure_info {
         Some(FailureInfo::ApplicationFailureInfo(i)) => i.details.as_ref(),
         Some(FailureInfo::CanceledFailureInfo(i)) => i.details.as_ref(),
@@ -159,20 +168,35 @@ pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
         &[
             f.message.to_term(env),
             atom(env, kind),
-            error_type.to_term(env),
+            error_type.map(str::to_string).to_term(env),
             non_retryable.to_term(env),
             f.cause.to_term(env),
             details.encode(env),
+            Some(Bytes(f.encode_to_vec())).to_term(env),
         ],
     )
 }
 
+/// A failure Gleam received and hands back untouched is sent as Temporal sent it, with
+/// everything `failure.Failure` does not model: whether what Gleam shows of it still matches
+/// its `original` tells. Any other failure is built from the fields, as an application
+/// failure or a cancellation, and its cause is read by the same rule.
 pub fn decode_failure(term: Term) -> DecodeResult<Failure> {
     let (_, f) = untag(term)?;
-    if f.len() != 6 {
+    if f.len() != 7 {
         return Err("expected a Failure".to_string());
     }
+    let message: String = at(&f, 0, "Failure.message")?;
     let (kind, _) = untag(f[1])?;
+    let error_type: Option<String> = at(&f, 2, "Failure.error_type")?;
+    let non_retryable: bool = at(&f, 3, "Failure.non_retryable")?;
+    let original: Option<Bytes> = at(&f, 6, "Failure.original")?;
+    if let Some(original) = original.and_then(|bytes| Failure::decode(bytes.0.as_slice()).ok())
+        && original.message == message
+        && failure_summary(&original) == (kind.as_str(), error_type.as_deref(), non_retryable)
+    {
+        return Ok(original);
+    }
     let details: Vec<Payload> = at(&f, 5, "Failure.details")?;
     let details = (!details.is_empty()).then_some(Payloads { payloads: details });
     let info = if kind == "cancelled" {
@@ -182,14 +206,14 @@ pub fn decode_failure(term: Term) -> DecodeResult<Failure> {
         })
     } else {
         FailureInfo::ApplicationFailureInfo(ApplicationFailureInfo {
-            r#type: at::<Option<String>>(&f, 2, "Failure.error_type")?.unwrap_or_default(),
-            non_retryable: at(&f, 3, "Failure.non_retryable")?,
+            r#type: error_type.unwrap_or_default(),
+            non_retryable,
             details,
             ..Default::default()
         })
     };
     Ok(Failure {
-        message: at(&f, 0, "Failure.message")?,
+        message,
         source: "GleamSDK".to_string(),
         cause: at(&f, 4, "Failure.cause")?,
         failure_info: Some(info),
@@ -377,25 +401,26 @@ pub fn to_activation(a: WorkflowActivation) -> bridge::Activation {
 pub fn to_activity_task(t: ActivityTask) -> bridge::ActivityTask {
     let task_token = Bytes(t.task_token);
     match t.variant {
-        Some(activity_task::Variant::Start(s)) => bridge::ActivityTask::ActivityStart {
-            task_token,
-            activity_type: s.activity_type,
-            activity_id: s.activity_id,
-            workflow_id: s
-                .workflow_execution
-                .map(|e| e.workflow_id)
-                .unwrap_or_default(),
-            run_id: s.run_id,
-            input: s.input,
-            attempt: i64::from(s.attempt),
-            heartbeat_details: s.heartbeat_details,
-            workflow_type: s.workflow_type,
-            start_to_close_ms: duration_ms(s.start_to_close_timeout),
-            heartbeat_timeout_ms: duration_ms(s.heartbeat_timeout).filter(|ms| *ms > 0),
-            scheduled_time_ms: millis(s.scheduled_time),
-            is_local: s.is_local,
-            headers: s.header_fields,
-        },
+        Some(activity_task::Variant::Start(s)) => {
+            let execution = s.workflow_execution.unwrap_or_default();
+            bridge::ActivityTask::ActivityStart {
+                task_token,
+                activity_type: s.activity_type,
+                activity_id: s.activity_id,
+                workflow_id: execution.workflow_id,
+                run_id: execution.run_id,
+                input: s.input,
+                attempt: i64::from(s.attempt),
+                heartbeat_details: s.heartbeat_details,
+                workflow_type: s.workflow_type,
+                start_to_close_ms: duration_ms(s.start_to_close_timeout),
+                heartbeat_timeout_ms: duration_ms(s.heartbeat_timeout).filter(|ms| *ms > 0),
+                scheduled_time_ms: millis(s.scheduled_time),
+                is_local: s.is_local,
+                headers: s.header_fields,
+                retry: s.retry_policy.map(to_retry_policy),
+            }
+        }
         Some(activity_task::Variant::Cancel(c)) => bridge::ActivityTask::ActivityCancel {
             task_token,
             reason: i64::from(c.reason),
@@ -441,6 +466,17 @@ pub fn to_nexus_task(task: NexusTask) -> bridge::NexusTask {
         None => bridge::NexusTask::NexusTaskCancelled {
             task_token: Bytes(vec![]),
         },
+    }
+}
+
+pub fn to_retry_policy(r: RetryPolicy) -> bridge::RetryPolicy {
+    bridge::RetryPolicy {
+        initial_interval_ms: duration_ms(r.initial_interval).unwrap_or(0),
+        backoff_coefficient: r.backoff_coefficient,
+        // The server reports a length of time that was never set as zero.
+        maximum_interval_ms: duration_ms(r.maximum_interval).filter(|ms| *ms > 0),
+        maximum_attempts: i64::from(r.maximum_attempts),
+        non_retryable_error_types: r.non_retryable_error_types,
     }
 }
 
@@ -803,6 +839,22 @@ pub fn decode_completion(
     })
 }
 
+/// The server takes only an application failure as an activity's. An activity that returns
+/// another kind as it received it, a timeout or a child workflow's failure, fails with an
+/// application failure that has it for a cause.
+fn application_failure(failure: Failure) -> Failure {
+    if let Some(FailureInfo::ApplicationFailureInfo(_)) = failure.failure_info {
+        return failure;
+    }
+    Failure {
+        message: failure.message.clone(),
+        source: "GleamSDK".to_string(),
+        cause: Some(Box::new(failure)),
+        failure_info: Some(FailureInfo::ApplicationFailureInfo(Default::default())),
+        ..Default::default()
+    }
+}
+
 pub fn decode_activity_result(term: Term) -> DecodeResult<ActivityExecutionResult> {
     use activity_execution_result::Status;
     let status = match bridge::ActivityResult::from_term(term)? {
@@ -810,7 +862,7 @@ pub fn decode_activity_result(term: Term) -> DecodeResult<ActivityExecutionResul
             Status::Completed(ar::Success { result })
         }
         bridge::ActivityResult::ActivityFailed { failure } => Status::Failed(ar::Failure {
-            failure: Some(failure),
+            failure: Some(application_failure(failure)),
             ..Default::default()
         }),
         bridge::ActivityResult::ActivityCancelled { failure } => {

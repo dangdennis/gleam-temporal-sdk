@@ -462,3 +462,127 @@ fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
   |> worker.with_workflows(workflows())
   |> worker.with_activities(activities())
 }
+
+// ---- what an activity is told about its task ----
+
+fn inspect_task() {
+  activity.Definition("inspect_task", codec.nil(), codec.string())
+}
+
+/// Fails on its first attempt and succeeds on its second, leaving what each was told
+/// where the test can read it.
+fn inspect_task_activity(
+  ctx: activity.Context,
+  _: Nil,
+) -> Result(String, Failure) {
+  let info = activity.info(ctx)
+  let told =
+    info.run_id
+    <> " "
+    <> string.inspect(
+      option.map(info.retry, fn(policy) {
+        #(policy.maximum_attempts, policy.non_retryable_error_types)
+      }),
+    )
+    <> " "
+    <> string.inspect(activity.is_final_attempt(ctx))
+  support.record(info.workflow_id <> int.to_string(info.attempt), told)
+  case info.attempt {
+    1 -> Error(failure.new("first attempt"))
+    _ -> Ok(told)
+  }
+}
+
+fn inspecting() {
+  workflow.Definition("inspecting", codec.nil(), codec.string())
+}
+
+fn inspecting_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
+  let twice =
+    options()
+    |> workflow.with_retry(
+      retry.policy(maximum_attempts: 2)
+      |> retry.with_initial_interval(duration.milliseconds(10))
+      |> retry.with_non_retryable_error_types(["Fatal"]),
+    )
+  workflow.execute_activity(ctx, inspect_task(), Nil, twice)
+}
+
+pub fn an_activity_knows_its_workflows_run_and_its_retry_policy_test() {
+  use env <- support.in_both_modes(
+    "activity-info",
+    support.local_client(),
+    fn(config) {
+      config
+      |> worker.with_workflows([
+        workflow.handler(inspecting(), inspecting_workflow),
+      ])
+      |> worker.with_activities([
+        activity.handler(inspect_task(), inspect_task_activity),
+      ])
+    },
+  )
+  let options = start_options(env)
+  let assert Ok(handle) = client.start(env.client, inspecting(), Nil, options)
+  let assert Some(run_id) = client.run_id(handle)
+  assert run_id != ""
+  assert client.result(handle) == Ok(run_id <> " Some(#(2, [\"Fatal\"])) True")
+  assert support.recorded(options.workflow_id <> "1")
+    == run_id <> " Some(#(2, [\"Fatal\"])) False"
+}
+
+// ---- a completion the NIF will not take ----
+
+@external(erlang, "temporal_test_ffi", "capture_log_metadata")
+fn capture_log_metadata(body: fn() -> Nil) -> List(#(String, List(String)))
+
+fn backwards() {
+  workflow.Definition("backwards", codec.nil(), codec.nil())
+}
+
+/// Asks for an activity the NIF refuses to hand to core: no timeout is negative.
+fn backwards_workflow(ctx: Context, _: Nil) -> Result(Nil, Failure) {
+  let options = workflow.activity_options(start_to_close: duration.seconds(-5))
+  use _ <- result.map(workflow.execute_activity(ctx, double(), 1, options))
+  Nil
+}
+
+pub fn a_completion_the_nif_rejects_fails_the_workflow_task_test() {
+  let client = support.local_client()
+  let task_queue = "backwards-" <> unique()
+  let assert Ok(worker) =
+    worker.new(client, task_queue)
+    |> worker.with_workflows([workflow.handler(backwards(), backwards_workflow)])
+    |> worker.start
+  let shown = fn() {
+    cmd("temporal workflow show --output json --workflow-id " <> task_queue)
+  }
+  let logged =
+    capture_log_metadata(fn() {
+      let assert Ok(handle) =
+        client.start(
+          client,
+          backwards(),
+          Nil,
+          client.start_options(workflow_id: task_queue, task_queue:),
+        )
+      // The task fails at once, with the reason. Before, nothing answered it, and the
+      // server waited ten seconds to time it out: its slot on the worker was held and
+      // the history said only that a task had timed out.
+      assert support.eventually(fn() {
+        string.contains(shown(), "EVENT_TYPE_WORKFLOW_TASK_FAILED")
+      })
+      let assert Ok(Nil) = client.terminate(handle, "done")
+      Nil
+    })
+  let history = shown()
+  assert string.contains(history, "a duration must be a non-negative Int")
+  assert !string.contains(history, "EVENT_TYPE_WORKFLOW_TASK_TIMED_OUT")
+  // And it is logged as an error that names the run.
+  assert list.any(logged, fn(line) {
+    string.contains(line.0, "workflow task completion rejected")
+    && string.contains(line.0, "a duration must be a non-negative Int")
+    && list.any(line.1, string.starts_with(_, "run_id=<<\""))
+  })
+  worker.stop(worker)
+}

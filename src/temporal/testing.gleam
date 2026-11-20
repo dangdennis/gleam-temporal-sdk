@@ -167,6 +167,7 @@ pub fn activity_info() -> activity.Info {
     workflow_type: "test",
     task_queue: "test",
     attempt: 1,
+    retry: None,
     heartbeat_details: [],
     start_to_close: None,
     heartbeat_timeout: None,

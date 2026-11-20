@@ -18,6 +18,9 @@ fn sample_activation() -> bridge.Activation
 @external(erlang, "temporal_nif", "sample_activity_task")
 fn sample_activity_task() -> bridge.ActivityTask
 
+@external(erlang, "temporal_nif", "sample_activity_failure")
+fn sample_activity_failure() -> Failure
+
 @external(erlang, "temporal_nif", "debug_completion")
 fn debug_completion(
   completion: bridge.Completion,
@@ -47,7 +50,27 @@ fn sample_failure(message: String) -> Failure {
     True,
     None,
     [],
+    None,
   )
+}
+
+/// `sample_failure` as it arrives from Rust: with the failure Temporal sent, which is the
+/// `Failure` protobuf message. Field 1 is the message and field 5 the application
+/// failure's type and non-retryable flag.
+fn received_failure(message: String) -> Failure {
+  let original = <<
+    0x0a,
+    string.byte_size(message),
+    message:utf8,
+    0x2a,
+    14,
+    0x0a,
+    10,
+    "SampleType":utf8,
+    0x10,
+    1,
+  >>
+  failure.Failure(..sample_failure(message), original: Some(original))
 }
 
 pub fn every_job_arrives_as_the_gleam_type_describes_it_test() {
@@ -91,7 +114,7 @@ pub fn every_job_arrives_as_the_gleam_type_describes_it_test() {
         ),
         bridge.ResolveChildWorkflow(
           16,
-          bridge.Failed(sample_failure("child failed")),
+          bridge.Failed(received_failure("child failed")),
         ),
         bridge.DoUpdate(
           id: "update-id",
@@ -103,7 +126,7 @@ pub fn every_job_arrives_as_the_gleam_type_describes_it_test() {
         bridge.ResolveExternalSignal(17, None),
         bridge.ResolveExternalCancel(
           18,
-          Some(sample_failure("no such workflow")),
+          Some(received_failure("no such workflow")),
         ),
         bridge.ResolveNexusStart(19, bridge.NexusStartedAsync("token")),
         bridge.ResolveNexus(20, bridge.Completed(Some(payload("7")))),
@@ -130,6 +153,15 @@ pub fn an_activity_task_arrives_as_the_gleam_type_describes_it_test() {
       scheduled_time_ms: 4321,
       is_local: True,
       headers: dict.from_list([#("trace", payload("3"))]),
+      retry: Some(
+        bridge.RetryPolicy(
+          initial_interval_ms: 1000,
+          backoff_coefficient: 2.5,
+          maximum_interval_ms: Some(9000),
+          maximum_attempts: 7,
+          non_retryable_error_types: ["Fatal"],
+        ),
+      ),
     )
 }
 
@@ -357,6 +389,103 @@ pub fn a_task_failure_reaches_core_test() {
   assert string.contains(seen, "run_id: \"the-run\"")
   assert string.contains(seen, "Failed")
   assert string.contains(seen, "task failed")
+}
+
+/// What core is given when a workflow fails with `failure`.
+fn sent(failure: Failure) -> String {
+  let assert Ok(seen) =
+    debug_completion(
+      bridge.Success("run", [bridge.FailWorkflow(failure)], 0),
+      "ns",
+    )
+  seen
+}
+
+/// Everything in `sample_activity_failure` that `failure.Failure` cannot hold.
+const unmodelled = [
+  "ActivityFailureInfo", "scheduled_event_id: 5", "started_event_id: 6",
+  "identity: \"the-worker\"", "name: \"the-activity-type\"",
+  "activity_id: \"the-activity-id\"", "retry_state: NonRetryableFailure",
+  "source: \"Server\"",
+]
+
+const unmodelled_in_the_cause = [
+  "TimeoutFailureInfo", "timeout_type: StartToClose", "last_heartbeat_details",
+  "stack_trace: \"the-stack\"",
+]
+
+pub fn a_received_failure_shows_its_kind_and_cause_test() {
+  let assert failure.Failure(
+    message: "Activity task timed out",
+    kind: failure.Activity,
+    error_type: None,
+    non_retryable: False,
+    cause: Some(failure.Failure(
+      message: "activity StartToClose timeout",
+      kind: failure.Timeout,
+      cause: None,
+      original: Some(_),
+      ..,
+    )),
+    details: [],
+    original: Some(_),
+  ) = sample_activity_failure()
+}
+
+pub fn a_failure_returned_unchanged_reaches_core_unchanged_test() {
+  let seen = sent(sample_activity_failure())
+  list.each(list.append(unmodelled, unmodelled_in_the_cause), fn(fragment) {
+    assert string.contains(seen, fragment)
+  })
+  assert !string.contains(seen, "ApplicationFailureInfo")
+  assert !string.contains(seen, "GleamSDK")
+}
+
+pub fn a_changed_failure_is_sent_as_built_and_its_cause_as_received_test() {
+  let seen =
+    sent(sample_activity_failure() |> failure.with_type("OrderAbandoned"))
+  assert string.contains(seen, "ApplicationFailureInfo")
+  assert string.contains(seen, "type: \"OrderAbandoned\"")
+  assert string.contains(seen, "message: \"Activity task timed out\"")
+  assert string.contains(seen, "source: \"GleamSDK\"")
+  assert !string.contains(seen, "ActivityFailureInfo")
+  // The cause was not touched, and goes back whole.
+  list.each(unmodelled_in_the_cause, fn(fragment) {
+    assert string.contains(seen, fragment)
+  })
+}
+
+pub fn every_function_that_changes_a_failure_forgets_the_original_test() {
+  let received = sample_activity_failure()
+  assert failure.with_type(received, "T").original == None
+  assert failure.non_retryable(received).original == None
+  assert failure.with_details(received, [payload("1")]).original == None
+  assert failure.new("built").original == None
+  assert failure.cancelled().original == None
+  assert failure.timeout("built").original == None
+  // The cause is a failure of its own and keeps its own.
+  let assert Some(failure.Failure(original: Some(_), ..)) =
+    failure.with_type(received, "T").cause
+}
+
+pub fn a_failure_whose_fields_no_longer_match_its_original_is_sent_as_built_test() {
+  // Changed with a record update, which leaves the original in place.
+  let relabelled =
+    failure.Failure(..sample_activity_failure(), message: "relabelled")
+  let seen = sent(relabelled)
+  assert string.contains(seen, "message: \"relabelled\"")
+  assert string.contains(seen, "ApplicationFailureInfo")
+  assert !string.contains(seen, "ActivityFailureInfo")
+  let flagged =
+    failure.Failure(..sample_activity_failure(), non_retryable: True)
+  assert string.contains(sent(flagged), "non_retryable: true")
+  let retyped =
+    failure.Failure(..sample_activity_failure(), kind: failure.Application)
+  assert !string.contains(sent(retyped), "ActivityFailureInfo")
+  // An original that is not a failure at all is ignored.
+  let garbled =
+    failure.Failure(..failure.new("built"), original: Some(<<255, 255, 255>>))
+  assert string.contains(sent(garbled), "message: \"built\"")
 }
 
 pub fn every_activity_result_reaches_core_test() {

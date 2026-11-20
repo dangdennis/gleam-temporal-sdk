@@ -3,9 +3,9 @@
 %% calling these directly.
 -module(temporal_nif).
 
--export([connect/7, start_metrics/1, update_with_start/6, complete_activity_async/5, debug_completion/2, debug_activity_result/1, debug_nexus_result/1,
-         sample_activation/0, sample_activity_task/0, update_workflow/6, poll_update/6, worker_poll_nexus/3,
-         worker_complete_nexus/5, schedule_put/7, schedule_describe/4, schedule_delete/4,
+-export([connect/3, start_metrics/1, set_core_log_level/1, update_with_start/6, complete_activity_async/5, debug_completion/2, debug_activity_result/1, debug_nexus_result/1,
+         sample_activation/0, sample_activity_task/0, sample_activity_failure/0, sample_stored_schedule/0, debug_schedule_update/3, update_workflow/6, poll_update/6, worker_poll_nexus/3,
+         worker_complete_nexus/5, schedule_create/6, schedule_update/7, schedule_describe/4, schedule_delete/4,
          schedule_patch/5, schedule_list/3, server_start/4, server_stop/3, time_control/4, describe_workflow/5, list_workflows/5, count_workflows/4, worker_new/5, replay_worker_new/2, worker_poll_workflow/3,
          worker_complete_workflow/4, worker_poll_activity/3, worker_complete_activity/5,
          worker_heartbeat/3, worker_shutdown/3, start_workflow/5, signal_workflow/7,
@@ -35,7 +35,7 @@ not_loaded() ->
                         "bin/build-nif in the package directory.">>,
                       Reason}).
 
-connect(_, _, _, _, _, _, _) -> not_loaded().
+connect(_, _, _) -> not_loaded().
 worker_new(_, _, _, _, _) -> not_loaded().
 replay_worker_new(_, _) -> not_loaded().
 worker_poll_workflow(_, _, _) -> not_loaded().
@@ -57,7 +57,8 @@ count_workflows(_, _, _, _) -> not_loaded().
 server_start(_, _, _, _) -> not_loaded().
 server_stop(_, _, _) -> not_loaded().
 time_control(_, _, _, _) -> not_loaded().
-schedule_put(_, _, _, _, _, _, _) -> not_loaded().
+schedule_create(_, _, _, _, _, _) -> not_loaded().
+schedule_update(_, _, _, _, _, _, _) -> not_loaded().
 schedule_describe(_, _, _, _) -> not_loaded().
 schedule_delete(_, _, _, _) -> not_loaded().
 schedule_patch(_, _, _, _, _) -> not_loaded().
@@ -71,6 +72,10 @@ debug_activity_result(_) -> not_loaded().
 debug_nexus_result(_) -> not_loaded().
 sample_activation() -> not_loaded().
 sample_activity_task() -> not_loaded().
+sample_activity_failure() -> not_loaded().
+sample_stored_schedule() -> not_loaded().
+debug_schedule_update(_, _, _) -> not_loaded().
 update_with_start(_, _, _, _, _, _) -> not_loaded().
 complete_activity_async(_, _, _, _, _) -> not_loaded().
 start_metrics(_) -> not_loaded().
+set_core_log_level(_) -> not_loaded().

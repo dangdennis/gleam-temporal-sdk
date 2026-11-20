@@ -10,7 +10,7 @@ use rustler::{Env, Term};
 use std::collections::HashMap;
 use temporalio_common::protos::temporal::api::{common::v1::Payload, failure::v1::Failure};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Activation {
     pub run_id: String,
     pub timestamp_ms: i64,
@@ -52,7 +52,7 @@ impl Wire for Activation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Job {
     InitializeWorkflow {
         workflow_type: String,
@@ -322,7 +322,7 @@ impl Wire for Job {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Resolution {
     Completed {
         result: Option<Payload>,
@@ -384,7 +384,7 @@ impl Wire for Resolution {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NexusStart {
     NexusStartedAsync { operation_token: String },
     NexusStartedSync,
@@ -419,7 +419,7 @@ impl Wire for NexusStart {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChildStart {
     ChildStarted { run_id: String },
     ChildStartFailed { workflow_id: String, cause: i64 },
@@ -459,7 +459,7 @@ impl Wire for ChildStart {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RetryPolicy {
     pub initial_interval_ms: i64,
     pub backoff_coefficient: f64,
@@ -498,7 +498,7 @@ impl Wire for RetryPolicy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     StartTimer {
         seq: i64,
@@ -965,7 +965,7 @@ impl Wire for Command {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SignalTarget {
     ExternalWorkflow { workflow_id: String, run_id: String },
     ChildWorkflowTarget { workflow_id: String },
@@ -1003,7 +1003,7 @@ impl Wire for SignalTarget {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChildStartOptions {
     pub execution_timeout_ms: Option<i64>,
     pub run_timeout_ms: Option<i64>,
@@ -1057,7 +1057,7 @@ impl Wire for ChildStartOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Completion {
     Success {
         run_id: String,
@@ -1111,7 +1111,7 @@ impl Wire for Completion {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ActivityTask {
     ActivityStart {
         task_token: Bytes,
@@ -1128,6 +1128,7 @@ pub enum ActivityTask {
         scheduled_time_ms: i64,
         is_local: bool,
         headers: HashMap<String, Payload>,
+        retry: Option<RetryPolicy>,
     },
     ActivityCancel {
         task_token: Bytes,
@@ -1153,6 +1154,7 @@ impl Wire for ActivityTask {
                 scheduled_time_ms,
                 is_local,
                 headers,
+                retry,
             } => record(
                 env,
                 "activity_start",
@@ -1171,6 +1173,7 @@ impl Wire for ActivityTask {
                     scheduled_time_ms.to_term(env),
                     is_local.to_term(env),
                     headers.to_term(env),
+                    retry.to_term(env),
                 ],
             ),
             Self::ActivityCancel { task_token, reason } => record(
@@ -1184,7 +1187,7 @@ impl Wire for ActivityTask {
     fn from_term(term: Term) -> DecodeResult<Self> {
         let (tag, f) = untag(term)?;
         match (tag.as_str(), f.len()) {
-            ("activity_start", 14) => Ok(Self::ActivityStart {
+            ("activity_start", 15) => Ok(Self::ActivityStart {
                 task_token: at(&f, 0, "ActivityStart.task_token")?,
                 activity_type: at(&f, 1, "ActivityStart.activity_type")?,
                 activity_id: at(&f, 2, "ActivityStart.activity_id")?,
@@ -1199,6 +1202,7 @@ impl Wire for ActivityTask {
                 scheduled_time_ms: at(&f, 11, "ActivityStart.scheduled_time_ms")?,
                 is_local: at(&f, 12, "ActivityStart.is_local")?,
                 headers: at(&f, 13, "ActivityStart.headers")?,
+                retry: at(&f, 14, "ActivityStart.retry")?,
             }),
             ("activity_cancel", 2) => Ok(Self::ActivityCancel {
                 task_token: at(&f, 0, "ActivityCancel.task_token")?,
@@ -1209,11 +1213,15 @@ impl Wire for ActivityTask {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkerOptions {
     pub max_cached_workflows: i64,
     pub max_concurrent_workflow_tasks: i64,
     pub max_concurrent_activities: i64,
+    pub max_concurrent_nexus_tasks: i64,
+    pub max_concurrent_workflow_task_polls: i64,
+    pub max_concurrent_activity_task_polls: i64,
+    pub max_concurrent_nexus_task_polls: i64,
     pub max_task_queue_activities_per_second: Option<f64>,
     pub max_activities_per_second: Option<f64>,
     pub enable_workflows: bool,
@@ -1232,6 +1240,10 @@ impl Wire for WorkerOptions {
                 self.max_cached_workflows.to_term(env),
                 self.max_concurrent_workflow_tasks.to_term(env),
                 self.max_concurrent_activities.to_term(env),
+                self.max_concurrent_nexus_tasks.to_term(env),
+                self.max_concurrent_workflow_task_polls.to_term(env),
+                self.max_concurrent_activity_task_polls.to_term(env),
+                self.max_concurrent_nexus_task_polls.to_term(env),
                 self.max_task_queue_activities_per_second.to_term(env),
                 self.max_activities_per_second.to_term(env),
                 self.enable_workflows.to_term(env),
@@ -1246,7 +1258,7 @@ impl Wire for WorkerOptions {
     fn from_term(term: Term) -> DecodeResult<Self> {
         let (tag, f) = untag(term)?;
         match (tag.as_str(), f.len()) {
-            ("worker_options", 10) => Ok(Self {
+            ("worker_options", 14) => Ok(Self {
                 max_cached_workflows: at(&f, 0, "WorkerOptions.max_cached_workflows")?,
                 max_concurrent_workflow_tasks: at(
                     &f,
@@ -1254,24 +1266,40 @@ impl Wire for WorkerOptions {
                     "WorkerOptions.max_concurrent_workflow_tasks",
                 )?,
                 max_concurrent_activities: at(&f, 2, "WorkerOptions.max_concurrent_activities")?,
+                max_concurrent_nexus_tasks: at(&f, 3, "WorkerOptions.max_concurrent_nexus_tasks")?,
+                max_concurrent_workflow_task_polls: at(
+                    &f,
+                    4,
+                    "WorkerOptions.max_concurrent_workflow_task_polls",
+                )?,
+                max_concurrent_activity_task_polls: at(
+                    &f,
+                    5,
+                    "WorkerOptions.max_concurrent_activity_task_polls",
+                )?,
+                max_concurrent_nexus_task_polls: at(
+                    &f,
+                    6,
+                    "WorkerOptions.max_concurrent_nexus_task_polls",
+                )?,
                 max_task_queue_activities_per_second: at(
                     &f,
-                    3,
+                    7,
                     "WorkerOptions.max_task_queue_activities_per_second",
                 )?,
-                max_activities_per_second: at(&f, 4, "WorkerOptions.max_activities_per_second")?,
-                enable_workflows: at(&f, 5, "WorkerOptions.enable_workflows")?,
-                enable_activities: at(&f, 6, "WorkerOptions.enable_activities")?,
-                enable_nexus: at(&f, 7, "WorkerOptions.enable_nexus")?,
-                deployment: at(&f, 8, "WorkerOptions.deployment")?,
-                shutdown_grace_ms: at(&f, 9, "WorkerOptions.shutdown_grace_ms")?,
+                max_activities_per_second: at(&f, 8, "WorkerOptions.max_activities_per_second")?,
+                enable_workflows: at(&f, 9, "WorkerOptions.enable_workflows")?,
+                enable_activities: at(&f, 10, "WorkerOptions.enable_activities")?,
+                enable_nexus: at(&f, 11, "WorkerOptions.enable_nexus")?,
+                deployment: at(&f, 12, "WorkerOptions.deployment")?,
+                shutdown_grace_ms: at(&f, 13, "WorkerOptions.shutdown_grace_ms")?,
             }),
             (tag, count) => Err(unexpected("WorkerOptions", tag, count)),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Deployment {
     pub name: String,
     pub build_id: String,
@@ -1307,7 +1335,7 @@ impl Wire for Deployment {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NexusTask {
     NexusStartTask {
         task_token: Bytes,
@@ -1404,7 +1432,7 @@ impl Wire for NexusTask {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NexusResult {
     NexusSyncSuccess {
         result: Payload,
@@ -1471,7 +1499,7 @@ impl Wire for NexusResult {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ActivityResult {
     ActivityCompleted { result: Option<Payload> },
     ActivityFailed { failure: Failure },
@@ -1513,7 +1541,7 @@ impl Wire for ActivityResult {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PollError {
     Shutdown,
     PollFailed { message: String },
@@ -1539,7 +1567,7 @@ impl Wire for PollError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
@@ -1566,7 +1594,40 @@ impl Wire for RpcError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum CoreLogLevel {
+    CoreLogOff,
+    CoreLogError,
+    CoreLogWarning,
+    CoreLogInfo,
+    CoreLogDebug,
+}
+
+impl Wire for CoreLogLevel {
+    fn to_term<'a>(&self, env: Env<'a>) -> Term<'a> {
+        match self {
+            Self::CoreLogOff => atom(env, "core_log_off"),
+            Self::CoreLogError => atom(env, "core_log_error"),
+            Self::CoreLogWarning => atom(env, "core_log_warning"),
+            Self::CoreLogInfo => atom(env, "core_log_info"),
+            Self::CoreLogDebug => atom(env, "core_log_debug"),
+        }
+    }
+
+    fn from_term(term: Term) -> DecodeResult<Self> {
+        let (tag, f) = untag(term)?;
+        match (tag.as_str(), f.len()) {
+            ("core_log_off", 0) => Ok(Self::CoreLogOff),
+            ("core_log_error", 0) => Ok(Self::CoreLogError),
+            ("core_log_warning", 0) => Ok(Self::CoreLogWarning),
+            ("core_log_info", 0) => Ok(Self::CoreLogInfo),
+            ("core_log_debug", 0) => Ok(Self::CoreLogDebug),
+            (tag, count) => Err(unexpected("CoreLogLevel", tag, count)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Tls {
     pub server_root_ca: Option<Bytes>,
     pub domain: Option<String>,
@@ -1599,7 +1660,7 @@ impl Wire for Tls {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StartRequest {
     pub workflow_id: String,
     pub workflow_type: String,
@@ -1674,7 +1735,7 @@ impl Wire for StartRequest {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UpdateOutcome {
     UpdateSucceeded { result: Vec<Payload> },
     UpdateFailed { failure: Failure },
@@ -1707,7 +1768,7 @@ impl Wire for UpdateOutcome {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Execution {
     pub workflow_id: String,
     pub run_id: String,
@@ -1764,7 +1825,7 @@ impl Wire for Execution {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     OutcomeCompleted { result: Vec<Payload> },
     OutcomeFailed { failure: Failure },
@@ -1805,7 +1866,52 @@ impl Wire for Outcome {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnectOptions {
+    pub target: String,
+    pub namespace: String,
+    pub identity: String,
+    pub api_key: Option<String>,
+    pub tls: Option<Tls>,
+    pub keep_alive: Option<(i64, i64)>,
+    pub connect_timeout_ms: i64,
+}
+
+impl Wire for ConnectOptions {
+    fn to_term<'a>(&self, env: Env<'a>) -> Term<'a> {
+        record(
+            env,
+            "connect_options",
+            &[
+                self.target.to_term(env),
+                self.namespace.to_term(env),
+                self.identity.to_term(env),
+                self.api_key.to_term(env),
+                self.tls.to_term(env),
+                self.keep_alive.to_term(env),
+                self.connect_timeout_ms.to_term(env),
+            ],
+        )
+    }
+
+    fn from_term(term: Term) -> DecodeResult<Self> {
+        let (tag, f) = untag(term)?;
+        match (tag.as_str(), f.len()) {
+            ("connect_options", 7) => Ok(Self {
+                target: at(&f, 0, "ConnectOptions.target")?,
+                namespace: at(&f, 1, "ConnectOptions.namespace")?,
+                identity: at(&f, 2, "ConnectOptions.identity")?,
+                api_key: at(&f, 3, "ConnectOptions.api_key")?,
+                tls: at(&f, 4, "ConnectOptions.tls")?,
+                keep_alive: at(&f, 5, "ConnectOptions.keep_alive")?,
+                connect_timeout_ms: at(&f, 6, "ConnectOptions.connect_timeout_ms")?,
+            }),
+            (tag, count) => Err(unexpected("ConnectOptions", tag, count)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScheduleCalendar {
     pub second: Vec<(i64, i64, i64)>,
     pub minute: Vec<(i64, i64, i64)>,
@@ -1853,7 +1959,7 @@ impl Wire for ScheduleCalendar {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScheduleSpec {
     pub intervals: Vec<(i64, i64)>,
     pub calendars: Vec<ScheduleCalendar>,
@@ -1892,7 +1998,7 @@ impl Wire for ScheduleSpec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Schedule {
     pub spec: ScheduleSpec,
     pub action: StartRequest,
@@ -1937,7 +2043,7 @@ impl Wire for Schedule {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScheduleInfo {
     pub action_count: i64,
     pub recent_actions: Vec<(i64, String)>,
@@ -1973,7 +2079,7 @@ impl Wire for ScheduleInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SchedulePatch {
     Pause {
         note: String,
@@ -2037,7 +2143,7 @@ impl Wire for SchedulePatch {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ServerKind {
     TimeSkipping,
     Dev,
@@ -2061,7 +2167,7 @@ impl Wire for ServerKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TimeOp {
     Lock,
     Unlock,
@@ -2093,7 +2199,7 @@ impl Wire for TimeOp {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LogLevel {
     Debug,
     Info,

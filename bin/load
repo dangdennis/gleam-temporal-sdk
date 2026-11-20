@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run the load test: thousands of workflows on several workers while workers are killed and
 # replaced. Uses the Temporal service on localhost:7233, starting a dev server for the run
-# if there is none. Tune with LOAD_WORKFLOWS, LOAD_WORKERS and LOAD_KILL_EVERY_MS.
+# if there is none. Tune with LOAD_WORKFLOWS, LOAD_WORKERS, LOAD_KILL_EVERY_MS and LOAD_POLLS,
+# the polls each worker keeps open for workflow tasks and for activity tasks.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"

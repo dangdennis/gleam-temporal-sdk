@@ -29,6 +29,10 @@ pub type Kind {
 
 /// An error as Temporal records it. Workflow and activity functions return one to fail,
 /// and receive one when something they waited on failed.
+///
+/// Returning a received failure as it is passes it on whole: an activity's failure stays
+/// an activity failure, with its cause, for whoever reads the workflow's. Build failures
+/// with `new`, `cancelled` and `timeout`, and change them with the `with_` functions.
 pub type Failure {
   Failure(
     message: String,
@@ -41,28 +45,33 @@ pub type Failure {
     cause: Option(Failure),
     /// Extra data attached by the code that raised an application failure.
     details: List(Payload),
+    /// The failure exactly as Temporal sent it, encoded. Not for callers to build or read:
+    /// it is how a failure received from Temporal and returned unchanged reaches the server
+    /// unchanged, with everything this type does not model. `None` on a failure built here,
+    /// and cleared by every function of this module that changes one. A cause carries its own.
+    original: Option(BitArray),
   )
 }
 
 /// A retryable application failure.
 pub fn new(message: String) -> Failure {
-  Failure(message, Application, None, False, None, [])
+  Failure(message, Application, None, False, None, [], None)
 }
 
 /// Set the failure's category. Retry policies can name categories that should not be
 /// retried, and callers match on it to tell failures apart.
 pub fn with_type(failure: Failure, error_type: String) -> Failure {
-  Failure(..failure, error_type: Some(error_type))
+  Failure(..failure, error_type: Some(error_type), original: None)
 }
 
 /// Mark the failure so that retry policies do not retry it.
 pub fn non_retryable(failure: Failure) -> Failure {
-  Failure(..failure, non_retryable: True)
+  Failure(..failure, non_retryable: True, original: None)
 }
 
 /// What a workflow returns to acknowledge a cancellation request.
 pub fn cancelled() -> Failure {
-  Failure("cancelled", Cancelled, None, False, None, [])
+  Failure("cancelled", Cancelled, None, False, None, [], None)
 }
 
 /// The innermost failure: the original error beneath activity and child workflow wrappers.
@@ -75,12 +84,12 @@ pub fn root_cause(failure: Failure) -> Failure {
 
 /// Attach data to the failure for whoever handles it.
 pub fn with_details(failure: Failure, details: List(Payload)) -> Failure {
-  Failure(..failure, details:)
+  Failure(..failure, details:, original: None)
 }
 
 /// A failure of kind `Timeout`.
 pub fn timeout(message: String) -> Failure {
-  Failure(message, Timeout, None, False, None, [])
+  Failure(message, Timeout, None, False, None, [], None)
 }
 
 /// Whether the failure is a cancellation, directly or as the cause of an activity or child

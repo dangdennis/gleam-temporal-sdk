@@ -26,6 +26,7 @@ import temporal/codec.{type Codec, type Payload}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
 import temporal/log
+import temporal/retry
 
 /// An activity's name and the codecs for its argument and result. Shared by the code that
 /// implements the activity and the workflows that call it.
@@ -45,6 +46,9 @@ pub type Info {
     task_queue: String,
     /// Starts at 1 and grows with each retry.
     attempt: Int,
+    /// The policy the server retries the activity with: the workflow's, with the server's
+    /// defaults and limits applied. `None` if the task did not carry one.
+    retry: Option(retry.Policy),
     /// What the previous attempt last passed to `heartbeat_with`.
     heartbeat_details: List(Payload),
     /// Longest this attempt may run.
@@ -148,6 +152,21 @@ pub fn new_context(
 /// The task the activity is running for.
 pub fn info(ctx: Context) -> Info {
   ctx.info
+}
+
+/// Whether the retry policy allows no attempt after this one, for an activity that must
+/// clean up or report before it fails for good. `False` when the policy has no limit on
+/// attempts, or the task carried no policy.
+///
+/// It only compares the attempt number with the policy's maximum. Retries can end sooner
+/// for other reasons: the schedule-to-close timeout passes, the failure is non-retryable,
+/// or the workflow cancels the activity or closes.
+pub fn is_final_attempt(ctx: Context) -> Bool {
+  case ctx.info.retry {
+    Some(policy) ->
+      policy.maximum_attempts > 0 && ctx.info.attempt >= policy.maximum_attempts
+    None -> False
+  }
 }
 
 // ---- logging ----

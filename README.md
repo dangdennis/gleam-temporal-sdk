@@ -109,7 +109,7 @@ The modules:
 | `temporal/codec`, `temporal/encryption` | Value codecs and payload codecs |
 | `temporal/schema` | Describing a JSON object once, for both encoding and decoding |
 | `temporal/log` | Fields for structured log lines |
-| `temporal/telemetry` | Prometheus metrics |
+| `temporal/telemetry` | Prometheus metrics, and the core library's log level |
 | `temporal/failure` | Failures |
 | `temporal/testing`, `temporal/replayer` | Test servers, activity contexts, history replay |
 
@@ -124,15 +124,15 @@ So is passing a bare number where a length of time is wanted: every timeout and 
 | Workflows | Activities, local activities, durable timers, signals, queries, updates, child workflows, continue-as-new, patching and `deprecate_patch`, memo and search attribute changes, headers, deterministic `now` / `random_int` / `uuid4`, logging with fields that is silent on replay |
 | Cancellation | Scopes carried by the `Context`: `with_scope`, `with_timeout`, `non_cancellable`, `cancel`; cancelling a scope cancels its timers, activities, local activities, child workflows, Nexus operations and pending signals |
 | Concurrency | `Future` values with `map`, `race`, `await`, `await_all`, `try_await_all`, `await_timeout`, `await_cancellable` |
-| Activities | Typed handlers, retry policies, all four timeouts, heartbeats with details, cancellation delivered to the activity, activity info, logging with fields, failure details, completion from outside by task token |
+| Activities | Typed handlers, retry policies, all four timeouts, heartbeats with details, cancellation delivered to the activity, activity info with the retry policy and `is_final_attempt`, logging with fields, failure details, completion from outside by task token |
 | Child workflows | Start and await separately, signal, parent close policy, id reuse policy, timeouts, retries, memo, cancellation type |
 | Other workflows | Signal and request cancellation of any workflow by id from workflow code |
 | Nexus | Call operations from workflows; serve operations from a worker, answered directly or backed by a workflow |
 | Client | Start with options (memo, search attributes, id reuse and conflict policies, timeouts, retries, start delay, cron), signal-with-start, update-with-start, execute, result, signal, query, update, cancel, terminate, describe, list, count, fetch history; typed errors |
 | Schedules | Create, describe, update, pause, unpause, trigger, backfill, delete, list; intervals with offsets, calendars, cron expressions, time zones, overlap policies |
-| Workers | Concurrency limits, activity rate limits, workflow-only and activity-only workers, workflow and activity middleware, outbound rewriting, worker deployment versioning with pinned and auto-upgrading workflows, graceful shutdown, Prometheus metrics |
+| Workers | Concurrency limits, the number of polls kept open, activity rate limits, workflow-only and activity-only workers, workflow and activity middleware, outbound rewriting, worker deployment versioning with pinned and auto-upgrading workflows, graceful shutdown, Prometheus metrics |
 | Data | JSON and binary payloads (`json/plain`, `binary/plain`), compatible with the Temporal CLI and other SDKs; JSON object schemas that give the encoder and the decoder from one description; payload codecs, with an AES-256-GCM encryption codec included |
-| Connection | Plaintext, TLS, mutual TLS, API keys |
+| Connection | Plaintext, TLS, mutual TLS, API keys, HTTP/2 keep-alive (on by default), a connect timeout |
 | Testing | `replayer.replay` for recorded histories; `temporal/testing` for a time-skipping server, a local dev server, and activity contexts that need no server |
 
 ## Not built
@@ -208,6 +208,11 @@ Schemas nest, with `schema.list`, `schema.optional` and `schema.dict` around the
 
 Every client call returns `Result(_, client.Error)`: one type, whose variants say whether
 the workflow failed, was cancelled, timed out, was not found, and so on.
+
+A workflow that returns a failure it received passes it on whole: an activity's failure
+stays an activity failure with its cause, as clients written with other SDKs expect.
+Changing it with `failure.with_type` or the like makes it the workflow's own application
+failure, with the same cause.
 
 `start` never waits. `workflow.start_activity` returns a future of the result;
 `child.start` and `operation.start` return a handle with a `started` future and a `result`
@@ -388,6 +393,24 @@ activity.log_warning(ctx, "card declined", [log.string("reason", reason)])
 same ones Temporal's other SDKs report, for Prometheus to scrape. Call it before the first
 `client.connect`; its `telemetry.Error` says whether it was called too late, given a bad
 address, or could not bind.
+
+Temporal's core library, beneath this SDK, logs on its own: retries that keep failing,
+workflow tasks failed back to the server, requests the server refused. Its warnings and
+errors are printed on standard error. `telemetry.set_core_log_level`, also called before
+the first `client.connect`, asks for more, less or none.
+
+## Connections and throughput
+
+A client pings the service every 30 seconds and reconnects when a ping goes unanswered for
+15, so a worker outlives a connection that dies without being closed.
+`client.with_keep_alive` changes the two, and `client.with_connect_timeout` how long
+`connect` waits, ten seconds by default.
+
+A worker keeps ten polls open for workflow tasks and ten for activity tasks. If tasks wait
+in the queue while the worker has slots free, raise them with
+`worker.with_max_concurrent_workflow_task_polls` and
+`worker.with_max_concurrent_activity_task_polls`: the further away the service, the more
+polls it takes to keep a worker busy.
 
 ## Middleware
 

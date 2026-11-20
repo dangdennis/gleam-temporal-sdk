@@ -1,6 +1,7 @@
 //// The loops that take tasks from core and hand them to workflow and activity processes.
 
 import gleam/dict.{type Dict}
+import gleam/dynamic
 import gleam/erlang/process.{type Pid}
 import gleam/list
 import gleam/option.{type Option}
@@ -12,6 +13,7 @@ import temporal/internal/runtime
 import temporal/internal/time
 import temporal/internal/transcode
 import temporal/middleware.{type Outbound}
+import temporal/retry
 
 /// A run that core removed from the cache, with core's `EvictionReason` value.
 pub type Eviction {
@@ -21,6 +23,9 @@ pub type Eviction {
 /// Dispatch workflow activations until the worker shuts down. Returns the evictions seen,
 /// newest first, when `record_evictions` is set; a long-lived worker leaves it unset so the
 /// list cannot grow without bound.
+///
+/// This loop and the two below return an error when a poll fails. Core retries what is
+/// worth retrying itself, so by then it has given up and the worker takes no more tasks.
 pub fn workflow_loop(
   worker: NifWorker,
   workflows: Dict(String, runtime.WorkflowFn),
@@ -64,18 +69,7 @@ fn do_workflow_loop(
             _ -> Error(Nil)
           }
         })
-      let complete = fn(completion) {
-        let completion = transcode.encode_completion(codec, completion)
-        case bridge.complete_workflow(worker, completion) {
-          Ok(Nil) -> Nil
-          Error(reason) ->
-            bridge.log(
-              bridge.Error,
-              "temporal: workflow completion rejected: " <> reason,
-              [],
-            )
-        }
-      }
+      let complete = complete_workflow(worker, codec, _)
       let existing = case dict.get(runs, activation.run_id) {
         Ok(pid) ->
           case process.is_alive(pid) {
@@ -122,6 +116,43 @@ fn do_workflow_loop(
   }
 }
 
+/// Answer an activation. An answer the NIF or core will not take, such as an activity
+/// with a negative timeout, would leave the workflow task holding its slot until the server
+/// timed it out, with nothing to show why. The task is failed instead: the reason is in
+/// the workflow's history and the server retries the task.
+fn complete_workflow(
+  worker: NifWorker,
+  codec: Option(PayloadCodec),
+  completion: bridge.Completion,
+) -> Nil {
+  let run_id = completion.run_id
+  let report = fn(message) {
+    bridge.log(bridge.Error, message, [#("run_id", dynamic.string(run_id))])
+  }
+  let encoded = transcode.encode_completion(codec, completion)
+  case bridge.complete_workflow(worker, encoded), completion {
+    Ok(Nil), _ -> Nil
+    Error(reason), bridge.Success(..) -> {
+      report(
+        "temporal: workflow task completion rejected, failing the task: "
+        <> reason,
+      )
+      let failed =
+        bridge.TaskFailure(
+          run_id,
+          failure.new("the workflow task's completion was rejected: " <> reason),
+        )
+      case bridge.complete_workflow(worker, failed) {
+        Ok(Nil) -> Nil
+        Error(reason) ->
+          report("temporal: could not fail the workflow task: " <> reason)
+      }
+    }
+    Error(reason), bridge.TaskFailure(..) ->
+      report("temporal: could not fail the workflow task: " <> reason)
+  }
+}
+
 fn dispatch(
   activation: bridge.Activation,
   existing: Result(Pid, Nil),
@@ -160,7 +191,7 @@ pub fn activity_loop(
   task_queue: String,
   codec: Option(PayloadCodec),
   cancellation_grace_ms: Option(Int),
-) -> Nil {
+) -> Result(Nil, String) {
   do_activity_loop(
     worker,
     activities,
@@ -178,7 +209,7 @@ fn do_activity_loop(
   codec: Option(PayloadCodec),
   cancellation_grace_ms: Option(Int),
   running: Dict(BitArray, Pid),
-) -> Nil {
+) -> Result(Nil, String) {
   let running = dict.filter(running, fn(_, pid) { process.is_alive(pid) })
   let continue = fn(running) {
     do_activity_loop(
@@ -191,25 +222,23 @@ fn do_activity_loop(
     )
   }
   case bridge.poll_activity(worker) {
-    Error(bridge.Shutdown) -> Nil
-    // Crash, so that the worker's manager sees it and restarts the loop.
-    Error(bridge.PollFailed(message)) ->
-      panic as { "activity polling failed: " <> message }
-    Ok(bridge.ActivityStart(task_token:, ..) as task) ->
+    Error(bridge.Shutdown) -> Ok(Nil)
+    Error(bridge.PollFailed(message)) -> Error(message)
+    Ok(bridge.ActivityStart(task_token:, activity_id:, ..) as task) ->
       case transcode.decode_activity_task(codec, task) {
         Ok(task) -> {
           let pid = run_activity(worker, activities, task_queue, codec, task)
           continue(dict.insert(running, task_token, pid))
         }
         Error(reason) -> {
-          let _ =
-            bridge.complete_activity(
-              worker,
-              task_token,
-              bridge.ActivityFailed(failure.new(
-                "payload codec could not decode the activity task: " <> reason,
-              )),
-            )
+          complete_activity(
+            worker,
+            task_token,
+            activity_id,
+            bridge.ActivityFailed(failure.new(
+              "payload codec could not decode the activity task: " <> reason,
+            )),
+          )
           continue(running)
         }
       }
@@ -225,6 +254,39 @@ fn do_activity_loop(
         Error(Nil) -> Nil
       }
       continue(running)
+    }
+  }
+}
+
+/// Report an activity's outcome. One the NIF or core will not take is logged and the
+/// activity failed in its place, so that the server retries it now instead of waiting for
+/// its timeout.
+fn complete_activity(
+  worker: NifWorker,
+  task_token: BitArray,
+  activity_id: String,
+  result: bridge.ActivityResult,
+) -> Nil {
+  let report = fn(message) {
+    bridge.log(bridge.Error, message, [
+      #("activity_id", dynamic.string(activity_id)),
+    ])
+  }
+  case bridge.complete_activity(worker, task_token, result) {
+    Ok(Nil) -> Nil
+    Error(reason) -> {
+      report(
+        "temporal: activity result rejected, failing the activity: " <> reason,
+      )
+      let failed =
+        bridge.ActivityFailed(failure.new(
+          "the activity's result was rejected: " <> reason,
+        ))
+      case bridge.complete_activity(worker, task_token, failed) {
+        Ok(Nil) -> Nil
+        Error(reason) ->
+          report("temporal: could not fail the activity: " <> reason)
+      }
     }
   }
 }
@@ -284,6 +346,7 @@ fn run_activity(
     scheduled_time_ms:,
     is_local:,
     headers:,
+    retry:,
   ) = task
   let ctx =
     activity.new_context(
@@ -295,6 +358,7 @@ fn run_activity(
         workflow_type:,
         task_queue:,
         attempt:,
+        retry: option.map(retry, retry.from_bridge),
         heartbeat_details:,
         start_to_close: time.option_from_ms(start_to_close_ms),
         heartbeat_timeout: time.option_from_ms(heartbeat_timeout_ms),
@@ -350,13 +414,12 @@ fn run_activity(
             bridge.ActivityFailed(failure.new("activity crashed: " <> crash))
         }
     }
-    let _ =
-      bridge.complete_activity(
-        worker,
-        task_token,
-        transcode.encode_activity_result(codec, result),
-      )
-    Nil
+    complete_activity(
+      worker,
+      task_token,
+      activity_id,
+      transcode.encode_activity_result(codec, result),
+    )
   })
 }
 
@@ -377,17 +440,48 @@ fn cancel_reason(reason: Int) -> activity.CancelReason {
 pub fn nexus_loop(
   worker: NifWorker,
   handle: fn(bridge.NexusTask) -> bridge.NexusResult,
-) -> Nil {
+) -> Result(Nil, String) {
   case bridge.poll_nexus(worker) {
-    Error(bridge.Shutdown) -> Nil
-    Error(bridge.PollFailed(message)) ->
-      panic as { "nexus polling failed: " <> message }
+    Error(bridge.Shutdown) -> Ok(Nil)
+    Error(bridge.PollFailed(message)) -> Error(message)
     Ok(task) -> {
       process.spawn_unlinked(fn() {
-        let _ = bridge.complete_nexus(worker, task.task_token, handle(task))
-        Nil
+        complete_nexus(worker, task.task_token, handle(task))
       })
       nexus_loop(worker, handle)
+    }
+  }
+}
+
+/// Answer a Nexus task. An answer the NIF or core will not take is logged and the task
+/// reported as one the handler failed on, which the caller's server retries.
+fn complete_nexus(
+  worker: NifWorker,
+  task_token: BitArray,
+  result: bridge.NexusResult,
+) -> Nil {
+  case bridge.complete_nexus(worker, task_token, result) {
+    Ok(Nil) -> Nil
+    Error(reason) -> {
+      bridge.log(
+        bridge.Error,
+        "temporal: Nexus task result rejected, failing the task: " <> reason,
+        [],
+      )
+      let failed =
+        bridge.NexusHandlerFailed(
+          "INTERNAL",
+          failure.new("the Nexus task's result was rejected: " <> reason),
+        )
+      case bridge.complete_nexus(worker, task_token, failed) {
+        Ok(Nil) -> Nil
+        Error(reason) ->
+          bridge.log(
+            bridge.Error,
+            "temporal: could not fail the Nexus task: " <> reason,
+            [],
+          )
+      }
     }
   }
 }

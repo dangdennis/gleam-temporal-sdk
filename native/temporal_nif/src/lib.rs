@@ -29,8 +29,13 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
-use temporalio_client::{ClientTlsOptions, Connection, ConnectionOptions, TlsOptions};
-use temporalio_common::telemetry::{PrometheusExporterOptions, start_prometheus_metric_exporter};
+use temporalio_client::{
+    ClientKeepAliveOptions, ClientTlsOptions, Connection, ConnectionOptions, TlsOptions,
+};
+use temporalio_common::telemetry::{
+    PrometheusExporterOptions, TelemetryOptions, construct_filter_string,
+    start_prometheus_metric_exporter,
+};
 use temporalio_common::{
     protos::{
         coresdk::{
@@ -43,7 +48,11 @@ use temporalio_common::{
                 self, WorkflowActivationCompletion, workflow_activation_completion::Status,
             },
         },
-        temporal::api::{common::v1::Payload, failure::v1::Failure, history::v1::History},
+        temporal::api::{
+            common::v1::Payload,
+            failure::v1::{Failure, failure::FailureInfo},
+            history::v1::History,
+        },
     },
     worker::{
         VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes,
@@ -54,6 +63,8 @@ use temporalio_sdk_core::{
     WorkerConfig, WorkerVersioningStrategy,
     replay::{HistoryForReplay, ReplayWorkerInput},
 };
+use tracing::{Level, Subscriber};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt};
 use wire::{DecodeResult, Wire};
 
 mod atoms {
@@ -103,13 +114,45 @@ impl rustler::Resource for WorkerRes {
 static METRICS_ADDRESS: Mutex<Option<SocketAddr>> = Mutex::new(None);
 /// Where they are being served.
 static METRICS_BOUND: OnceLock<Result<SocketAddr, String>> = OnceLock::new();
+/// The least severe of core's log lines to print, if asked before the runtime started.
+static CORE_LOG_LEVEL: Mutex<Option<bridge::CoreLogLevel>> = Mutex::new(None);
 static RUNTIME: OnceLock<CoreRuntime> = OnceLock::new();
+
+/// Prints the log lines of core and its client at `level` and above on standard error.
+/// Lines from the libraries beneath them are printed from warnings up.
+fn core_logger(level: bridge::CoreLogLevel) -> Option<Arc<dyn Subscriber + Send + Sync>> {
+    let level = match level {
+        bridge::CoreLogLevel::CoreLogOff => return None,
+        bridge::CoreLogLevel::CoreLogError => Level::ERROR,
+        bridge::CoreLogLevel::CoreLogWarning => Level::WARN,
+        bridge::CoreLogLevel::CoreLogInfo => Level::INFO,
+        bridge::CoreLogLevel::CoreLogDebug => Level::DEBUG,
+    };
+    let others = level.min(Level::WARN);
+    let lines = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_target(false)
+        .with_filter(EnvFilter::new(construct_filter_string(level, others)));
+    Some(Arc::new(tracing_subscriber::registry().with(lines)))
+}
 
 pub fn runtime() -> &'static CoreRuntime {
     RUNTIME.get_or_init(|| {
-        let mut runtime =
-            CoreRuntime::new(RuntimeOptions::default(), TokioRuntimeBuilder::default())
-                .expect("failed to start the Temporal core runtime");
+        let level = CORE_LOG_LEVEL
+            .lock()
+            .ok()
+            .and_then(|level| level.clone())
+            .unwrap_or(bridge::CoreLogLevel::CoreLogWarning);
+        let telemetry = TelemetryOptions::builder()
+            .maybe_subscriber_override(core_logger(level))
+            .build();
+        let options = RuntimeOptions::builder()
+            .telemetry_options(telemetry)
+            .build()
+            .expect("the default runtime options are valid");
+        let mut runtime = CoreRuntime::new(options, TokioRuntimeBuilder::default())
+            .expect("failed to start the Temporal core runtime");
         if let Some(socket_addr) = METRICS_ADDRESS.lock().ok().and_then(|a| *a) {
             let started = {
                 let _guard = runtime.tokio_handle().enter();
@@ -163,6 +206,24 @@ fn start_metrics<'a>(env: Env<'a>, address: String) -> Term<'a> {
     }
 }
 
+/// Choose which of core's log lines are printed. Like `start_metrics`, it has to be called
+/// before the runtime starts.
+#[rustler::nif]
+fn set_core_log_level<'a>(env: Env<'a>, level: Term<'a>) -> rustler::NifResult<Term<'a>> {
+    let level = bridge::CoreLogLevel::from_term(level).map_err(|_| rustler::Error::BadArg)?;
+    let already_started = (atoms::error(), atoms::already_started()).encode(env);
+    // Held while checking, so that a runtime starting now either reads the new level or
+    // has already made this call fail.
+    let Ok(mut wanted) = CORE_LOG_LEVEL.lock() else {
+        return Ok(already_started);
+    };
+    if RUNTIME.get().is_some() {
+        return Ok(already_started);
+    }
+    *wanted = Some(level);
+    Ok(ok(env, atoms::nil().encode(env)))
+}
+
 /// Run `fut` on the core runtime, then send `{temporal_nif, Ref, reply}` to `pid`. `reply`
 /// builds the term on a Tokio thread, which is the only place an `OwnedEnv` may send from.
 pub fn spawn_reply<F, T, R>(pid: LocalPid, reference: Term, fut: F, reply: R)
@@ -212,6 +273,8 @@ fn lost_task_failure() -> Failure {
     Failure {
         message: "the worker process that asked for this task died before receiving it".to_string(),
         source: "GleamSDK".to_string(),
+        // The server takes no other kind of failure from an activity.
+        failure_info: Some(FailureInfo::ApplicationFailureInfo(Default::default())),
         ..Default::default()
     }
 }
@@ -231,35 +294,84 @@ fn unit_result<'a, E: std::fmt::Display>(env: Env<'a>, r: Result<(), E>) -> Term
     }
 }
 
-#[rustler::nif]
-fn connect<'a>(
-    env: Env<'a>,
-    pid: LocalPid,
-    reference: Term<'a>,
+/// What the client crate is told from `bridge.ConnectOptions`.
+struct ConnectOptions {
     target: String,
     namespace: String,
     identity: String,
-    api_key: Term<'a>,
-    tls: Term<'a>,
-) -> Term<'a> {
-    let api_key = match Option::<String>::from_term(api_key) {
-        Ok(key) => key,
-        Err(e) => return err(env, format!("invalid API key: {e}")),
+    api_key: Option<String>,
+    tls: Option<TlsOptions>,
+    keep_alive: Option<ClientKeepAliveOptions>,
+    connect_timeout: Duration,
+}
+
+fn connect_options(options: bridge::ConnectOptions) -> DecodeResult<ConnectOptions> {
+    let bridge::ConnectOptions {
+        target,
+        namespace,
+        identity,
+        api_key,
+        tls,
+        keep_alive,
+        connect_timeout_ms,
+    } = options;
+    let positive = |value: i64, name: &str| match n::<u64>(value, name)? {
+        0 => Err(format!("{name}: must be longer than zero")),
+        ms => Ok(Duration::from_millis(ms)),
     };
-    let tls = match Option::<bridge::Tls>::from_term(tls) {
-        Ok(tls) => tls.map(tls_options),
-        Err(e) => return err(env, format!("invalid TLS options: {e}")),
+    Ok(ConnectOptions {
+        target,
+        namespace,
+        identity,
+        api_key,
+        tls: tls.map(tls_options),
+        keep_alive: keep_alive
+            .map(|(interval, timeout)| {
+                Ok::<_, String>(
+                    ClientKeepAliveOptions::builder()
+                        .interval(positive(interval, "the keep-alive interval")?)
+                        .timeout(positive(timeout, "the keep-alive timeout")?)
+                        .build(),
+                )
+            })
+            .transpose()?,
+        connect_timeout: positive(connect_timeout_ms, "the connect timeout")?,
+    })
+}
+
+#[rustler::nif]
+fn connect<'a>(env: Env<'a>, pid: LocalPid, reference: Term<'a>, options: Term<'a>) -> Term<'a> {
+    let options = match bridge::ConnectOptions::from_term(options).and_then(connect_options) {
+        Ok(options) => options,
+        Err(e) => return err(env, format!("invalid connection options: {e}")),
     };
     let fut = async move {
+        let ConnectOptions {
+            target,
+            namespace,
+            identity,
+            api_key,
+            tls,
+            keep_alive,
+            connect_timeout,
+        } = options;
         let url = Url::from_str(&target).map_err(|e| format!("invalid target url: {e}"))?;
+        // The timeout is given twice: the option bounds every attempt to open a socket, now
+        // and when reconnecting, and the outer one bounds the whole handshake, which also
+        // waits for the server's first answer.
         let options = ConnectionOptions::new(url)
             .identity(identity.clone())
             .maybe_api_key(api_key)
             .maybe_tls_options(tls)
+            .keep_alive(keep_alive)
+            .connect_timeout(connect_timeout)
             .build();
-        let connection = Connection::connect(options)
+        let connection = tokio::time::timeout(connect_timeout, Connection::connect(options))
             .await
-            .map_err(|e| format!("connection failed: {e}"))?;
+            .map_err(|_| {
+                format!("could not connect to {target} within {connect_timeout:?}: timed out")
+            })?
+            .map_err(|e| format!("could not connect to {target}: {e}"))?;
         Ok::<_, String>(ConnectionRes {
             connection,
             namespace,
@@ -299,6 +411,10 @@ struct WorkerOptions {
     max_cached_workflows: usize,
     max_workflow_tasks: usize,
     max_activities: usize,
+    max_nexus_tasks: usize,
+    workflow_task_polls: usize,
+    activity_task_polls: usize,
+    nexus_task_polls: usize,
     task_queue_activities_per_second: Option<f64>,
     worker_activities_per_second: Option<f64>,
     task_types: WorkerTaskTypes,
@@ -306,11 +422,21 @@ struct WorkerOptions {
     shutdown_grace: Duration,
 }
 
+/// How many polls to keep open: what was asked for, but no more than there are slots to
+/// run what they return, and no fewer than core accepts.
+fn polls(asked: i64, slots: usize, least: usize, name: &str) -> DecodeResult<usize> {
+    Ok(n::<usize>(asked, name)?.min(slots).max(least))
+}
+
 fn worker_options(options: bridge::WorkerOptions) -> DecodeResult<WorkerOptions> {
     let bridge::WorkerOptions {
         max_cached_workflows,
         max_concurrent_workflow_tasks,
         max_concurrent_activities,
+        max_concurrent_nexus_tasks,
+        max_concurrent_workflow_task_polls,
+        max_concurrent_activity_task_polls,
+        max_concurrent_nexus_task_polls,
         max_task_queue_activities_per_second,
         max_activities_per_second,
         enable_workflows,
@@ -319,15 +445,42 @@ fn worker_options(options: bridge::WorkerOptions) -> DecodeResult<WorkerOptions>
         deployment,
         shutdown_grace_ms,
     } = options;
+    let max_cached_workflows = n(max_cached_workflows, "WorkerOptions.max_cached_workflows")?;
+    let max_workflow_tasks = n(
+        max_concurrent_workflow_tasks,
+        "WorkerOptions.max_concurrent_workflow_tasks",
+    )?;
+    let max_activities = n(
+        max_concurrent_activities,
+        "WorkerOptions.max_concurrent_activities",
+    )?;
+    let max_nexus_tasks = n(
+        max_concurrent_nexus_tasks,
+        "WorkerOptions.max_concurrent_nexus_tasks",
+    )?;
     Ok(WorkerOptions {
-        max_cached_workflows: n(max_cached_workflows, "WorkerOptions.max_cached_workflows")?,
-        max_workflow_tasks: n(
-            max_concurrent_workflow_tasks,
-            "WorkerOptions.max_concurrent_workflow_tasks",
+        max_cached_workflows,
+        max_workflow_tasks,
+        max_activities,
+        max_nexus_tasks,
+        workflow_task_polls: polls(
+            max_concurrent_workflow_task_polls,
+            max_workflow_tasks,
+            // With a cache, core polls the worker's sticky queue as well as the shared one.
+            if max_cached_workflows > 0 { 2 } else { 1 },
+            "WorkerOptions.max_concurrent_workflow_task_polls",
         )?,
-        max_activities: n(
-            max_concurrent_activities,
-            "WorkerOptions.max_concurrent_activities",
+        activity_task_polls: polls(
+            max_concurrent_activity_task_polls,
+            max_activities,
+            1,
+            "WorkerOptions.max_concurrent_activity_task_polls",
+        )?,
+        nexus_task_polls: polls(
+            max_concurrent_nexus_task_polls,
+            max_nexus_tasks,
+            1,
+            "WorkerOptions.max_concurrent_nexus_task_polls",
         )?,
         task_queue_activities_per_second: max_task_queue_activities_per_second,
         worker_activities_per_second: max_activities_per_second,
@@ -388,14 +541,15 @@ fn worker_config(
         .task_queue(task_queue)
         .max_cached_workflows(options.max_cached_workflows)
         .task_types(options.task_types)
-        .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
-        .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
+        .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(options.workflow_task_polls))
+        .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(options.activity_task_polls))
+        .nexus_task_poller_behavior(PollerBehavior::SimpleMaximum(options.nexus_task_polls))
         .max_outstanding_workflow_tasks(options.max_workflow_tasks)
         .max_outstanding_activities(options.max_activities)
         .maybe_max_task_queue_activities_per_second(options.task_queue_activities_per_second)
         .maybe_max_worker_activities_per_second(options.worker_activities_per_second)
         .max_outstanding_local_activities(100usize)
-        .max_outstanding_nexus_tasks(1usize)
+        .max_outstanding_nexus_tasks(options.max_nexus_tasks)
         .versioning_strategy(options.versioning)
         .graceful_shutdown_period(options.shutdown_grace)
         .build()
@@ -461,6 +615,10 @@ fn replay_worker_new<'a>(
         max_cached_workflows: 1,
         max_workflow_tasks: 100,
         max_activities: 100,
+        max_nexus_tasks: 1,
+        workflow_task_polls: 2,
+        activity_task_polls: 1,
+        nexus_task_polls: 1,
         task_queue_activities_per_second: None,
         worker_activities_per_second: None,
         task_types: WorkerTaskTypes::workflow_only(),

@@ -3,13 +3,14 @@
 use crate::{
     ConnectionRes, atoms, bridge,
     client::{StartRequest, invalid, rpc_err},
-    convert::{count, duration_ms, millis, ms, n, opt_ms, timestamp},
+    convert::{count, duration_ms, millis, ms, n, opt_ms, timestamp, to_retry_policy},
     ok, spawn_reply,
     wire::{Bytes, DecodeResult, Wire},
 };
+use prost::Message;
 use rustler::{Atom, Encoder, Env, LocalPid, ResourceArc, Term};
 use temporalio_common::protos::temporal::api::{
-    common::v1::{Payloads, RetryPolicy, WorkflowType},
+    common::v1::{Payloads, WorkflowType},
     schedule::v1::{
         BackfillRequest, IntervalSpec, Range, Schedule, ScheduleAction, ScheduleInfo,
         SchedulePatch, SchedulePolicies, ScheduleSpec, ScheduleState, StructuredCalendarSpec,
@@ -166,16 +167,6 @@ fn action(r: StartRequest) -> ScheduleAction {
     }
 }
 
-fn to_retry_policy(r: RetryPolicy) -> bridge::RetryPolicy {
-    bridge::RetryPolicy {
-        initial_interval_ms: duration_ms(r.initial_interval).unwrap_or(0),
-        backoff_coefficient: r.backoff_coefficient,
-        maximum_interval_ms: set_ms(r.maximum_interval),
-        maximum_attempts: i64::from(r.maximum_attempts),
-        non_retryable_error_types: r.non_retryable_error_types,
-    }
-}
-
 /// `bridge.StartRequest` from a schedule's action. A schedule stores less than a start
 /// request holds, and the rest is left empty.
 fn to_start_request(a: Option<ScheduleAction>) -> Result<bridge::StartRequest, tonic::Status> {
@@ -235,7 +226,7 @@ fn schedule(schedule: bridge::Schedule) -> DecodeResult<Schedule> {
     })
 }
 
-fn to_schedule(s: Schedule) -> Result<bridge::Schedule, tonic::Status> {
+pub fn to_schedule(s: Schedule) -> Result<bridge::Schedule, tonic::Status> {
     let policies = s.policies.unwrap_or_default();
     let state = s.state.unwrap_or_default();
     Ok(bridge::Schedule {
@@ -312,70 +303,214 @@ fn unit<'a>(env: Env<'a>, r: Result<(), tonic::Status>) -> Term<'a> {
     }
 }
 
-/// Create the schedule, or, given a conflict token from `schedule_describe`, replace it.
+/// Write onto `stored`, the schedule as the server has it, the fields in which `changed`
+/// differs from `described`, which is what Gleam was shown of `stored`. A field the caller
+/// left alone keeps the server's value exactly, and so does everything `bridge.Schedule`
+/// does not model: the start and end time, excluded calendars, the remaining-actions limit,
+/// the action's headers and id reuse policy, and whatever the server adds later.
+pub fn overwrite(
+    stored: &mut Schedule,
+    described: bridge::Schedule,
+    changed: bridge::Schedule,
+) -> DecodeResult<()> {
+    let bridge::Schedule {
+        spec: new_spec,
+        action: new_action,
+        overlap_policy,
+        catchup_window_ms,
+        pause_on_failure,
+        paused,
+        note,
+    } = changed;
+
+    if new_spec != described.spec {
+        let old = described.spec;
+        let bridge::ScheduleSpec {
+            intervals,
+            calendars,
+            cron_expressions,
+            timezone,
+            jitter_ms,
+        } = new_spec.clone();
+        let new = spec(new_spec)?;
+        let stored = stored.spec.get_or_insert_default();
+        if intervals != old.intervals {
+            stored.interval = new.interval;
+        }
+        if calendars != old.calendars {
+            stored.structured_calendar = new.structured_calendar;
+        }
+        if cron_expressions != old.cron_expressions {
+            stored.cron_string = new.cron_string;
+        }
+        if timezone != old.timezone {
+            stored.timezone_name = new.timezone_name;
+            // The server prefers the zone's rules, when given, to its name.
+            stored.timezone_data = vec![];
+        }
+        if jitter_ms != old.jitter_ms {
+            stored.jitter = new.jitter;
+        }
+    }
+
+    if new_action != described.action {
+        let old = described.action;
+        let new: StartRequest = new_action.clone().try_into()?;
+        let action = stored.action.get_or_insert_default();
+        if !matches!(action.action, Some(Action::StartWorkflow(_))) {
+            action.action = Some(Action::StartWorkflow(Default::default()));
+        }
+        let Some(Action::StartWorkflow(stored)) = &mut action.action else {
+            unreachable!("set above")
+        };
+        // Only what `schedule.Action` has: the rest of a start request is not a schedule's.
+        if new_action.workflow_id != old.workflow_id {
+            stored.workflow_id = new.workflow_id;
+        }
+        if new_action.workflow_type != old.workflow_type {
+            stored.workflow_type = Some(WorkflowType {
+                name: new.workflow_type,
+            });
+        }
+        if new_action.task_queue != old.task_queue {
+            stored.task_queue.get_or_insert_default().name = new.task_queue;
+        }
+        if new_action.input != old.input {
+            stored.input = Some(Payloads {
+                payloads: new.input,
+            });
+        }
+        if new_action.execution_timeout_ms != old.execution_timeout_ms {
+            stored.workflow_execution_timeout = new.execution_timeout;
+        }
+        if new_action.run_timeout_ms != old.run_timeout_ms {
+            stored.workflow_run_timeout = new.run_timeout;
+        }
+        if new_action.task_timeout_ms != old.task_timeout_ms {
+            stored.workflow_task_timeout = new.task_timeout;
+        }
+        if new_action.retry != old.retry {
+            stored.retry_policy = new.retry;
+        }
+        if new_action.memo != old.memo {
+            stored.memo = new.memo;
+        }
+        if new_action.search_attributes != old.search_attributes {
+            stored.search_attributes = new.search_attributes;
+        }
+    }
+
+    let policies = stored.policies.get_or_insert_default();
+    if overlap_policy != described.overlap_policy {
+        policies.overlap_policy = n(overlap_policy, "Schedule.overlap_policy")?;
+    }
+    if catchup_window_ms != described.catchup_window_ms {
+        policies.catchup_window = opt_ms(catchup_window_ms, "Schedule.catchup_window_ms")?;
+    }
+    if pause_on_failure != described.pause_on_failure {
+        policies.pause_on_failure = pause_on_failure;
+    }
+
+    let state = stored.state.get_or_insert_default();
+    if paused != described.paused {
+        state.paused = paused;
+    }
+    if note != described.note {
+        state.notes = note;
+    }
+    Ok(())
+}
+
 #[rustler::nif]
-fn schedule_put<'a>(
+fn schedule_create<'a>(
     env: Env<'a>,
     pid: LocalPid,
     reference: Term<'a>,
     conn: ResourceArc<ConnectionRes>,
     schedule_id: String,
     schedule: Term<'a>,
-    conflict_token: Term<'a>,
     trigger_immediately: bool,
 ) -> Term<'a> {
     let schedule = match bridge::Schedule::from_term(schedule).and_then(self::schedule) {
         Ok(s) => s,
         Err(e) => return invalid(env, format!("invalid schedule: {e}")),
     };
-    let conflict_token = match Option::<Bytes>::from_term(conflict_token) {
-        Ok(token) => token.map(|token| token.0),
-        Err(e) => return invalid(env, format!("invalid conflict token: {e}")),
-    };
     let fut = async move {
-        let mut service = conn.connection.workflow_service();
-        let request_id = uuid::Uuid::new_v4().to_string();
-        match conflict_token {
-            None => service
-                .create_schedule(
-                    CreateScheduleRequest {
-                        namespace: conn.namespace.clone(),
-                        schedule_id,
-                        schedule: Some(schedule),
-                        initial_patch: trigger_immediately.then(|| SchedulePatch {
-                            trigger_immediately: Some(TriggerImmediatelyRequest::default()),
-                            ..Default::default()
-                        }),
-                        identity: conn.identity.clone(),
-                        request_id,
+        conn.connection
+            .workflow_service()
+            .create_schedule(
+                CreateScheduleRequest {
+                    namespace: conn.namespace.clone(),
+                    schedule_id,
+                    schedule: Some(schedule),
+                    initial_patch: trigger_immediately.then(|| SchedulePatch {
+                        trigger_immediately: Some(TriggerImmediatelyRequest::default()),
                         ..Default::default()
-                    }
-                    .into_request(),
-                )
-                .await
-                .map(|_| ()),
-            Some(conflict_token) => service
-                .update_schedule(
-                    UpdateScheduleRequest {
-                        namespace: conn.namespace.clone(),
-                        schedule_id,
-                        schedule: Some(schedule),
-                        conflict_token,
-                        identity: conn.identity.clone(),
-                        request_id,
-                        ..Default::default()
-                    }
-                    .into_request(),
-                )
-                .await
-                .map(|_| ()),
-        }
+                    }),
+                    identity: conn.identity.clone(),
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .map(|_| ())
     };
     spawn_reply(pid, reference, fut, unit);
     atoms::ok().encode(env)
 }
 
-/// Answers `{Schedule, ScheduleInfo, ConflictToken}`.
+/// Replace the schedule `schedule_describe` answered. `stored` is the third element of its
+/// answer; `described` the first, and `changed` what the caller made of it. See `overwrite`.
+#[rustler::nif]
+fn schedule_update<'a>(
+    env: Env<'a>,
+    pid: LocalPid,
+    reference: Term<'a>,
+    conn: ResourceArc<ConnectionRes>,
+    schedule_id: String,
+    stored: Term<'a>,
+    described: Term<'a>,
+    changed: Term<'a>,
+) -> Term<'a> {
+    let request = (|| {
+        let stored = Bytes::from_term(stored)?;
+        let mut request = UpdateScheduleRequest::decode(stored.0.as_slice())
+            .map_err(|e| format!("not a schedule from schedule_describe: {e}"))?;
+        overwrite(
+            request.schedule.get_or_insert_default(),
+            bridge::Schedule::from_term(described)?,
+            bridge::Schedule::from_term(changed)?,
+        )?;
+        Ok::<_, String>(request)
+    })();
+    let request = match request {
+        Ok(request) => request,
+        Err(e) => return invalid(env, format!("invalid schedule: {e}")),
+    };
+    let fut = async move {
+        conn.connection
+            .workflow_service()
+            .update_schedule(
+                UpdateScheduleRequest {
+                    namespace: conn.namespace.clone(),
+                    schedule_id,
+                    identity: conn.identity.clone(),
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    ..request
+                }
+                .into_request(),
+            )
+            .await
+            .map(|_| ())
+    };
+    spawn_reply(pid, reference, fut, unit);
+    atoms::ok().encode(env)
+}
+
+/// Answers `{Schedule, ScheduleInfo, Stored}`. `Stored` is for `schedule_update`: the
+/// schedule exactly as the server has it and the token that tells whether it has changed
+/// since, encoded as the update request they will be sent back in.
 #[rustler::nif]
 fn schedule_describe<'a>(
     pid: LocalPid,
@@ -398,10 +533,15 @@ fn schedule_describe<'a>(
     };
     spawn_reply(pid, reference, fut, |env, r| {
         let described = r.and_then(|d| {
+            let stored = UpdateScheduleRequest {
+                schedule: d.schedule.clone(),
+                conflict_token: d.conflict_token,
+                ..Default::default()
+            };
             Ok((
                 to_schedule(d.schedule.unwrap_or_default())?,
                 to_info(d.info.unwrap_or_default()),
-                Bytes(d.conflict_token),
+                Bytes(stored.encode_to_vec()),
             ))
         });
         match described {

@@ -31,7 +31,7 @@ temporal server start-dev       # a local service, from the Temporal CLI
 | `temporal/client` | Connect; start, execute, signal, query, update, cancel, describe, list |
 | `temporal/retry`, `temporal/failure` | Retry policies; the `Failure` type |
 | `temporal/codec`, `temporal/schema` | Codecs for values; JSON objects described once |
-| `temporal/schedule`, `temporal/nexus`, `temporal/encryption`, `temporal/telemetry`, `temporal/log` | Schedules; serving Nexus; payload encryption; metrics; log fields |
+| `temporal/schedule`, `temporal/nexus`, `temporal/encryption`, `temporal/telemetry`, `temporal/log` | Schedules; serving Nexus; payload encryption; metrics and the core library's log level; log fields |
 | `temporal/testing`, `temporal/replayer` | Test servers, activity contexts; history replay |
 
 ## The core shape: definition, handler, worker, client
@@ -244,6 +244,12 @@ Workflows and activities fail by returning `Error(Failure)`. From
 - A failed activity or child reaches the workflow as a wrapper (`kind` `Activity` or
   `ChildWorkflow`). The error the code returned is `failure.root_cause(failed)`; match on
   its `error_type`. `failure.is_cancellation` and `failure.is_timeout` look through wrappers.
+- Returning a received failure as it is passes it on whole: clients see an activity
+  failure with its cause. `failure.with_type`, `non_retryable` and `with_details` make it
+  the workflow's own application failure instead, with the same cause. Never set a
+  failure's `original` field.
+- In an activity, `activity.is_final_attempt(ctx)` says whether the retry policy allows
+  no attempt after this one; `activity.info(ctx).retry` is the policy.
 - Retried: a failed activity, without limit unless `workflow.with_retry` says otherwise;
   a local activity likewise; an attempt that passes its start-to-close or heartbeat
   timeout. Not retried: a `non_retryable` failure, a type the policy lists, a
@@ -314,5 +320,9 @@ replays every workflow task.
 | Log warning `signal "x" dropped: could not decode it: ...` | The sender's value does not match the signal definition's codec |
 | `client.AlreadyExists(..)` on start | A workflow with that id is running. Use `client.with_id_conflict_policy(client.UseExisting)` or another id |
 | Crash `temporal_library_not_loaded`: ``The Temporal native library could not be loaded. Run `gleam run -m temporal/install` to download it, or compile it with bin/build-nif in the package directory.`` | The native library is missing, typically after `gleam clean` or in CI |
-| `Error(telemetry.AlreadyStarted)` | `telemetry.serve_prometheus` was called after the first `client.connect`. Call it first in `main` |
+| `Error(telemetry.AlreadyStarted)` | `telemetry.serve_prometheus` or `telemetry.set_core_log_level` was called after the first `client.connect`. Call them first in `main`, the log level before the metrics |
+| `client.ConnectionFailed("could not connect to http://localhost:7233 within 10s: timed out")` | The service did not answer in time: a wrong address, a firewall, or TLS on one side only. `client.with_connect_timeout` changes the wait |
+| Workflow task failure `the workflow task's completion was rejected: ...`, logged as `temporal: workflow task completion rejected, failing the task: ...` | The workflow asked for something that cannot be sent, such as a negative timeout. Fix the value; the task is retried |
+| Log error `temporal worker: activity polling on task queue "x" failed, registering the worker again: ...` | The service answered polls with an error for over a minute, usually a proxy or load balancer in front of it. The worker recovers by itself once the service does |
+| Tasks wait in the queue while the worker has free slots | Too few polls for the round trip to the service. Raise `worker.with_max_concurrent_workflow_task_polls` and `worker.with_max_concurrent_activity_task_polls` from their default of 10 |
 | A workflow never progresses and nothing fails | No worker polls its task queue, or the worker crashed in workflow code and is retrying the task: check the worker's log |

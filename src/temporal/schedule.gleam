@@ -506,11 +506,10 @@ pub fn create(
   schedule_id: String,
   schedule: Schedule,
 ) -> Result(Nil, Error) {
-  bridge.schedule_put(
+  bridge.schedule_create(
     client.connection(client),
     schedule_id,
     to_bridge(client, schedule),
-    None,
     False,
   )
   |> result.map_error(client.request_error)
@@ -540,23 +539,37 @@ pub fn describe(
 }
 
 /// Change a schedule: `change` receives the schedule as the server has it and returns the
-/// one to store, usually by passing it through `with_` functions. The update is rejected if the schedule changed in between. Unlike deleting
-/// and recreating, this keeps the schedule's history and the timing of its intervals.
+/// one to store, usually by passing it through `with_` functions. The update is rejected if
+/// the schedule changed in between. Unlike deleting and recreating, this keeps the
+/// schedule's history and the timing of its intervals.
+///
+/// Only what `change` changed is written. Everything else stays as the server has it,
+/// including settings `Schedule` cannot express, such as a start and end time, a limit on
+/// the number of actions, or headers, set with another SDK or the Temporal CLI.
 pub fn update(
   client: Client,
   schedule_id: String,
   change: fn(Schedule) -> Schedule,
 ) -> Result(Nil, Error) {
-  use #(schedule, _, conflict_token) <- result.try(
+  use #(described, _, stored) <- result.try(
     bridge.schedule_describe(client.connection(client), schedule_id)
     |> result.map_error(client.request_error),
   )
-  bridge.schedule_put(
+  let before = from_bridge(client, described)
+  let after = change(before)
+  // A part the caller left alone goes back as it was described, so that encoding it again,
+  // which an encrypting codec does differently each time, does not make it look changed.
+  let changed = to_bridge(client, after)
+  let changed = case after.action == before.action {
+    True -> bridge.Schedule(..changed, action: described.action)
+    False -> changed
+  }
+  bridge.schedule_update(
     client.connection(client),
     schedule_id,
-    to_bridge(client, change(from_bridge(client, schedule))),
-    Some(conflict_token),
-    False,
+    stored,
+    described,
+    changed,
   )
   |> result.map_error(client.request_error)
 }

@@ -53,6 +53,8 @@ pub fn decode_map(
   |> result.map(dict.from_list)
 }
 
+/// The failure's `original` is left alone, here and in `encode_failure`: the details inside
+/// it stay as the service sent them, which is how they go back if the failure is returned.
 pub fn decode_failure(
   codec: Option(PayloadCodec),
   failure: Failure,

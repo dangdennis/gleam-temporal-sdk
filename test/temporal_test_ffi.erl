@@ -1,5 +1,5 @@
 -module(temporal_test_ffi).
--export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, capture_log_metadata/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1, memory_mb/0, env_int/2]).
+-export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, capture_log_metadata/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1, memory_mb/0, env_int/2, tcp_proxy/1, tcp_proxy_mode/2, silent_listener/0, run_only/1, await_log/2]).
 
 unique() ->
     integer_to_binary(erlang:system_time(microsecond)).
@@ -108,6 +108,23 @@ capture(Fun, Detail) ->
     ok = logger:set_primary_config(level, Level),
     drain_logs([]).
 
+%% Inside capture_logs/1: wait until a line that contains Text has been logged. The lines
+%% read while waiting are put back for capture_logs/1 to return.
+await_log(Text, Timeout) ->
+    await_log(Text, erlang:monotonic_time(millisecond) + Timeout, []).
+
+await_log(Text, Deadline, Seen) ->
+    PutBack = fun() -> [self() ! {temporal_log, Line} || Line <- lists:reverse(Seen)] end,
+    receive
+        {temporal_log, {_, Logged, _} = Line} ->
+            case binary:match(Logged, Text) of
+                nomatch -> await_log(Text, Deadline, [Line | Seen]);
+                _ -> PutBack(), self() ! {temporal_log, Line}, true
+            end
+    after max(0, Deadline - erlang:monotonic_time(millisecond)) ->
+        PutBack(), false
+    end.
+
 drain_logs(Seen) ->
     receive {temporal_log, Line} -> drain_logs([Line | Seen])
     after 0 -> lists:reverse(Seen)
@@ -165,4 +182,141 @@ env_int(Name, Default) ->
     case os:getenv(binary_to_list(Name)) of
         false -> Default;
         Value -> list_to_integer(Value)
+    end.
+
+%% A TCP proxy in front of 127.0.0.1:UpstreamPort, whose link can be broken in the ways a
+%% network breaks. Listens on a free port and returns it. See tcp_proxy_mode/2.
+tcp_proxy(UpstreamPort) ->
+    Parent = self(),
+    spawn(fun() ->
+        {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true},
+                                          {ip, {127, 0, 0, 1}}]),
+        {ok, Port} = inet:port(Listen),
+        persistent_term:put({tcp_proxy, Port}, forward),
+        Parent ! {tcp_proxy, Port},
+        tcp_accept_loop(Listen, Port, UpstreamPort)
+    end),
+    receive {tcp_proxy, Port} -> Port end.
+
+%% `forward` relays.
+%%
+%% `blackhole` swallows every byte in both directions and closes nothing, as a dropped route
+%% does. A connection that has lost bytes stays dead when the proxy forwards again, as one
+%% whose route came back without its state would: only new connections work.
+%%
+%% `not_found` closes the connections there are and answers every request on a new one
+%% with HTTP 404, as a load balancer that has lost its backend does. gRPC reads that as
+%% UNIMPLEMENTED, which is not an error worth retrying.
+tcp_proxy_mode(Port, Mode) ->
+    persistent_term:put({tcp_proxy, Port}, Mode),
+    nil.
+
+tcp_proxy_mode(Port) ->
+    persistent_term:get({tcp_proxy, Port}).
+
+tcp_accept_loop(Listen, Port, UpstreamPort) ->
+    {ok, Client} = gen_tcp:accept(Listen),
+    spawn(fun() ->
+        case tcp_proxy_mode(Port) of
+            not_found -> http2_not_found(Client, Port);
+            _ -> tcp_relay(Client, Port, UpstreamPort)
+        end
+    end),
+    tcp_accept_loop(Listen, Port, UpstreamPort).
+
+tcp_relay(Client, Port, UpstreamPort) ->
+    {ok, Upstream} = gen_tcp:connect("127.0.0.1", UpstreamPort, [binary, {active, false}]),
+    Dead = atomics:new(1, []),
+    Self = self(),
+    Relay = fun(From, To) ->
+        spawn_link(fun() -> tcp_relay(From, To, Port, Dead, Self) end)
+    end,
+    Relay(Client, Upstream),
+    Relay(Upstream, Client),
+    receive closed -> ok end,
+    gen_tcp:close(Client),
+    gen_tcp:close(Upstream).
+
+tcp_relay(From, To, Port, Dead, Owner) ->
+    %% Woken often, so that a change of mode is seen on a quiet connection too.
+    Received = gen_tcp:recv(From, 0, 100),
+    case tcp_proxy_mode(Port) of
+        blackhole -> atomics:put(Dead, 1, 1);
+        _ -> ok
+    end,
+    case {Received, tcp_proxy_mode(Port), atomics:get(Dead, 1)} of
+        {_, not_found, _} -> Owner ! closed;
+        {{error, timeout}, _, _} -> tcp_relay(From, To, Port, Dead, Owner);
+        {{error, _}, _, _} -> Owner ! closed;
+        {{ok, _}, _, 1} -> tcp_relay(From, To, Port, Dead, Owner);
+        {{ok, Data}, _, 0} ->
+            case gen_tcp:send(To, Data) of
+                ok -> tcp_relay(From, To, Port, Dead, Owner);
+                {error, _} -> Owner ! closed
+            end
+    end.
+
+%% Just enough HTTP/2 to refuse every request: read the client's preface, send empty
+%% settings, then answer frame by frame.
+http2_not_found(Socket, Port) ->
+    case gen_tcp:recv(Socket, 24) of
+        {ok, <<"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n">>} ->
+            ok = gen_tcp:send(Socket, <<0:24, 4, 0, 0:32>>),
+            http2_frames(Socket, Port);
+        _ -> gen_tcp:close(Socket)
+    end.
+
+http2_frames(Socket, Port) ->
+    case {http2_frame(Socket), tcp_proxy_mode(Port)} of
+        {{ok, Type, Flags, Stream, Payload}, not_found} ->
+            Reply = case {Type, Flags band 1, Flags band 4} of
+                %% Data: give the connection's window back.
+                {0, _, _} when byte_size(Payload) > 0 ->
+                    <<4:24, 8, 0, 0:32, 0:1, (byte_size(Payload)):31>>;
+                %% Headers, complete: `:status 404`, and the stream ends.
+                {1, _, 4} -> <<1:24, 1, 5, 0:1, Stream:31, 16#8d>>;
+                %% Settings and pings are acknowledged.
+                {4, 0, _} -> <<0:24, 4, 1, 0:32>>;
+                {6, 0, _} -> <<8:24, 6, 1, 0:32, Payload/binary>>;
+                _ -> <<>>
+            end,
+            case gen_tcp:send(Socket, Reply) of
+                ok -> http2_frames(Socket, Port);
+                {error, _} -> gen_tcp:close(Socket)
+            end;
+        %% The backend is back: the client reconnects and is relayed to it.
+        _ -> gen_tcp:close(Socket)
+    end.
+
+http2_frame(Socket) ->
+    case gen_tcp:recv(Socket, 9) of
+        {ok, <<0:24, Type, Flags, _:1, Stream:31>>} -> {ok, Type, Flags, Stream, <<>>};
+        {ok, <<Length:24, Type, Flags, _:1, Stream:31>>} ->
+            case gen_tcp:recv(Socket, Length) of
+                {ok, Payload} -> {ok, Type, Flags, Stream, Payload};
+                Error -> Error
+            end;
+        Error -> Error
+    end.
+
+%% A port that accepts connections and never says anything on them.
+silent_listener() ->
+    Parent = self(),
+    spawn(fun() ->
+        {ok, Listen} = gen_tcp:listen(0, [binary, {active, false}, {ip, {127, 0, 0, 1}}]),
+        {ok, Port} = inet:port(Listen),
+        Parent ! {silent_listener, Port},
+        silent_accept_loop(Listen, [])
+    end),
+    receive {silent_listener, Port} -> Port end.
+
+silent_accept_loop(Listen, Held) ->
+    {ok, Socket} = gen_tcp:accept(Listen),
+    silent_accept_loop(Listen, [Socket | Held]).
+
+%% Run the tests of the named modules only: `gleam test` runs all of them.
+run_only(Modules) ->
+    case eunit:test([binary_to_atom(M) || M <- Modules], [verbose, {scale_timeouts, 10}]) of
+        ok -> halt(0);
+        _ -> halt(1)
     end.
