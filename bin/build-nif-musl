@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Build the Rust NIF for musl (Alpine Linux) and check that an Alpine Erlang loads it.
+# Needs Docker; builds for the architecture Docker runs on. The release workflow runs this
+# for the musl libraries it publishes. The library is left at
+# native/temporal_nif/target/musl/release/libtemporal_nif.so, apart from bin/build-nif's.
+#
+# RUST_IMAGE and ERLANG_IMAGE name the images to use, for a mirror or another version.
+# BUILD_DOCKER_ARGS adds arguments to the build's `docker run`, such as a volume holding
+# the crates for a machine whose containers have no network.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+rust_image="${RUST_IMAGE:-rust:1-alpine}"
+erlang_image="${ERLANG_IMAGE:-erlang:27-alpine}"
+
+# Rust links musl statically unless told otherwise, and cannot make a shared library that
+# way. A NIF must share the C library of the VM that loads it, so link it dynamically.
+# The image carries the C compiler that the ring and zstd crates need.
+# shellcheck disable=SC2086
+docker run --rm \
+  --volume "$root:/work" \
+  --workdir /work/native/temporal_nif \
+  --env CARGO_TARGET_DIR=/work/native/temporal_nif/target/musl \
+  --env RUSTFLAGS="-C target-feature=-crt-static" \
+  ${BUILD_DOCKER_ARGS:-} \
+  "$rust_image" \
+  sh -c "cargo build --release && chown -R $(id -u):$(id -g) target/musl"
+
+# Load it the way the package does and call a function that needs no server.
+docker run --rm \
+  --volume "$root:/work:ro" \
+  "$erlang_image" \
+  sh -c '
+    set -e
+    mkdir -p /check/priv && cd /check
+    cp /work/native/temporal_nif/target/musl/release/libtemporal_nif.so priv/
+    erlc /work/src/temporal_nif.erl
+    erl -noshell -eval "
+      Activation = temporal_nif:sample_activation(),
+      activation = element(1, Activation),
+      io:format(\"loaded by ~s~n\", [erlang:system_info(system_architecture)]),
+      halt(0)."'

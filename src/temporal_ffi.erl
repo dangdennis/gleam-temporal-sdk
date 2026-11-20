@@ -8,6 +8,8 @@
          poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/3, worker_shutdown/2, new_flag/0, raise_flag/1, flag_raised/1,
          start_workflow/3, describe_workflow/3, list_workflows/3, count_workflows/2, signal_workflow/5, query_workflow/5, cancel_workflow/3,
          terminate_workflow/4, workflow_result/3, fetch_history/3,
+         start_activity/2, activity_result/3, describe_activity/3, cancel_activity/4,
+         terminate_activity/4, list_activities/3, count_activities/2,
          send_activation/2, receive_activation/0, get_state/0, put_state/1, rescue/1,
          exit_normal/0, kill/1, replace_lone_surrogates/1]).
 
@@ -181,6 +183,27 @@ workflow_result(Conn, Id, RunId) ->
 
 fetch_history(Conn, Id, RunId) ->
     call(fun(P, R) -> temporal_nif:fetch_history(P, R, Conn, Id, RunId) end).
+
+start_activity(Conn, Request) ->
+    call(fun(P, R) -> temporal_nif:start_activity(P, R, Conn, Request) end).
+
+activity_result(Conn, Id, RunId) ->
+    call(fun(P, R) -> temporal_nif:activity_result(P, R, Conn, Id, RunId) end).
+
+describe_activity(Conn, Id, RunId) ->
+    call(fun(P, R) -> temporal_nif:describe_activity(P, R, Conn, Id, RunId) end).
+
+cancel_activity(Conn, Id, RunId, Reason) ->
+    call(fun(P, R) -> temporal_nif:cancel_activity(P, R, Conn, Id, RunId, Reason) end).
+
+terminate_activity(Conn, Id, RunId, Reason) ->
+    call(fun(P, R) -> temporal_nif:terminate_activity(P, R, Conn, Id, RunId, Reason) end).
+
+list_activities(Conn, Query, Limit) ->
+    call(fun(P, R) -> temporal_nif:list_activities(P, R, Conn, Query, Limit) end).
+
+count_activities(Conn, Query) ->
+    call(fun(P, R) -> temporal_nif:count_activities(P, R, Conn, Query) end).
 
 send_activation(Pid, Activation) ->
     Pid ! {temporal_activation, Activation},

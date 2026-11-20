@@ -168,6 +168,7 @@ pub fn activity_info() -> activity.Info {
     workflow_id: "test",
     run_id: "test",
     workflow_type: "test",
+    activity_run_id: None,
     task_queue: "test",
     attempt: 1,
     retry: None,
@@ -191,6 +192,18 @@ pub fn with_activity_type(
   activity_type: String,
 ) -> activity.Info {
   activity.Info(..info, activity_type:)
+}
+
+/// The info of a standalone activity: one a client started with no workflow around it,
+/// for code that asks `activity.is_standalone`.
+pub fn as_standalone(info: activity.Info) -> activity.Info {
+  activity.Info(
+    ..info,
+    workflow_id: "",
+    run_id: "",
+    workflow_type: "",
+    activity_run_id: Some("test"),
+  )
 }
 
 /// The info of an activity whose previous attempt last heartbeated with `details`, for

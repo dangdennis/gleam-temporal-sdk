@@ -223,5 +223,5 @@ versioning.
 
 ## Where to go next
 
-The README lists everything else: child workflows, updates, local activities, schedules,
-Nexus, encryption, middleware, metrics, and what the worker does when things go wrong.
+The README lists everything else: child workflows, updates, local activities, standalone
+activities, schedules, Nexus, encryption, middleware, metrics, and what the worker does when things go wrong.

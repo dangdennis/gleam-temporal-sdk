@@ -34,11 +34,21 @@ gleam deps download
 gleam run -m temporal/install
 ```
 
-The second command fetches a prebuilt library for Linux or macOS, on x86-64 or ARM, so no
-Rust toolchain is needed. The library lives under `build/`, so run the command again after
-`gleam clean` or after changing the version, and as a step in CI. On another platform, or to
-build from source, run `build/packages/temporal_gleam/bin/build-nif` instead, which needs
-Rust 1.88+.
+The second command fetches a prebuilt library, so no Rust toolchain is needed. The library
+lives under `build/`, so run the command again after `gleam clean` or after changing the
+version, and as a step in CI and in a Dockerfile. Libraries are published for:
+
+| System | x86-64 | ARM64 |
+|---|---|---|
+| Linux with glibc: Debian, Ubuntu, Fedora and most others | yes | yes |
+| Linux with musl: Alpine, such as the `erlang:alpine` and `hexpm/erlang` Alpine images | yes | yes |
+| macOS | yes | yes |
+
+The installer tells glibc from musl by the VM it runs in, so run it in the image the
+application will run in, not on the host. Releases up to v0.2.0 have no musl libraries.
+On another platform, or to build from source, run
+`build/packages/temporal_gleam/bin/build-nif` instead, which needs Rust 1.88+; on Alpine it
+also needs `build-base` and `RUSTFLAGS="-C target-feature=-crt-static"`.
 
 ## Example
 
@@ -107,6 +117,7 @@ The modules:
 | `temporal/workflow/operation` | Calling Nexus operations |
 | `temporal/activity` | Writing activities |
 | `temporal/client` | Starting, signalling, querying, updating and awaiting workflows |
+| `temporal/client/standalone_activity` | Running an activity from a client, with no workflow around it |
 | `temporal/worker` | Running workflows and activities |
 | `temporal/schedule` | Schedules |
 | `temporal/nexus` | Serving Nexus operations |
@@ -135,6 +146,7 @@ So is passing a bare number where a length of time is wanted: every timeout and 
 | Other workflows | Signal and request cancellation of any workflow by id from workflow code |
 | Nexus | Call operations from workflows; serve operations from a worker, answered directly or backed by a workflow |
 | Client | Start with options (memo, search attributes, id reuse and conflict policies, timeouts, retries, start delay, cron), signal-with-start, update-with-start, execute, result, signal, query, update, cancel, terminate, describe, list, count, fetch history; typed errors |
+| Standalone activities | Start an activity from a client with no workflow: options (all four timeouts, retries, id reuse and conflict policies, search attributes, start delay, headers), execute, result, describe, cancel, terminate, list, count; workers run them like any activity, and `activity.is_standalone` tells them apart |
 | Schedules | Create, describe, update, pause, unpause, trigger, backfill, delete, list; intervals with offsets, calendars, cron expressions, time zones, overlap policies |
 | Workers | Concurrency limits, the number of polls kept open, activity rate limits, workflow-only and activity-only workers, workflow and activity middleware, outbound rewriting with the workflow's context, worker deployment versioning with pinned and auto-upgrading workflows, graceful shutdown on `stop`, on SIGTERM and under a supervisor, Prometheus metrics |
 | Data | JSON and binary payloads (`json/plain`, `binary/plain`), compatible with the Temporal CLI and other SDKs; JSON object schemas that give the encoder and the decoder from one description; payload codecs, with an AES-256-GCM encryption codec included |
@@ -151,7 +163,9 @@ So is passing a bare number where a length of time is wanted: every timeout and 
 - Memo or search attributes on a schedule itself (they can be set on the workflows it
   starts)
 - Client calls to manage worker deployments: use the Temporal CLI or UI
-- Protobuf payloads, HTTP proxies, standalone activities
+- Protobuf payloads, HTTP proxies
+- Standalone activities: pausing, unpausing, resetting and changing the options of one
+  that is running, summaries, priorities, and completion callbacks
 - Enforcement of determinism: nothing stops workflow code from calling a clock or spawning a
   process. Replay tests are how such mistakes are found.
 - Waiting for SIGINT (Ctrl-C): the VM does not hand it to Erlang code. `worker.run` and
@@ -161,8 +175,9 @@ So is passing a bare number where a length of time is wanted: every timeout and 
   integer arrives there rounded. Send such values as strings.
 - A way to read back half of a UTF-16 surrogate pair: a JSON string that JavaScript cut
   through an emoji is read with U+FFFD in place of the stray half.
-- A Hex release. Prebuilt NIFs are built by the release workflow for Linux and macOS on
-  x86-64 and ARM, but only Linux x86-64 has been run.
+- A Hex release. Prebuilt NIFs are built by the release workflow for Linux (glibc and
+  musl) and macOS on x86-64 and ARM, but only Linux x86-64 has been run: with glibc by the
+  test suite, with musl by loading the library in an Alpine Erlang.
 
 ## Passed through, not tested
 
@@ -325,6 +340,44 @@ the workflow's main function. Histories are compatible either way.
 without a round trip through the server. Use it for work that takes a few seconds at most.
 A local activity is recorded only when it finishes, so if its worker dies the activity
 runs again from the start on another worker: it must be safe to repeat.
+
+## Standalone activities
+
+A client can start an activity directly, with no workflow around it. The server schedules
+it, retries it and times it out as it does for a workflow's activities; use one for a
+single durable step that needs no orchestration.
+
+```gleam
+import temporal/client/standalone_activity
+
+let options =
+  standalone_activity.options(
+    activity_id: "receipt-order-42",
+    task_queue: "mail",
+    start_to_close: duration.seconds(10),
+  )
+  |> standalone_activity.with_retry(retry.policy(maximum_attempts: 3))
+let assert Ok(message_id) =
+  standalone_activity.execute(client, send_receipt(), "ada@example.com", options)
+```
+
+`start` returns a handle instead of waiting, for `result`, `describe`, `cancel` and
+`terminate`; `handle` makes one again from an activity id. An activity that did not
+complete gives `client.ActivityFailed` with the failure of its last attempt,
+`ActivityCancelled`, `ActivityTerminated` or `ActivityTimedOut`. `list` and `count` take a
+visibility query, such as `ActivityType = "send_receipt"`.
+
+The activity is defined and registered as usual, and any worker on the task queue runs
+it; an activity-only worker is enough. In its code `activity.is_standalone(ctx)` is true,
+and `activity.info(ctx)` has an `activity_run_id` and empty `workflow_id`, `run_id` and
+`workflow_type`. Heartbeats, cancellation, retries, `is_final_attempt` and completion by
+task token work as they do under a workflow. The client's payload codec covers the
+argument, the result, failures and heartbeat details.
+
+The server must have the feature enabled: the development server of Temporal CLI 1.10
+(server 1.32) has; on a server where it is off, set the dynamic config
+`activity.enableStandalone=true`. See
+[`standalone_activities.gleam`](examples/src/examples/standalone_activities.gleam).
 
 ## Nexus
 
@@ -550,10 +603,12 @@ adjusted with `testing.with_attempt`, `testing.with_heartbeat_details` and their
 Requirements: Gleam 1.19+, Erlang/OTP 27+, Rust 1.88+. The tests also need the
 [Temporal CLI](https://docs.temporal.io/cli) and `openssl` on the `PATH`; the time-skipping
 test downloads Temporal's test server unless `TEMPORAL_TEST_SERVER` names one. A dev server
-you start yourself needs Nexus and worker deployments enabled, as in `bin/test`.
+you start yourself needs Nexus, worker deployments and standalone activities enabled, as in
+`bin/test`, and Temporal CLI 1.10 or later for the last.
 
 ```sh
 bin/build-nif   # compile the Rust NIF into priv/
+bin/build-nif-musl # with Docker: compile it for Alpine and load it in an Alpine Erlang
 bin/test        # build, start a dev server if none is running, run every test
 bin/conformance # bin/test, then replay this SDK's histories on the TypeScript SDK
 bin/examples    # run every example under examples/ and check its result
@@ -568,6 +623,7 @@ bin/codegen     # regenerate the Rust boundary types after changing bridge.gleam
 | Boundary layout | Every job, command, activity result and Nexus result crosses the Gleam–Rust boundary and arrives with each field in place. The Rust types are generated from the Gleam ones, so this mainly guards the mapping to core's messages | `test/bridge_test.gleam` |
 | Runtime unit tests | For hand-written activations, the runtime emits exactly the expected commands, in order. No server or NIF involved | `test/runtime_test.gleam` |
 | End-to-end scenarios | Each feature works against a real Temporal server | `test/integration_test.gleam`, `test/features_test.gleam`, `test/advanced_test.gleam`, `test/schedule_test.gleam` |
+| Standalone activities | Run, retried to a typed failure, heartbeating, described, cancelled, terminated, timed out, listed, encrypted; and exchanged with the TypeScript SDK's client and worker in both directions | `test/standalone_activity_test.gleam` |
 | Replay on every task | Every workflow scenario also runs with the workflow cache disabled, so each workflow task replays the run from the start; core fails the task on any divergence | same files |
 | History replay | Each finished run's history is replayed through `replayer`; reordered code is rejected as non-deterministic | same files |
 | Randomized programs | Random programs of timers, activities, fan-outs, races, deadlines, scope cancellations, random draws and child workflows must match a pure model and replay cleanly | `test/property_test.gleam` |

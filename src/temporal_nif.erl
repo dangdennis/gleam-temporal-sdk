@@ -10,7 +10,10 @@
          worker_complete_workflow/4, worker_poll_activity/3, worker_complete_activity/5,
          worker_heartbeat/3, worker_shutdown/4, start_workflow/5, signal_workflow/7,
          query_workflow/7, cancel_workflow/5, terminate_workflow/6, workflow_result/5,
-         fetch_history/5]).
+         fetch_history/5, start_activity/4, activity_result/5, describe_activity/5,
+         cancel_activity/6, terminate_activity/6, list_activities/5, count_activities/4,
+         sample_standalone_activity_task/0, debug_activity_start/1,
+         sample_activity_execution/0]).
 
 -on_load(init/0).
 
@@ -77,5 +80,15 @@ sample_stored_schedule() -> not_loaded().
 debug_schedule_update(_, _, _) -> not_loaded().
 update_with_start(_, _, _, _, _, _) -> not_loaded().
 complete_activity_async(_, _, _, _, _) -> not_loaded().
+start_activity(_, _, _, _) -> not_loaded().
+activity_result(_, _, _, _, _) -> not_loaded().
+describe_activity(_, _, _, _, _) -> not_loaded().
+cancel_activity(_, _, _, _, _, _) -> not_loaded().
+terminate_activity(_, _, _, _, _, _) -> not_loaded().
+list_activities(_, _, _, _, _) -> not_loaded().
+count_activities(_, _, _, _) -> not_loaded().
+sample_standalone_activity_task() -> not_loaded().
+debug_activity_start(_) -> not_loaded().
+sample_activity_execution() -> not_loaded().
 start_metrics(_) -> not_loaded().
 set_core_log_level(_) -> not_loaded().

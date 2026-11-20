@@ -1,4 +1,5 @@
-//// Connect to a Temporal service and start, signal, query and await workflows.
+//// Connect to a Temporal service and start, signal, query and await workflows. To run an
+//// activity with no workflow around it, see `temporal/client/standalone_activity`.
 ////
 //// ```gleam
 //// let assert Ok(client) = client.connect(client.local())
@@ -139,10 +140,10 @@ pub type StartOptions {
 pub type Error {
   /// The service could not be reached, or refused the connection.
   ConnectionFailed(message: String)
-  /// No such workflow, run or schedule.
+  /// No such workflow, run, schedule or standalone activity.
   NotFound(message: String)
-  /// A workflow with this id is running or may not be started again, or a schedule with
-  /// this id exists.
+  /// A workflow or standalone activity with this id is running or may not be started
+  /// again, or a schedule with this id exists.
   AlreadyExists(message: String)
   /// The workflow returned a failure.
   WorkflowFailed(failure: Failure)
@@ -154,6 +155,15 @@ pub type Error {
   WorkflowTimedOut
   /// The workflow rejected the update, or accepted it and then failed it.
   UpdateFailed(failure: Failure)
+  /// A standalone activity failed and its retry policy allowed no further attempt.
+  ActivityFailed(failure: Failure)
+  /// A standalone activity accepted a request to cancel, or was cancelled before a
+  /// worker picked it up.
+  ActivityCancelled
+  /// A standalone activity was terminated from outside.
+  ActivityTerminated
+  /// One of a standalone activity's timeouts passed and no further attempt was allowed.
+  ActivityTimedOut
   /// The workflow rejected a query, or the query handler failed.
   QueryFailed(message: String)
   /// The server's answer could not be decoded with the codec given.

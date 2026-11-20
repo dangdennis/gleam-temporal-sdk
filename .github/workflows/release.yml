@@ -38,28 +38,46 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            built: libtemporal_nif.so
+            built: release/libtemporal_nif.so
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            built: libtemporal_nif.so
+            built: release/libtemporal_nif.so
           - os: macos-15
             target: aarch64-apple-darwin
-            built: libtemporal_nif.dylib
+            built: release/libtemporal_nif.dylib
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            built: libtemporal_nif.dylib
+            built: release/libtemporal_nif.dylib
+          # For Alpine. Built in an Alpine container by bin/build-nif-musl, which also
+          # checks that an Alpine Erlang loads the result. The container is started by
+          # the script rather than by `container:`, whose actions do not run on ARM
+          # Alpine, so checkout and the upload stay on the runner.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            built: musl/release/libtemporal_nif.so
+            musl: true
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            built: musl/release/libtemporal_nif.so
+            musl: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.musl }}
       - uses: Swatinem/rust-cache@v2
+        if: ${{ !matrix.musl }}
         with:
           workspaces: native/temporal_nif
       - name: Build
+        if: ${{ !matrix.musl }}
         run: cargo build --release --manifest-path native/temporal_nif/Cargo.toml
+      - name: Build and load in Alpine
+        if: ${{ matrix.musl }}
+        run: bin/build-nif-musl
       - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp "native/temporal_nif/target/release/${{ matrix.built }}" "libtemporal_nif-${{ matrix.target }}.so"
+          cp "native/temporal_nif/target/${{ matrix.built }}" "libtemporal_nif-${{ matrix.target }}.so"
           gh release upload "${{ needs.release.outputs.tag }}" "libtemporal_nif-${{ matrix.target }}.so" --clobber

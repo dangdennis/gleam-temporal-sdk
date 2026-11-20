@@ -419,6 +419,7 @@ pub fn to_activity_task(t: ActivityTask) -> bridge::ActivityTask {
                 is_local: s.is_local,
                 headers: s.header_fields,
                 retry: s.retry_policy.map(to_retry_policy),
+                activity_run_id: s.run_id,
             }
         }
         Some(activity_task::Variant::Cancel(c)) => bridge::ActivityTask::ActivityCancel {

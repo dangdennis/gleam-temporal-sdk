@@ -33,6 +33,7 @@ once, because they share localhost:7233.
 | `bin/examples` | Runs every example and checks its result | After any change to the public API, `examples/` or the skill |
 | `bin/load` | Thousands of workflows while workers are killed | After changes to workers, pollers or process handling |
 | `bin/codegen` | Regenerates `native/temporal_nif/src/bridge.rs` | After changing a type in `bridge.gleam` |
+| `bin/build-nif-musl` | Compiles the NIF for musl in an Alpine container and loads it in an Alpine Erlang. Needs Docker | After changing how the NIF is built or loaded; the release workflow runs it |
 
 CI also checks `gleam format` (here and in `examples/`), `cargo fmt` and `cargo clippy`.
 
@@ -65,4 +66,7 @@ CI also checks `gleam format` (here and in `examples/`), `cargo fmt` and `cargo 
 - **Releasing.** Set the version in `gleam.toml`, run `gleam deps update temporal_gleam`
   in `examples/` so its lock file follows, and update the `ref = "v..."` lines in the
   docs. Once CI is green, run the Release workflow: it tags the version and attaches the
-  native libraries that `gleam run -m temporal/install` downloads.
+  native libraries that `gleam run -m temporal/install` downloads, one per target:
+  `x86_64` and `aarch64` for each of `unknown-linux-gnu`, `unknown-linux-musl` and
+  `apple-darwin`. A new target needs an entry in the workflow's matrix and a case in
+  `install.target`, with its architecture strings in `test/install_test.gleam`.

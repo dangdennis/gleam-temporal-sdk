@@ -237,6 +237,7 @@ pub type ActivityTask {
     task_token: BitArray,
     activity_type: String,
     activity_id: String,
+    /// Empty, like `run_id` and `workflow_type`, for a standalone activity.
     workflow_id: String,
     run_id: String,
     input: List(Payload),
@@ -250,6 +251,9 @@ pub type ActivityTask {
     headers: Dict(String, Payload),
     /// The policy the server retries the activity with.
     retry: Option(RetryPolicy),
+    /// The run of a standalone activity: one a client started without a workflow. Empty
+    /// for an activity a workflow scheduled.
+    activity_run_id: String,
   )
   ActivityCancel(task_token: BitArray, reason: Int)
 }
@@ -793,6 +797,122 @@ pub fn list_workflows(
 
 @external(erlang, "temporal_ffi", "count_workflows")
 pub fn count_workflows(
+  connection: Connection,
+  query: String,
+) -> Result(Int, RpcError)
+
+// ---- standalone activities ----
+
+pub type ActivityStartRequest {
+  ActivityStartRequest(
+    activity_id: String,
+    activity_type: String,
+    task_queue: String,
+    input: List(Payload),
+    schedule_to_close_ms: Option(Int),
+    schedule_to_start_ms: Option(Int),
+    start_to_close_ms: Option(Int),
+    heartbeat_timeout_ms: Option(Int),
+    retry: Option(RetryPolicy),
+    /// The API's `ActivityIdReusePolicy` value.
+    id_reuse_policy: Int,
+    /// The API's `ActivityIdConflictPolicy` value.
+    id_conflict_policy: Int,
+    search_attributes: Dict(String, Payload),
+    start_delay_ms: Option(Int),
+    headers: Dict(String, Payload),
+  )
+}
+
+/// How a standalone activity ended. A cancellation, termination or timeout is a failure
+/// of that kind.
+pub type ActivityOutcome {
+  ActivitySucceeded(result: List(Payload))
+  ActivityEnded(failure: Failure)
+}
+
+/// The server's description of a standalone activity.
+pub type ActivityExecution {
+  ActivityExecution(
+    activity_id: String,
+    run_id: String,
+    activity_type: String,
+    task_queue: String,
+    /// The API's `ActivityExecutionStatus` value.
+    status: Int,
+    /// The API's `PendingActivityState` value; 0 once the activity has closed.
+    run_state: Int,
+    attempt: Int,
+    schedule_time_ms: Int,
+    close_time_ms: Option(Int),
+    last_failure: Option(Failure),
+    heartbeat_details: List(Payload),
+    last_worker_identity: String,
+    search_attributes: Dict(String, Payload),
+  )
+}
+
+/// A standalone activity as a list shows it.
+pub type ActivitySummary {
+  ActivitySummary(
+    activity_id: String,
+    run_id: String,
+    activity_type: String,
+    task_queue: String,
+    status: Int,
+    schedule_time_ms: Int,
+    close_time_ms: Option(Int),
+    search_attributes: Dict(String, Payload),
+  )
+}
+
+/// Start a standalone activity and return its run id.
+@external(erlang, "temporal_ffi", "start_activity")
+pub fn start_activity(
+  connection: Connection,
+  request: ActivityStartRequest,
+) -> Result(String, RpcError)
+
+/// Wait for a standalone activity to close. An empty `run_id` means the latest run.
+@external(erlang, "temporal_ffi", "activity_result")
+pub fn activity_result(
+  connection: Connection,
+  activity_id: String,
+  run_id: String,
+) -> Result(ActivityOutcome, RpcError)
+
+@external(erlang, "temporal_ffi", "describe_activity")
+pub fn describe_activity(
+  connection: Connection,
+  activity_id: String,
+  run_id: String,
+) -> Result(ActivityExecution, RpcError)
+
+@external(erlang, "temporal_ffi", "cancel_activity")
+pub fn cancel_activity(
+  connection: Connection,
+  activity_id: String,
+  run_id: String,
+  reason: String,
+) -> Result(Nil, RpcError)
+
+@external(erlang, "temporal_ffi", "terminate_activity")
+pub fn terminate_activity(
+  connection: Connection,
+  activity_id: String,
+  run_id: String,
+  reason: String,
+) -> Result(Nil, RpcError)
+
+@external(erlang, "temporal_ffi", "list_activities")
+pub fn list_activities(
+  connection: Connection,
+  query: String,
+  limit: Int,
+) -> Result(List(ActivitySummary), RpcError)
+
+@external(erlang, "temporal_ffi", "count_activities")
+pub fn count_activities(
   connection: Connection,
   query: String,
 ) -> Result(Int, RpcError)

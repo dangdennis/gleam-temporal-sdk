@@ -146,6 +146,18 @@ pub fn an_activity_can_be_tested_without_a_server_test() {
   assert testing.heartbeat_count(env) == 0
 }
 
+pub fn an_activity_context_can_be_that_of_a_standalone_activity_test() {
+  let standalone = fn(info) {
+    testing.activity_env(info)
+    |> testing.activity_context
+    |> activity.is_standalone
+  }
+  assert !standalone(testing.activity_info())
+  let info = testing.activity_info() |> testing.as_standalone
+  assert standalone(info)
+  assert info.workflow_id == "" && info.run_id == "" && info.workflow_type == ""
+}
+
 pub fn the_final_attempt_is_the_one_the_retry_policy_ends_on_test() {
   let on_attempt = fn(attempt, retry) {
     activity.Info(..testing.activity_info(), attempt:, retry:)

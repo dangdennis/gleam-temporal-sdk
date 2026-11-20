@@ -22,6 +22,7 @@ import examples/saga
 import examples/schedules
 import examples/search_attributes
 import examples/signals
+import examples/standalone_activities
 import examples/testing as testing_example
 import examples/timers
 import examples/updates
@@ -149,6 +150,13 @@ pub fn local_activities_test() {
 pub fn heartbeats_test() {
   assert heartbeats.run(local_client())
     == Ok("10 rows, the last attempt resumed from row 5; feed stopped")
+}
+
+pub fn standalone_activities_test() {
+  assert standalone_activities.run(local_client())
+    == Ok(
+      "sent to ada@example.com on attempt 2; receipt is Completed after 2 attempts; feed was Running, then cancelled",
+    )
 }
 
 pub fn async_completion_test() {

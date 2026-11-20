@@ -162,6 +162,114 @@ pub fn an_activity_task_arrives_as_the_gleam_type_describes_it_test() {
           non_retryable_error_types: ["Fatal"],
         ),
       ),
+      activity_run_id: "activity-run-id",
+    )
+}
+
+@external(erlang, "temporal_nif", "sample_standalone_activity_task")
+fn sample_standalone_activity_task() -> bridge.ActivityTask
+
+@external(erlang, "temporal_nif", "debug_activity_start")
+fn debug_activity_start(
+  request: bridge.ActivityStartRequest,
+) -> Result(String, String)
+
+@external(erlang, "temporal_nif", "sample_activity_execution")
+fn sample_activity_execution() -> bridge.ActivityExecution
+
+/// What core makes of the server's task for an activity that no workflow scheduled.
+pub fn a_standalone_activity_task_names_its_own_run_and_no_workflow_test() {
+  assert sample_standalone_activity_task()
+    == bridge.ActivityStart(
+      task_token: <<"token":utf8>>,
+      activity_type: "activity-type",
+      activity_id: "activity-id",
+      workflow_id: "",
+      run_id: "",
+      input: [payload("1")],
+      attempt: 2,
+      heartbeat_details: [],
+      workflow_type: "",
+      start_to_close_ms: Some(6000),
+      heartbeat_timeout_ms: None,
+      scheduled_time_ms: 4321,
+      is_local: False,
+      headers: dict.new(),
+      retry: Some(
+        bridge.RetryPolicy(
+          initial_interval_ms: 1000,
+          backoff_coefficient: 2.0,
+          maximum_interval_ms: Some(9000),
+          maximum_attempts: 2,
+          non_retryable_error_types: [],
+        ),
+      ),
+      activity_run_id: "activity-run-id",
+    )
+}
+
+pub fn a_standalone_activity_start_request_crosses_whole_test() {
+  let request =
+    bridge.ActivityStartRequest(
+      activity_id: "the-activity-id",
+      activity_type: "the-activity-type",
+      task_queue: "the-queue",
+      input: [payload("41")],
+      schedule_to_close_ms: Some(1001),
+      schedule_to_start_ms: Some(2002),
+      start_to_close_ms: Some(3003),
+      heartbeat_timeout_ms: Some(4004),
+      retry: Some(retry()),
+      id_reuse_policy: 3,
+      id_conflict_policy: 2,
+      search_attributes: dict.from_list([#("TheAttribute", payload("42"))]),
+      start_delay_ms: Some(5005),
+      headers: dict.from_list([#("the-header", payload("43"))]),
+    )
+  let assert Ok(seen) = debug_activity_start(request)
+  list.each(
+    [
+      "activity_id: \"the-activity-id\"", "name: \"the-activity-type\"",
+      "name: \"the-queue\"",
+      "schedule_to_close_timeout: Some(Duration { seconds: 1, nanos: 1000000 })",
+      "schedule_to_start_timeout: Some(Duration { seconds: 2, nanos: 2000000 })",
+      "start_to_close_timeout: Some(Duration { seconds: 3, nanos: 3000000 })",
+      "heartbeat_timeout: Some(Duration { seconds: 4, nanos: 4000000 })",
+      "maximum_attempts: 6", "id_reuse_policy: RejectDuplicate",
+      "id_conflict_policy: UseExisting", "TheAttribute", "the-header",
+      "start_delay: Some(Duration { seconds: 5, nanos: 5000000 })",
+    ],
+    fn(expected) {
+      assert string.contains(seen, expected) as expected
+    },
+  )
+
+  // A value the request cannot carry is refused, not truncated.
+  let assert Error(_) =
+    debug_activity_start(
+      bridge.ActivityStartRequest(..request, start_to_close_ms: Some(-1)),
+    )
+}
+
+pub fn a_standalone_activity_description_arrives_as_the_gleam_type_describes_it_test() {
+  let assert bridge.ActivityExecution(last_failure: Some(last_failure), ..) as seen =
+    sample_activity_execution()
+  assert last_failure.message == "boom"
+  assert bridge.ActivityExecution(..seen, last_failure: None)
+    == bridge.ActivityExecution(
+      activity_id: "activity-id",
+      run_id: "run-id",
+      activity_type: "activity-type",
+      task_queue: "queue",
+      status: 1,
+      run_state: 2,
+      attempt: 2,
+      schedule_time_ms: 4321,
+      close_time_ms: Some(8765),
+      last_failure: None,
+      heartbeat_details: [payload("1")],
+      last_worker_identity: "worker",
+      search_attributes: dict.from_list([#("Key", payload("2"))]),
     )
 }
 

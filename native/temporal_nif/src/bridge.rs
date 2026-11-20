@@ -1175,6 +1175,7 @@ pub enum ActivityTask {
         is_local: bool,
         headers: HashMap<String, Payload>,
         retry: Option<RetryPolicy>,
+        activity_run_id: String,
     },
     ActivityCancel {
         task_token: Bytes,
@@ -1201,6 +1202,7 @@ impl Wire for ActivityTask {
                 is_local,
                 headers,
                 retry,
+                activity_run_id,
             } => record(
                 env,
                 "activity_start",
@@ -1220,6 +1222,7 @@ impl Wire for ActivityTask {
                     is_local.to_term(env),
                     headers.to_term(env),
                     retry.to_term(env),
+                    activity_run_id.to_term(env),
                 ],
             ),
             Self::ActivityCancel { task_token, reason } => record(
@@ -1233,7 +1236,7 @@ impl Wire for ActivityTask {
     fn from_term(term: Term) -> DecodeResult<Self> {
         let (tag, f) = untag(term)?;
         match (tag.as_str(), f.len()) {
-            ("activity_start", 15) => Ok(Self::ActivityStart {
+            ("activity_start", 16) => Ok(Self::ActivityStart {
                 task_token: at(&f, 0, "ActivityStart.task_token")?,
                 activity_type: at(&f, 1, "ActivityStart.activity_type")?,
                 activity_id: at(&f, 2, "ActivityStart.activity_id")?,
@@ -1249,6 +1252,7 @@ impl Wire for ActivityTask {
                 is_local: at(&f, 12, "ActivityStart.is_local")?,
                 headers: at(&f, 13, "ActivityStart.headers")?,
                 retry: at(&f, 14, "ActivityStart.retry")?,
+                activity_run_id: at(&f, 15, "ActivityStart.activity_run_id")?,
             }),
             ("activity_cancel", 2) => Ok(Self::ActivityCancel {
                 task_token: at(&f, 0, "ActivityCancel.task_token")?,
@@ -2271,6 +2275,215 @@ impl Wire for LogLevel {
             ("warning", 0) => Ok(Self::Warning),
             ("error", 0) => Ok(Self::Error),
             (tag, count) => Err(unexpected("LogLevel", tag, count)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivityStartRequest {
+    pub activity_id: String,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub input: Vec<Payload>,
+    pub schedule_to_close_ms: Option<i64>,
+    pub schedule_to_start_ms: Option<i64>,
+    pub start_to_close_ms: Option<i64>,
+    pub heartbeat_timeout_ms: Option<i64>,
+    pub retry: Option<RetryPolicy>,
+    pub id_reuse_policy: i64,
+    pub id_conflict_policy: i64,
+    pub search_attributes: HashMap<String, Payload>,
+    pub start_delay_ms: Option<i64>,
+    pub headers: HashMap<String, Payload>,
+}
+
+impl Wire for ActivityStartRequest {
+    fn to_term<'a>(&self, env: Env<'a>) -> Term<'a> {
+        record(
+            env,
+            "activity_start_request",
+            &[
+                self.activity_id.to_term(env),
+                self.activity_type.to_term(env),
+                self.task_queue.to_term(env),
+                self.input.to_term(env),
+                self.schedule_to_close_ms.to_term(env),
+                self.schedule_to_start_ms.to_term(env),
+                self.start_to_close_ms.to_term(env),
+                self.heartbeat_timeout_ms.to_term(env),
+                self.retry.to_term(env),
+                self.id_reuse_policy.to_term(env),
+                self.id_conflict_policy.to_term(env),
+                self.search_attributes.to_term(env),
+                self.start_delay_ms.to_term(env),
+                self.headers.to_term(env),
+            ],
+        )
+    }
+
+    fn from_term(term: Term) -> DecodeResult<Self> {
+        let (tag, f) = untag(term)?;
+        match (tag.as_str(), f.len()) {
+            ("activity_start_request", 14) => Ok(Self {
+                activity_id: at(&f, 0, "ActivityStartRequest.activity_id")?,
+                activity_type: at(&f, 1, "ActivityStartRequest.activity_type")?,
+                task_queue: at(&f, 2, "ActivityStartRequest.task_queue")?,
+                input: at(&f, 3, "ActivityStartRequest.input")?,
+                schedule_to_close_ms: at(&f, 4, "ActivityStartRequest.schedule_to_close_ms")?,
+                schedule_to_start_ms: at(&f, 5, "ActivityStartRequest.schedule_to_start_ms")?,
+                start_to_close_ms: at(&f, 6, "ActivityStartRequest.start_to_close_ms")?,
+                heartbeat_timeout_ms: at(&f, 7, "ActivityStartRequest.heartbeat_timeout_ms")?,
+                retry: at(&f, 8, "ActivityStartRequest.retry")?,
+                id_reuse_policy: at(&f, 9, "ActivityStartRequest.id_reuse_policy")?,
+                id_conflict_policy: at(&f, 10, "ActivityStartRequest.id_conflict_policy")?,
+                search_attributes: at(&f, 11, "ActivityStartRequest.search_attributes")?,
+                start_delay_ms: at(&f, 12, "ActivityStartRequest.start_delay_ms")?,
+                headers: at(&f, 13, "ActivityStartRequest.headers")?,
+            }),
+            (tag, count) => Err(unexpected("ActivityStartRequest", tag, count)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivityOutcome {
+    ActivitySucceeded { result: Vec<Payload> },
+    ActivityEnded { failure: Failure },
+}
+
+impl Wire for ActivityOutcome {
+    fn to_term<'a>(&self, env: Env<'a>) -> Term<'a> {
+        match self {
+            Self::ActivitySucceeded { result } => {
+                record(env, "activity_succeeded", &[result.to_term(env)])
+            }
+            Self::ActivityEnded { failure } => {
+                record(env, "activity_ended", &[failure.to_term(env)])
+            }
+        }
+    }
+
+    fn from_term(term: Term) -> DecodeResult<Self> {
+        let (tag, f) = untag(term)?;
+        match (tag.as_str(), f.len()) {
+            ("activity_succeeded", 1) => Ok(Self::ActivitySucceeded {
+                result: at(&f, 0, "ActivitySucceeded.result")?,
+            }),
+            ("activity_ended", 1) => Ok(Self::ActivityEnded {
+                failure: at(&f, 0, "ActivityEnded.failure")?,
+            }),
+            (tag, count) => Err(unexpected("ActivityOutcome", tag, count)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivityExecution {
+    pub activity_id: String,
+    pub run_id: String,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub status: i64,
+    pub run_state: i64,
+    pub attempt: i64,
+    pub schedule_time_ms: i64,
+    pub close_time_ms: Option<i64>,
+    pub last_failure: Option<Failure>,
+    pub heartbeat_details: Vec<Payload>,
+    pub last_worker_identity: String,
+    pub search_attributes: HashMap<String, Payload>,
+}
+
+impl Wire for ActivityExecution {
+    fn to_term<'a>(&self, env: Env<'a>) -> Term<'a> {
+        record(
+            env,
+            "activity_execution",
+            &[
+                self.activity_id.to_term(env),
+                self.run_id.to_term(env),
+                self.activity_type.to_term(env),
+                self.task_queue.to_term(env),
+                self.status.to_term(env),
+                self.run_state.to_term(env),
+                self.attempt.to_term(env),
+                self.schedule_time_ms.to_term(env),
+                self.close_time_ms.to_term(env),
+                self.last_failure.to_term(env),
+                self.heartbeat_details.to_term(env),
+                self.last_worker_identity.to_term(env),
+                self.search_attributes.to_term(env),
+            ],
+        )
+    }
+
+    fn from_term(term: Term) -> DecodeResult<Self> {
+        let (tag, f) = untag(term)?;
+        match (tag.as_str(), f.len()) {
+            ("activity_execution", 13) => Ok(Self {
+                activity_id: at(&f, 0, "ActivityExecution.activity_id")?,
+                run_id: at(&f, 1, "ActivityExecution.run_id")?,
+                activity_type: at(&f, 2, "ActivityExecution.activity_type")?,
+                task_queue: at(&f, 3, "ActivityExecution.task_queue")?,
+                status: at(&f, 4, "ActivityExecution.status")?,
+                run_state: at(&f, 5, "ActivityExecution.run_state")?,
+                attempt: at(&f, 6, "ActivityExecution.attempt")?,
+                schedule_time_ms: at(&f, 7, "ActivityExecution.schedule_time_ms")?,
+                close_time_ms: at(&f, 8, "ActivityExecution.close_time_ms")?,
+                last_failure: at(&f, 9, "ActivityExecution.last_failure")?,
+                heartbeat_details: at(&f, 10, "ActivityExecution.heartbeat_details")?,
+                last_worker_identity: at(&f, 11, "ActivityExecution.last_worker_identity")?,
+                search_attributes: at(&f, 12, "ActivityExecution.search_attributes")?,
+            }),
+            (tag, count) => Err(unexpected("ActivityExecution", tag, count)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivitySummary {
+    pub activity_id: String,
+    pub run_id: String,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub status: i64,
+    pub schedule_time_ms: i64,
+    pub close_time_ms: Option<i64>,
+    pub search_attributes: HashMap<String, Payload>,
+}
+
+impl Wire for ActivitySummary {
+    fn to_term<'a>(&self, env: Env<'a>) -> Term<'a> {
+        record(
+            env,
+            "activity_summary",
+            &[
+                self.activity_id.to_term(env),
+                self.run_id.to_term(env),
+                self.activity_type.to_term(env),
+                self.task_queue.to_term(env),
+                self.status.to_term(env),
+                self.schedule_time_ms.to_term(env),
+                self.close_time_ms.to_term(env),
+                self.search_attributes.to_term(env),
+            ],
+        )
+    }
+
+    fn from_term(term: Term) -> DecodeResult<Self> {
+        let (tag, f) = untag(term)?;
+        match (tag.as_str(), f.len()) {
+            ("activity_summary", 8) => Ok(Self {
+                activity_id: at(&f, 0, "ActivitySummary.activity_id")?,
+                run_id: at(&f, 1, "ActivitySummary.run_id")?,
+                activity_type: at(&f, 2, "ActivitySummary.activity_type")?,
+                task_queue: at(&f, 3, "ActivitySummary.task_queue")?,
+                status: at(&f, 4, "ActivitySummary.status")?,
+                schedule_time_ms: at(&f, 5, "ActivitySummary.schedule_time_ms")?,
+                close_time_ms: at(&f, 6, "ActivitySummary.close_time_ms")?,
+                search_attributes: at(&f, 7, "ActivitySummary.search_attributes")?,
+            }),
+            (tag, count) => Err(unexpected("ActivitySummary", tag, count)),
         }
     }
 }

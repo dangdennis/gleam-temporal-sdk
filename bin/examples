@@ -9,7 +9,8 @@ bin/build-nif
 if ! temporal operator cluster health >/dev/null 2>&1; then
   temporal server start-dev --headless --log-level error \
     --dynamic-config-value system.enableNexus=true \
-    --dynamic-config-value system.enableDeploymentVersions=true >/dev/null 2>&1 &
+    --dynamic-config-value system.enableDeploymentVersions=true \
+    --dynamic-config-value activity.enableStandalone=true >/dev/null 2>&1 &
   server=$!
   trap 'kill "$server"' EXIT
   until temporal operator cluster health >/dev/null 2>&1; do sleep 0.5; done

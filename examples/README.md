@@ -21,6 +21,7 @@ returns what happened.
 | [`local_activities.gleam`](src/examples/local_activities.gleam) | Short activities run inside the workflow's worker |
 | [`heartbeats.gleam`](src/examples/heartbeats.gleam) | Heartbeats with progress, resuming after a failed attempt, an activity that accepts cancellation |
 | [`async_completion.gleam`](src/examples/async_completion.gleam) | An activity finished later, from outside, by its task token |
+| [`standalone_activities.gleam`](src/examples/standalone_activities.gleam) | An activity started from a client with no workflow: execute, retries, describe, cancel |
 | [`schedules.gleam`](src/examples/schedules.gleam) | Creating, describing, pausing, triggering, backfilling and deleting a schedule |
 | [`data.gleam`](src/examples/data.gleam) | `temporal/schema` objects with nested and optional fields, several arguments, no arguments, a hand-written codec |
 | [`encryption.gleam`](src/examples/encryption.gleam) | The encryption payload codec, and rotating its key |
@@ -48,7 +49,9 @@ To run one and print what it returned, start a server and name the example by it
 
 ```sh
 bin/build-nif                    # once, from the repository root
-temporal server start-dev --dynamic-config-value system.enableNexus=true
+temporal server start-dev \
+  --dynamic-config-value system.enableNexus=true \
+  --dynamic-config-value activity.enableStandalone=true
 cd examples
 gleam run -- hello
 ```
@@ -66,7 +69,8 @@ The tests do the first two themselves.
 Task queues and workflow ids are fixed and start with `examples-`. Running an example again
 reuses its ids, which Temporal allows once the earlier run has closed. If a run was
 interrupted and left a workflow open, terminate it (`temporal workflow terminate
---workflow-id <id>`) or restart the development server.
+--workflow-id <id>`, or `temporal activity terminate --activity-id <id>` for a standalone
+activity) or restart the development server.
 
 ## Using them in your own project
 

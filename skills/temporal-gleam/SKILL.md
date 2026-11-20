@@ -29,6 +29,7 @@ temporal server start-dev       # a local service, from the Temporal CLI
 | `temporal/activity` | Activity definitions and code: info, heartbeats, cancellation, `is_worker_shutting_down`, logging |
 | `temporal/worker` | Running workflows and activities: `run`, `start`/`stop`, `await_shutdown_signal`, `supervised`; middleware |
 | `temporal/client` | Connect; start, execute, signal, query, update, cancel, describe, list |
+| `temporal/client/standalone_activity` | Run an activity from a client with no workflow: start, execute, result, describe, cancel, terminate, list |
 | `temporal/retry`, `temporal/failure` | Retry policies; the `Failure` type |
 | `temporal/codec`, `temporal/schema` | Codecs for values; JSON objects described once |
 | `temporal/schedule`, `temporal/nexus`, `temporal/encryption`, `temporal/telemetry`, `temporal/log` | Schedules; serving Nexus; payload encryption; metrics and the core library's log level; log fields |
@@ -252,6 +253,38 @@ killed this way is retried on another worker. `worker.stop` returns when all of 
 over. A long activity should check `is_worker_shutting_down`, heartbeat its progress
 with `activity.heartbeat_with` and return an error, so a deploy does not wait for it.
 
+**Standalone activities** run an activity from a client with no workflow around it, for
+one durable step that needs no orchestration. Same `activity.Definition`, same handler,
+any worker on the task queue. From
+[`standalone_activities.gleam`](../../examples/src/examples/standalone_activities.gleam):
+
+```gleam
+  // Start it and wait for its result. A start-to-close timeout is required.
+  let options =
+    standalone_activity.options(
+      activity_id: "examples-standalone-receipt",
+      task_queue:,
+      start_to_close: duration.seconds(10),
+    )
+    |> standalone_activity.with_retry(
+      retry.policy(maximum_attempts: 3)
+      |> retry.with_initial_interval(duration.milliseconds(100)),
+    )
+  use receipt <- result.try(standalone_activity.execute(
+    client,
+    send_receipt(),
+    "ada@example.com",
+    options,
+  ))
+```
+
+`standalone_activity.start` returns a handle for `result`, `describe`, `cancel(handle,
+reason)` and `terminate(handle, reason)`; `standalone_activity.handle(client, definition,
+activity_id)` makes one again. Errors are `client.ActivityFailed(failure)`,
+`client.ActivityCancelled`, `client.ActivityTerminated`, `client.ActivityTimedOut`. In the
+activity, `activity.is_standalone(ctx)` is true and `activity.info(ctx).workflow_id` is
+`""`. The server needs `activity.enableStandalone` (on in Temporal CLI 1.10's dev server).
+
 **Continue-as-new** is `workflow.continue_as_new(ctx, definition, input)`; the new run
 keeps the task queue, memo, search attributes, retry policy and headers. To change them
 or set timeouts: `continue_as_new.options() |> continue_as_new.with_task_queue(..)` and
@@ -270,7 +303,7 @@ for a result that is nothing. `codec.float()` reads `10`; `codec.int()` reads `1
 Integers above 2^53 lose precision in JavaScript: send them as strings.
 
 Everything else has an example: see the table in
-[`examples/README.md`](../../examples/README.md) (timers, child workflows, saga,
+[`examples/README.md`](../../examples/README.md) (timers, child workflows, saga, standalone activities,
 continue-as-new, local activities, schedules, middleware, supervised workers, other SDKs'
 activities, Nexus, encryption, Temporal Cloud).
 
@@ -369,8 +402,9 @@ replays every workflow task.
 | `replayer.Nondeterminism(..)`, or workflow tasks failing with a nondeterminism error after a deploy | The code issues different commands than the history records. Guard the change with `workflow.patched` |
 | `client.UpdateFailed` with `no handler registered for update "x"` | The workflow had not called `update.set_validator`, `update.next` or `update.receive` for it by the time it next waited |
 | Log warning `signal "x" dropped: could not decode it: ...` | The sender's value does not match the signal definition's codec |
+| `client.RequestFailed(_, "Standalone activity is disabled")` | The server has standalone activities off. Start the dev server with `--dynamic-config-value activity.enableStandalone=true`, with Temporal CLI 1.10 or later |
 | `client.AlreadyExists(..)` on start | A workflow with that id is running. Use `client.with_id_conflict_policy(client.UseExisting)` or another id |
-| Crash `temporal_library_not_loaded`: ``The Temporal native library could not be loaded. Run `gleam run -m temporal/install` to download it, or compile it with bin/build-nif in the package directory.`` | The native library is missing, typically after `gleam clean` or in CI |
+| Crash `temporal_library_not_loaded`: ``The Temporal native library could not be loaded. Run `gleam run -m temporal/install` to download it, or compile it with bin/build-nif in the package directory.`` | The native library is missing, typically after `gleam clean` or in CI; or it was installed for another C library, by running the installer on a glibc host for an Alpine (musl) image or the reverse. Run the installer inside the image that runs the application |
 | `Error(telemetry.AlreadyStarted)` | `telemetry.serve_prometheus` or `telemetry.set_core_log_level` was called after the first `client.connect`. Call them first in `main`, the log level before the metrics |
 | `client.ConnectionFailed("could not connect to http://localhost:7233 within 10s: timed out")` | The service did not answer in time: a wrong address, a firewall, or TLS on one side only. `client.with_connect_timeout` changes the wait |
 | Workflow task failure `the workflow task's completion was rejected: ...`, logged as `temporal: workflow task completion rejected, failing the task: ...` | The workflow asked for something that cannot be sent, such as a negative timeout. Fix the value; the task is retried |

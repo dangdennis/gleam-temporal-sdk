@@ -4,7 +4,7 @@ import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
-import gleam/option.{type Option, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/string
 import temporal/activity
 import temporal/codec.{type PayloadCodec}
@@ -456,6 +456,7 @@ fn run_activity(
     is_local:,
     headers:,
     retry:,
+    activity_run_id:,
   ) = task
   let ctx =
     activity.new_context(
@@ -465,6 +466,10 @@ fn run_activity(
         workflow_id:,
         run_id:,
         workflow_type:,
+        activity_run_id: case activity_run_id {
+          "" -> None
+          _ -> Some(activity_run_id)
+        },
         task_queue:,
         attempt:,
         retry: option.map(retry, retry.from_bridge),

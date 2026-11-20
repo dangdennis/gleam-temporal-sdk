@@ -42,7 +42,7 @@ fn payloads_arg<'a>(env: Env<'a>, term: Term<'a>) -> Result<Vec<Payload>, Term<'
     Vec::<Payload>::from_term(term).map_err(|e| invalid(env, format!("invalid payloads: {e}")))
 }
 
-fn unit_reply<'a>(env: Env<'a>, r: Result<(), tonic::Status>) -> Term<'a> {
+pub fn unit_reply<'a>(env: Env<'a>, r: Result<(), tonic::Status>) -> Term<'a> {
     match r {
         Ok(()) => ok(env, atoms::nil().encode(env)),
         Err(s) => rpc_err(env, &s),

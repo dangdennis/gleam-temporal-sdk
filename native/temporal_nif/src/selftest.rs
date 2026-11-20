@@ -281,8 +281,9 @@ fn sample_activity_task(env: Env) -> Term {
             heartbeat_timeout: Some(duration(700)),
             is_local: true,
             header_fields: [("trace".to_string(), payload("3"))].into(),
-            // Names a standalone activity's own run, not the workflow's.
-            run_id: "ignored".to_string(),
+            // A standalone activity's own run, not the workflow's. Core sets it on tasks
+            // that have no workflow; here it only shows which field goes where.
+            run_id: "activity-run-id".to_string(),
             retry_policy: Some(RetryPolicy {
                 initial_interval: Some(duration(1000)),
                 backoff_coefficient: 2.5,
@@ -292,6 +293,83 @@ fn sample_activity_task(env: Env) -> Term {
             }),
             ..Default::default()
         })),
+    })
+    .to_term(env)
+}
+
+/// A standalone activity's first task as core hands it over: the workflow fields empty and
+/// the activity's own run named.
+#[rustler::nif]
+fn sample_standalone_activity_task(env: Env) -> Term {
+    use temporalio_common::protos::temporal::api::workflowservice::v1::PollActivityTaskQueueResponse;
+    to_activity_task(ActivityTask::start_from_poll_resp(
+        PollActivityTaskQueueResponse {
+            task_token: b"token".to_vec(),
+            activity_id: "activity-id".to_string(),
+            activity_type: Some(ActivityType {
+                name: "activity-type".to_string(),
+            }),
+            activity_run_id: "activity-run-id".to_string(),
+            input: Some(Payloads {
+                payloads: vec![payload("1")],
+            }),
+            scheduled_time: Some(timestamp(4321)),
+            attempt: 2,
+            start_to_close_timeout: Some(duration(6000)),
+            retry_policy: Some(RetryPolicy {
+                initial_interval: Some(duration(1000)),
+                backoff_coefficient: 2.0,
+                maximum_interval: Some(duration(9000)),
+                maximum_attempts: 2,
+                non_retryable_error_types: vec![],
+            }),
+            ..Default::default()
+        },
+    ))
+    .to_term(env)
+}
+
+/// The request a `bridge.ActivityStartRequest` becomes, printed.
+#[rustler::nif]
+fn debug_activity_start<'a>(env: Env<'a>, request: Term<'a>) -> Term<'a> {
+    match bridge::ActivityStartRequest::from_term(request).and_then(crate::activity::start_request)
+    {
+        Ok(request) => ok(env, format!("{request:?}").encode(env)),
+        Err(e) => err(env, e),
+    }
+}
+
+/// The description of a standalone activity that failed once, as Gleam is shown it.
+#[rustler::nif]
+fn sample_activity_execution(env: Env) -> Term {
+    use temporalio_common::protos::temporal::api::{
+        activity::v1::ActivityExecutionInfo, common::v1::SearchAttributes,
+        workflowservice::v1::DescribeActivityExecutionResponse,
+    };
+    crate::activity::to_execution(DescribeActivityExecutionResponse {
+        run_id: "run-id".to_string(),
+        info: Some(ActivityExecutionInfo {
+            activity_id: "activity-id".to_string(),
+            activity_type: Some(ActivityType {
+                name: "activity-type".to_string(),
+            }),
+            status: 1,
+            run_state: 2,
+            task_queue: "queue".to_string(),
+            attempt: 2,
+            schedule_time: Some(timestamp(4321)),
+            close_time: Some(timestamp(8765)),
+            last_failure: Some(failure("boom")),
+            heartbeat_details: Some(Payloads {
+                payloads: vec![payload("1")],
+            }),
+            last_worker_identity: "worker".to_string(),
+            search_attributes: Some(SearchAttributes {
+                indexed_fields: [("Key".to_string(), payload("2"))].into(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
     })
     .to_term(env)
 }

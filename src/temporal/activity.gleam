@@ -35,40 +35,53 @@ pub type Definition(input, output) {
 }
 
 /// What the worker knows about the task an activity is running for.
+///
+/// An activity is usually scheduled by a workflow, but a client can also start one on
+/// its own: a standalone activity, see `temporal/client/standalone_activity`. For one of
+/// those there is no workflow: `workflow_id`, `run_id` and `workflow_type` are empty and
+/// `activity_run_id` is set. Ask with `is_standalone` rather than testing for `""`.
 pub type Info {
   Info(
     activity_id: String,
     activity_type: String,
+    /// The workflow that scheduled the activity. Empty for a standalone activity.
     workflow_id: String,
+    /// The workflow's run. Empty for a standalone activity.
     run_id: String,
+    /// Empty for a standalone activity.
     workflow_type: String,
+    /// The activity's own run, for a standalone activity. `None` when a workflow
+    /// scheduled it.
+    activity_run_id: Option(String),
     /// The queue the worker running the activity polls.
     task_queue: String,
     /// Starts at 1 and grows with each retry.
     attempt: Int,
-    /// The policy the server retries the activity with: the workflow's, with the server's
-    /// defaults and limits applied. `None` if the task did not carry one.
+    /// The policy the server retries the activity with: the one it was started with, with
+    /// the server's defaults and limits applied. `None` if the task did not carry one.
     retry: Option(retry.Policy),
     /// What the previous attempt last passed to `heartbeat_with`.
     heartbeat_details: List(Payload),
     /// Longest this attempt may run.
     start_to_close: Option(Duration),
-    /// The longest gap between heartbeats the workflow allows.
+    /// The longest gap between heartbeats the activity was started with.
     heartbeat_timeout: Option(Duration),
     /// When the activity was first scheduled.
     scheduled_time: Timestamp,
     /// Whether the workflow started this as a local activity.
     is_local: Bool,
-    /// Context, such as a trace id, that the workflow passed beside the arguments.
+    /// Context, such as a trace id, that the workflow or client passed beside the
+    /// arguments.
     headers: Dict(String, Payload),
   )
 }
 
 /// Why the server or the worker wants an activity to stop.
 pub type CancelReason {
-  /// The workflow, or its cancellation scope, cancelled the activity.
+  /// The workflow, its cancellation scope, or a client cancelled the activity.
   CancelRequested
-  /// The activity no longer exists on the server, usually because its workflow closed.
+  /// The activity no longer exists on the server, usually because its workflow closed or,
+  /// for a standalone activity, it was terminated.
   NotFound
   /// A timeout passed. Whatever the activity returns now is ignored.
   TimedOut
@@ -157,13 +170,20 @@ pub fn info(ctx: Context) -> Info {
   ctx.info
 }
 
+/// Whether a client started the activity on its own, with no workflow around it. The
+/// workflow fields of `info` are then empty. Everything else an activity can do works
+/// the same: heartbeats, cancellation, retries and `complete_later`.
+pub fn is_standalone(ctx: Context) -> Bool {
+  option.is_some(ctx.info.activity_run_id)
+}
+
 /// Whether the retry policy allows no attempt after this one, for an activity that must
 /// clean up or report before it fails for good. `False` when the policy has no limit on
 /// attempts, or the task carried no policy.
 ///
 /// It only compares the attempt number with the policy's maximum. Retries can end sooner
 /// for other reasons: the schedule-to-close timeout passes, the failure is non-retryable,
-/// or the workflow cancels the activity or closes.
+/// the activity is cancelled, or its workflow closes.
 pub fn is_final_attempt(ctx: Context) -> Bool {
   case ctx.info.retry {
     Some(policy) ->
@@ -181,22 +201,34 @@ fn log(
   fields: List(log.Field),
 ) -> Nil {
   let info = ctx.info
+  // A standalone activity has a run of its own and no workflow to name.
+  let owner = case info.activity_run_id {
+    Some(activity_run_id) -> [
+      #("activity_run_id", dynamic.string(activity_run_id)),
+    ]
+    None -> [
+      #("workflow_id", dynamic.string(info.workflow_id)),
+      #("run_id", dynamic.string(info.run_id)),
+    ]
+  }
   bridge.log(
     level,
     message,
-    list.append(log.metadata(fields), [
-      #("activity_id", dynamic.string(info.activity_id)),
-      #("activity_type", dynamic.string(info.activity_type)),
-      #("workflow_id", dynamic.string(info.workflow_id)),
-      #("run_id", dynamic.string(info.run_id)),
-      #("attempt", dynamic.int(info.attempt)),
+    list.flatten([
+      log.metadata(fields),
+      [
+        #("activity_id", dynamic.string(info.activity_id)),
+        #("activity_type", dynamic.string(info.activity_type)),
+      ],
+      owner,
+      [#("attempt", dynamic.int(info.attempt))],
     ]),
   )
 }
 
 /// Log through Erlang's `logger`. The activity's id and type, its workflow's id and run
-/// id, and the attempt number are attached as metadata, and so are `fields`: see
-/// `temporal/log`. Activities are not replayed, so every call logs, once per attempt.
+/// id (for a standalone activity, its own run id as `activity_run_id` instead), and the
+/// attempt number are attached as metadata, and so are `fields`: see `temporal/log`. Activities are not replayed, so every call logs, once per attempt.
 pub fn log_debug(
   ctx: Context,
   message: String,

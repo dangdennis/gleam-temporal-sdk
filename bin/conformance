@@ -6,8 +6,9 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 rm -rf build/conformance
+# Installed first: one of the tests exchanges standalone activities with the TypeScript SDK.
+(cd test/conformance/typescript && { [ -d node_modules ] || npm install --no-audit --no-fund; })
 bin/test
 cd test/conformance/typescript
-[ -d node_modules ] || npm install --no-audit --no-fund
 # Core logs the divergence the control run provokes; it is expected.
 node harness.js replay "$root/build/conformance" 2>/dev/null | sed '/WARN/d'

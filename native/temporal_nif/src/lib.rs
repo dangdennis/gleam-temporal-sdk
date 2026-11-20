@@ -8,6 +8,7 @@
 // NIF arguments are positional and mirror the Erlang call, so they cannot be grouped.
 #![allow(clippy::too_many_arguments)]
 
+mod activity;
 mod bridge;
 mod client;
 mod convert;

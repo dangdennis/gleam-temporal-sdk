@@ -28,6 +28,7 @@ import examples/saga
 import examples/schedules
 import examples/search_attributes
 import examples/signals
+import examples/standalone_activities
 import examples/testing as testing_example
 import examples/timers
 import examples/updates
@@ -70,6 +71,7 @@ fn run(name: String, client: Client) -> String {
     "local_activities" -> string.inspect(local_activities.run(client))
     "heartbeats" -> string.inspect(heartbeats.run(client))
     "async_completion" -> string.inspect(async_completion.run(client))
+    "standalone_activities" -> string.inspect(standalone_activities.run(client))
     "schedules" -> string.inspect(schedules.run(client))
     "data" -> string.inspect(data.run(client))
     "encryption" -> {

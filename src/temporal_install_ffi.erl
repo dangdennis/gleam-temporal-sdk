@@ -2,22 +2,28 @@
 %% runs when the NIF is missing.
 -module(temporal_install_ffi).
 
--export([install/0]).
+-export([install/1, machine/0]).
 
 -define(REPOSITORY, "dangdennis/gleam-temporal-sdk").
 
-%% Fetch the library matching this machine and this package version into the package's priv
-%% directory. A tag given as the first command-line argument overrides the version.
-install() ->
+%% What temporal/install chooses the library by: the VM's architecture, the operating
+%% system's name, and whether the system is Alpine Linux.
+machine() ->
+    {_, Os} = os:type(),
+    {unicode:characters_to_binary(erlang:system_info(system_architecture)),
+     atom_to_binary(Os),
+     filelib:is_regular("/etc/alpine-release")}.
+
+%% Fetch the library built for `Target`, a Rust target name, and this package version into
+%% the package's priv directory. A tag given as the first command-line argument overrides
+%% the version.
+install(TargetBinary) ->
     Tag = tag(),
-    case {target(), os:find_executable("curl")} of
-        {{error, Machine}, _} ->
-            {error, unicode:characters_to_binary(
-                ["there is no prebuilt library for ", Machine,
-                 "; compile it with bin/build-nif in the package directory"])};
-        {_, false} ->
+    Target = binary_to_list(TargetBinary),
+    case os:find_executable("curl") of
+        false ->
             {error, <<"curl is needed to download the library and was not found">>};
-        {{ok, Target}, Curl} ->
+        Curl ->
             Priv = code:priv_dir(temporal_gleam),
             File = filename:join(Priv, "libtemporal_nif.so"),
             Partial = File ++ ".part",
@@ -33,7 +39,9 @@ install() ->
                 {_, Output} ->
                     _ = file:delete(Partial),
                     {error, unicode:characters_to_binary(
-                        ["could not download ", Url, "\n", Output])}
+                        ["could not download ", Url, "\n", Output,
+                         "If release ", Tag, " has no library for ", Target,
+                         ", compile it with bin/build-nif in the package directory"])}
             end
     end.
 
@@ -44,23 +52,6 @@ tag() ->
             _ = application:load(temporal_gleam),
             {ok, Version} = application:get_key(temporal_gleam, vsn),
             "v" ++ Version
-    end.
-
-%% The Rust target name the release files are published under.
-target() ->
-    Architecture = erlang:system_info(system_architecture),
-    Cpu = case Architecture of
-              "x86_64" ++ _ -> "x86_64";
-              "amd64" ++ _ -> "x86_64";
-              "aarch64" ++ _ -> "aarch64";
-              "arm64" ++ _ -> "aarch64";
-              _ -> unknown
-          end,
-    case {Cpu, os:type()} of
-        {unknown, _} -> {error, Architecture};
-        {_, {unix, linux}} -> {ok, Cpu ++ "-unknown-linux-gnu"};
-        {_, {unix, darwin}} -> {ok, Cpu ++ "-apple-darwin"};
-        _ -> {error, Architecture}
     end.
 
 run(Program, Args) ->
