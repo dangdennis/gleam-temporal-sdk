@@ -62,3 +62,7 @@ CI also checks `gleam format` (here and in `examples/`), `cargo fmt` and `cargo 
   `skills/temporal-gleam/SKILL.md`, `README.md` and `docs/guide.md`. The skill's snippets
   are copied verbatim from the examples and it quotes error messages from the source:
   copy again when either changes, do not retype.
+- **Releasing.** Set the version in `gleam.toml`, run `gleam deps update temporal_gleam`
+  in `examples/` so its lock file follows, and update the `ref = "v..."` lines in the
+  docs. Once CI is green, run the Release workflow: it tags the version and attaches the
+  native libraries that `gleam run -m temporal/install` downloads.
