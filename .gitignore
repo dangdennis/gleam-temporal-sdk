@@ -1,4 +1,5 @@
 /build
+/examples/build
 /native/temporal_nif/target
 /priv/*.so
 erl_crash.dump

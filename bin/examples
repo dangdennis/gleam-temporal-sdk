@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Run the examples: examples/test calls every example under examples/src/examples and checks
+# what it returns. They need a Temporal service on localhost:7233; one is started with the
+# Temporal CLI for the duration of the run unless already present.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+bin/build-nif
+if ! temporal operator cluster health >/dev/null 2>&1; then
+  temporal server start-dev --headless --log-level error \
+    --dynamic-config-value system.enableNexus=true \
+    --dynamic-config-value system.enableDeploymentVersions=true >/dev/null 2>&1 &
+  server=$!
+  trap 'kill "$server"' EXIT
+  until temporal operator cluster health >/dev/null 2>&1; do sleep 0.5; done
+fi
+cd examples
+gleam test

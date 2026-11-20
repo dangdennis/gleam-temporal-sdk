@@ -10,7 +10,7 @@ Add the package to `gleam.toml` and download its native library:
 
 ```toml
 [dependencies]
-temporal_gleam = { git = "https://github.com/dangdennis/gleam-temporal-sdk", ref = "v0.1.0" }
+temporal_gleam = { git = "https://github.com/dangdennis/gleam-temporal-sdk", ref = "v0.2.0" }
 ```
 
 ```sh

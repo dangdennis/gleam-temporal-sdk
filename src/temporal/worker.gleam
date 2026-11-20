@@ -1,6 +1,7 @@
 //// Run workflows and activities by polling a task queue.
 
 import gleam/dict.{type Dict}
+import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -299,6 +300,9 @@ const restart_window_ms = 60_000
 @external(erlang, "temporal_ffi", "system_time_ms")
 fn now_ms() -> Int
 
+@external(erlang, "erlang", "exit")
+fn exit(reason: Dynamic) -> Nil
+
 fn manage(
   config: Config,
   parent: Pid,
@@ -358,7 +362,15 @@ fn supervise(
     Exited(process.ExitMessage(pid, reason)) ->
       case dict.get(manager.loops, pid), reason {
         // The process that started the worker, or its supervisor, is going away.
-        Error(Nil), _ if pid == parent -> bridge.worker_shutdown(manager.nif)
+        Error(Nil), _ if pid == parent -> {
+          bridge.worker_shutdown(manager.nif)
+          // A supervisor that asks its child to shut down expects it to leave with the
+          // reason it was asked with, and reports anything else as an error.
+          case reason {
+            process.Abnormal(asked) -> exit(asked)
+            _ -> Nil
+          }
+        }
         // Something else that was linked to this process.
         Error(Nil), _ -> supervise(manager, parent, events)
         // A loop ends normally only when the worker is shutting down.

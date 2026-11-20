@@ -34,7 +34,7 @@ jobs:
 
       - name: Check formatting
         run: |
-          gleam format --check src test codegen/src
+          gleam format --check src test codegen/src examples/src examples/test
           cargo fmt --check --manifest-path native/temporal_nif/Cargo.toml
 
       # The Rust boundary types are generated from the Gleam ones and committed.
@@ -50,6 +50,10 @@ jobs:
       # histories on the TypeScript SDK.
       - name: Test and check conformance
         run: bin/conformance
+
+      # Every example under examples/ runs against a dev server and has its result checked.
+      - name: Run the examples
+        run: bin/examples
 
       - name: Load test
         run: LOAD_WORKFLOWS=500 bin/load

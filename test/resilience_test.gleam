@@ -1,6 +1,7 @@
 //// What happens when parts of a worker die: a polling loop, a workflow run's process, an
 //// activity that will not stop, the worker itself under a supervisor.
 
+import gleam/erlang/atom
 import gleam/erlang/process.{type Pid}
 import gleam/list
 import gleam/option.{Some}
@@ -201,6 +202,32 @@ pub fn a_supervisor_restarts_a_worker_that_dies_test() {
   let assert Ok(Nil) = client.signal(handle, nudge(), Nil)
   assert client.result(handle) == Ok(42)
   shut_down(supervisor)
+}
+
+pub fn a_supervisor_stops_its_worker_with_the_reason_it_asked_with_test() {
+  let task_queue = "supervised-stop-" <> unique()
+  let found = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let assert Ok(supervisor) =
+      static_supervisor.new(static_supervisor.OneForOne)
+      |> static_supervisor.add(worker.supervised(config(task_queue)))
+      |> static_supervisor.start
+    process.send(found, #(supervisor.pid, process.self()))
+    process.sleep_forever()
+  })
+  let assert Ok(#(supervisor, owner)) = process.receive(found, 10_000)
+  let assert [manager] =
+    linked(supervisor) |> list.filter(fn(pid) { pid != owner })
+  let monitor = process.monitor(manager)
+  // A supervisor stops, and stops its children, when the process that started it does.
+  shut_down(owner)
+  let down =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(down) { down })
+  let assert Ok(process.ProcessDown(reason: process.Abnormal(reason), ..)) =
+    process.selector_receive(down, 30_000)
+  // Leaving with any other reason makes the supervisor log a shutdown error.
+  assert reason == atom.to_dynamic(atom.create("shutdown"))
 }
 
 pub fn a_worker_whose_loops_keep_crashing_gives_up_test() {

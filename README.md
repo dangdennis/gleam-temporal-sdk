@@ -11,7 +11,10 @@ Status: experimental. The features under "What works" are tested against a real 
 server, apart from the options listed under "Passed through, not tested". It has not run in
 production and has had no load testing.
 
-New here? Start with the [guide](docs/guide.md).
+New here? Start with the [guide](docs/guide.md), then copy from the [examples](examples/README.md):
+one runnable module per pattern. Coding agents that use the SDK should read
+[skills/temporal-gleam/SKILL.md](skills/temporal-gleam/SKILL.md); agents and people working
+on the SDK itself, [AGENTS.md](AGENTS.md).
 
 ## Install
 
@@ -20,7 +23,7 @@ pinned to a release tag:
 
 ```toml
 [dependencies]
-temporal_gleam = { git = "https://github.com/dangdennis/gleam-temporal-sdk", ref = "v0.1.0" }
+temporal_gleam = { git = "https://github.com/dangdennis/gleam-temporal-sdk", ref = "v0.2.0" }
 ```
 
 Then download the dependencies and the native library:
@@ -448,6 +451,7 @@ you start yourself needs Nexus and worker deployments enabled, as in `bin/test`.
 bin/build-nif   # compile the Rust NIF into priv/
 bin/test        # build, start a dev server if none is running, run every test
 bin/conformance # bin/test, then replay this SDK's histories on the TypeScript SDK
+bin/examples    # run every example under examples/ and check its result
 bin/load        # thousands of workflows while workers are killed
 bin/codegen     # regenerate the Rust boundary types after changing bridge.gleam
 ```
