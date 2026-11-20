@@ -15,6 +15,7 @@ New here? Start with the [guide](docs/guide.md), then copy from the [examples](e
 one runnable module per pattern. Coding agents that use the SDK should read
 [skills/temporal-gleam/SKILL.md](skills/temporal-gleam/SKILL.md); agents and people working
 on the SDK itself, [AGENTS.md](AGENTS.md).
+The API reference is at <https://dangdennis.github.io/gleam-temporal-sdk/>.
 
 ## Install
 
