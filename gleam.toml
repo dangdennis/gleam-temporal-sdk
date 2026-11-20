@@ -1,5 +1,5 @@
 name = "temporal_gleam"
-version = "0.2.0"
+version = "0.3.0"
 description = "A Temporal SDK for Gleam on the BEAM, built on Temporal's sdk-core"
 target = "erlang"
 licences = ["MIT"]

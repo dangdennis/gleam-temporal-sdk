@@ -13,7 +13,7 @@ the linked file for the whole program.
 
 ```toml
 [dependencies]
-temporal_gleam = { git = "https://github.com/dangdennis/gleam-temporal-sdk", ref = "v0.2.0" }
+temporal_gleam = { git = "https://github.com/dangdennis/gleam-temporal-sdk", ref = "v0.3.0" }
 ```
 
 ```sh

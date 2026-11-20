@@ -6,7 +6,7 @@
 ////
 //// It picks the library published for this package version and this machine: Linux with
 //// glibc (Debian, Ubuntu and most others) or musl (Alpine), or macOS, on x86-64 or ARM.
-//// Pass a release tag, such as `v0.2.0`, to choose another version.
+//// Pass a release tag, such as `v0.3.0`, to choose another version.
 
 import gleam/io
 import gleam/result

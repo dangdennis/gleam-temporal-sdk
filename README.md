@@ -24,7 +24,7 @@ pinned to a release tag:
 
 ```toml
 [dependencies]
-temporal_gleam = { git = "https://github.com/dangdennis/gleam-temporal-sdk", ref = "v0.2.0" }
+temporal_gleam = { git = "https://github.com/dangdennis/gleam-temporal-sdk", ref = "v0.3.0" }
 ```
 
 Then download the dependencies and the native library:
@@ -45,7 +45,7 @@ version, and as a step in CI and in a Dockerfile. Libraries are published for:
 | macOS | yes | yes |
 
 The installer tells glibc from musl by the VM it runs in, so run it in the image the
-application will run in, not on the host. Releases up to v0.2.0 have no musl libraries.
+application will run in, not on the host. Releases up to v0.3.0 have no musl libraries.
 On another platform, or to build from source, run
 `build/packages/temporal_gleam/bin/build-nif` instead, which needs Rust 1.88+; on Alpine it
 also needs `build-base` and `RUSTFLAGS="-C target-feature=-crt-static"`.
