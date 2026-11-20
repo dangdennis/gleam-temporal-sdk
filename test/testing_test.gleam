@@ -63,6 +63,7 @@ fn start_server() -> testing.Env {
 }
 
 pub fn a_week_long_sleep_finishes_at_once_test() {
+  use <- support.unless_musl("a_week_long_sleep_finishes_at_once_test")
   let env = start_server()
   let task_queue = "skipping-" <> unique()
   let assert Ok(worker) =

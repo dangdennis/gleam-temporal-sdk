@@ -2,8 +2,10 @@
 
 import gleam/erlang/process
 import gleam/int
+import gleam/io
 import gleam/list
 import temporal/client.{type Client}
+import temporal/internal/bridge
 import temporal/worker
 
 /// A string that differs on every call, for ids and task queue names.
@@ -88,4 +90,14 @@ pub fn register_search_attribute() -> String {
       "temporal operator search-attribute create --name GleamTestKeyword --type Keyword 2>&1",
     )
   "GleamTestKeyword"
+}
+
+/// Run `body` unless the VM is on musl (Alpine), where Temporal's time-skipping test
+/// server has no build; say so instead, so the gap is visible in the test output.
+pub fn unless_musl(what: String, body: fn() -> Nil) -> Nil {
+  case bridge.is_musl() {
+    True ->
+      io.println("\nskipped " <> what <> ": no time-skipping server on musl")
+    False -> body()
+  }
 }

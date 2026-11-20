@@ -80,6 +80,7 @@ fn process_order_workflow(
 fn test_server_path() -> Result(String, Nil)
 
 pub fn the_guides_order_workflow_ships_or_refunds_test() {
+  use <- support.unless_musl("the_guides_order_workflow_ships_or_refunds_test")
   let assert Ok(env) = case test_server_path() {
     Ok(path) -> testing.start_time_skipping_with(executable: path)
     Error(Nil) -> testing.start_time_skipping()

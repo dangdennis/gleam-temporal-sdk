@@ -151,11 +151,12 @@ pub fn crashing_worker(task_queue: String, level: String) -> Nil {
 }
 
 /// What a node running `crashing_worker` writes to standard error in its first seconds.
+/// The node ends itself, because macOS has no `timeout` command to end it with.
 fn standard_error(level: String) -> String {
   let task_queue = "core-log-" <> level <> "-" <> unique()
   let written =
     cmd(
-      "timeout 4 erl -noshell -pa build/dev/erlang/*/ebin -eval 'tuning_test:crashing_worker(<<\""
+      "erl -noshell -pa build/dev/erlang/*/ebin -eval 'timer:apply_after(4000, erlang, halt, [0]), tuning_test:crashing_worker(<<\""
       <> task_queue
       <> "\">>, <<\""
       <> level

@@ -57,15 +57,31 @@ fn start(
 ///
 /// The server is downloaded on first use and cached in the temporary directory. It does
 /// not implement everything a real server does; visibility queries in particular.
+///
+/// Temporal publishes no build of this server for Alpine Linux (musl); there this returns
+/// an error, and tests that need it have to run elsewhere.
 pub fn start_time_skipping() -> Result(Env, client.Error) {
-  start(bridge.TimeSkipping, None)
+  start_time_skipping_server(None)
+}
+
+fn start_time_skipping_server(
+  executable: Option(String),
+) -> Result(Env, client.Error) {
+  case bridge.is_musl() {
+    True ->
+      Error(client.ConnectionFailed(
+        "the time-skipping test server has no build for Alpine Linux (musl); "
+        <> "run tests that need it on a glibc Linux or macOS",
+      ))
+    False -> start(bridge.TimeSkipping, executable)
+  }
 }
 
 /// Like `start_time_skipping`, with a `temporal-test-server` executable already on disk.
 pub fn start_time_skipping_with(
   executable executable: String,
 ) -> Result(Env, client.Error) {
-  start(bridge.TimeSkipping, Some(executable))
+  start_time_skipping_server(Some(executable))
 }
 
 /// Start a full development server on a free port, with a real clock. The Temporal CLI is

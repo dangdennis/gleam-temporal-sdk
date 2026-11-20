@@ -949,3 +949,7 @@ pub fn exit_normal() -> a
 
 @external(erlang, "temporal_ffi", "kill")
 pub fn kill(pid: Pid) -> Nil
+
+/// Whether the VM is linked against musl, as on Alpine Linux.
+@external(erlang, "temporal_ffi", "is_musl")
+pub fn is_musl() -> Bool

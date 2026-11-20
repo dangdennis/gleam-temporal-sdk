@@ -10,7 +10,7 @@
          terminate_workflow/4, workflow_result/3, fetch_history/3,
          start_activity/2, activity_result/3, describe_activity/3, cancel_activity/4,
          terminate_activity/4, list_activities/3, count_activities/2,
-         send_activation/2, receive_activation/0, get_state/0, put_state/1, rescue/1,
+         send_activation/2, receive_activation/0, get_state/0, put_state/1, rescue/1, is_musl/0,
          exit_normal/0, kill/1, replace_lone_surrogates/1]).
 
 %% Start an asynchronous NIF call and wait for its reply. A NIF that rejects its arguments
@@ -266,6 +266,10 @@ describe(#{gleam_error := Kind, message := Message, module := Module, function :
     io_lib:format("~ts in ~ts.~ts, line ~b: ~ts", [Kind, Module, Function, Line, Message]);
 describe(Reason) ->
     io_lib:format("~0tp", [Reason]).
+
+%% Whether this VM is linked against musl, as on Alpine Linux.
+is_musl() ->
+    string:find(erlang:system_info(system_architecture), "musl") =/= nomatch.
 
 exit_normal() ->
     exit(normal).
