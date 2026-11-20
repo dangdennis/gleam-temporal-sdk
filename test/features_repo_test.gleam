@@ -372,7 +372,11 @@ pub fn schedule_backfill_test() {
       )
         |> schedule.with_paused(True),
     )
-  let now = timestamp.system_time()
+  // Half past the current minute, so that each two-minute window below holds exactly two
+  // of the schedule's ticks whatever second the test runs at.
+  let #(seconds, _) =
+    timestamp.to_unix_seconds_and_nanoseconds(timestamp.system_time())
+  let now = timestamp.from_unix_seconds(seconds - seconds % 60 + 30)
   let ago = fn(minutes) { timestamp.subtract(now, duration.minutes(minutes)) }
   // Two minutes of a one-minute schedule, twice: three years ago and half an hour ago.
   let three_years = 3 * 365 * 24 * 60
@@ -392,10 +396,16 @@ pub fn schedule_backfill_test() {
       to: ago(30),
       overlap: schedule.AllowAll,
     )
-  assert eventually(fn() {
+  let action_count = fn() {
     let assert Ok(described) = schedule.describe(client, id)
-    described.action_count == 4
-  })
+    described.action_count
+  }
+  // The server works through a backfill a tick at a time, slowly on a busy machine.
+  let _ =
+    eventually(fn() { action_count() >= 4 })
+    || eventually(fn() { action_count() >= 4 })
+  process.sleep(500)
+  assert action_count() == 4
   let assert Ok(Nil) = schedule.delete(client, id)
   worker.stop(worker)
 }
