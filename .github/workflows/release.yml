@@ -1,16 +1,28 @@
 name: Release
 
-# Builds the NIF for each supported machine and attaches the files to the release, for
-# bin/fetch-nif to download.
+# Pushing a version tag builds the NIF for each supported machine and attaches the files to a
+# GitHub release, where `gleam run -m temporal/install` finds them.
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: write
 
 jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the package version
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' gleam.toml)" = "$GITHUB_REF_NAME"
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$GITHUB_REF_NAME" || gh release create "$GITHUB_REF_NAME" --generate-notes
+
   nif:
+    needs: release
     strategy:
       fail-fast: false
       matrix:
@@ -24,7 +36,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             built: libtemporal_nif.dylib
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             built: libtemporal_nif.dylib
     runs-on: ${{ matrix.os }}
@@ -41,4 +53,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp "native/temporal_nif/target/release/${{ matrix.built }}" "libtemporal_nif-${{ matrix.target }}.so"
-          gh release upload "${{ github.event.release.tag_name }}" "libtemporal_nif-${{ matrix.target }}.so" --clobber
+          gh release upload "$GITHUB_REF_NAME" "libtemporal_nif-${{ matrix.target }}.so" --clobber

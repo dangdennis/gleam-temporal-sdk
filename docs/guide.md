@@ -6,13 +6,17 @@ Temporal.
 
 ## Set up
 
-Add the package and build its NIF. Building needs a Rust toolchain; `bin/fetch-nif` gets a
-prebuilt one instead, for a released version.
+Add the package to `gleam.toml` and download its native library:
+
+```toml
+[dependencies]
+temporal_gleam = { git = "https://github.com/dangdennis/gleam-temporal-sdk", ref = "v0.1.0" }
+```
 
 ```sh
-gleam add temporal_gleam
-bin/build-nif
-temporal server start-dev   # a local Temporal service, from the Temporal CLI
+gleam deps download
+gleam run -m temporal/install   # a prebuilt library; no Rust toolchain needed
+temporal server start-dev       # a local Temporal service, from the Temporal CLI
 ```
 
 ## Describe what exists

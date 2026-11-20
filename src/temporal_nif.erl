@@ -19,44 +19,58 @@ init() ->
                {error, _} -> "priv";
                Dir -> Dir
            end,
-    erlang:load_nif(filename:join(Priv, "libtemporal_nif"), 0).
+    case erlang:load_nif(filename:join(Priv, "libtemporal_nif"), 0) of
+        ok -> ok;
+        {error, {_, Text}} ->
+            %% Loading the module still succeeds, so that the first call can say what to do.
+            persistent_term:put({?MODULE, load_error}, unicode:characters_to_binary(Text)),
+            ok
+    end.
 
-connect(_, _, _, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-worker_new(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-replay_worker_new(_, _) -> erlang:nif_error(nif_not_loaded).
-worker_poll_workflow(_, _, _) -> erlang:nif_error(nif_not_loaded).
-worker_complete_workflow(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
-worker_poll_activity(_, _, _) -> erlang:nif_error(nif_not_loaded).
-worker_complete_activity(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-worker_heartbeat(_, _, _) -> erlang:nif_error(nif_not_loaded).
-worker_shutdown(_, _, _) -> erlang:nif_error(nif_not_loaded).
-start_workflow(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-signal_workflow(_, _, _, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-query_workflow(_, _, _, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-cancel_workflow(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-terminate_workflow(_, _, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-workflow_result(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-fetch_history(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-describe_workflow(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-list_workflows(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-count_workflows(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
-server_start(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
-server_stop(_, _, _) -> erlang:nif_error(nif_not_loaded).
-time_control(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
-schedule_put(_, _, _, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-schedule_describe(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
-schedule_delete(_, _, _, _) -> erlang:nif_error(nif_not_loaded).
-schedule_patch(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-schedule_list(_, _, _) -> erlang:nif_error(nif_not_loaded).
-update_workflow(_, _, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-poll_update(_, _, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-worker_poll_nexus(_, _, _) -> erlang:nif_error(nif_not_loaded).
-worker_complete_nexus(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-debug_completion(_, _) -> erlang:nif_error(nif_not_loaded).
-debug_activity_result(_) -> erlang:nif_error(nif_not_loaded).
-debug_nexus_result(_) -> erlang:nif_error(nif_not_loaded).
-sample_activation() -> erlang:nif_error(nif_not_loaded).
-sample_activity_task() -> erlang:nif_error(nif_not_loaded).
-update_with_start(_, _, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-complete_activity_async(_, _, _, _, _) -> erlang:nif_error(nif_not_loaded).
-start_metrics(_) -> erlang:nif_error(nif_not_loaded).
+not_loaded() ->
+    Reason = persistent_term:get({?MODULE, load_error}, <<"unknown">>),
+    erlang:nif_error({temporal_library_not_loaded,
+                      <<"The Temporal native library could not be loaded. Run "
+                        "`gleam run -m temporal/install` to download it, or compile it with "
+                        "bin/build-nif in the package directory.">>,
+                      Reason}).
+
+connect(_, _, _, _, _, _, _) -> not_loaded().
+worker_new(_, _, _, _, _) -> not_loaded().
+replay_worker_new(_, _) -> not_loaded().
+worker_poll_workflow(_, _, _) -> not_loaded().
+worker_complete_workflow(_, _, _, _) -> not_loaded().
+worker_poll_activity(_, _, _) -> not_loaded().
+worker_complete_activity(_, _, _, _, _) -> not_loaded().
+worker_heartbeat(_, _, _) -> not_loaded().
+worker_shutdown(_, _, _) -> not_loaded().
+start_workflow(_, _, _, _, _) -> not_loaded().
+signal_workflow(_, _, _, _, _, _, _) -> not_loaded().
+query_workflow(_, _, _, _, _, _, _) -> not_loaded().
+cancel_workflow(_, _, _, _, _) -> not_loaded().
+terminate_workflow(_, _, _, _, _, _) -> not_loaded().
+workflow_result(_, _, _, _, _) -> not_loaded().
+fetch_history(_, _, _, _, _) -> not_loaded().
+describe_workflow(_, _, _, _, _) -> not_loaded().
+list_workflows(_, _, _, _, _) -> not_loaded().
+count_workflows(_, _, _, _) -> not_loaded().
+server_start(_, _, _, _) -> not_loaded().
+server_stop(_, _, _) -> not_loaded().
+time_control(_, _, _, _) -> not_loaded().
+schedule_put(_, _, _, _, _, _, _) -> not_loaded().
+schedule_describe(_, _, _, _) -> not_loaded().
+schedule_delete(_, _, _, _) -> not_loaded().
+schedule_patch(_, _, _, _, _) -> not_loaded().
+schedule_list(_, _, _) -> not_loaded().
+update_workflow(_, _, _, _, _, _) -> not_loaded().
+poll_update(_, _, _, _, _, _) -> not_loaded().
+worker_poll_nexus(_, _, _) -> not_loaded().
+worker_complete_nexus(_, _, _, _, _) -> not_loaded().
+debug_completion(_, _) -> not_loaded().
+debug_activity_result(_) -> not_loaded().
+debug_nexus_result(_) -> not_loaded().
+sample_activation() -> not_loaded().
+sample_activity_task() -> not_loaded().
+update_with_start(_, _, _, _, _, _) -> not_loaded().
+complete_activity_async(_, _, _, _, _) -> not_loaded().
+start_metrics(_) -> not_loaded().

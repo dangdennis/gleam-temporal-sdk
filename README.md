@@ -13,6 +13,29 @@ production and has had no load testing.
 
 New here? Start with the [guide](docs/guide.md).
 
+## Install
+
+The package is installed from this repository rather than from Hex. Add it to `gleam.toml`,
+pinned to a release tag:
+
+```toml
+[dependencies]
+temporal_gleam = { git = "https://github.com/dangdennis/gleam-temporal-sdk", ref = "v0.1.0" }
+```
+
+Then download the dependencies and the native library:
+
+```sh
+gleam deps download
+gleam run -m temporal/install
+```
+
+The second command fetches a prebuilt library for Linux or macOS, on x86-64 or ARM, so no
+Rust toolchain is needed. The library lives under `build/`, so run the command again after
+`gleam clean` or after changing the version, and as a step in CI. On another platform, or to
+build from source, run `build/packages/temporal_gleam/bin/build-nif` instead, which needs
+Rust 1.88+.
+
 ## Example
 
 ```gleam
@@ -370,7 +393,6 @@ bin/build-nif   # compile the Rust NIF into priv/
 bin/test        # build, start a dev server if none is running, run every test
 bin/conformance # bin/test, then replay this SDK's histories on the TypeScript SDK
 bin/load        # thousands of workflows while workers are killed
-bin/fetch-nif   # download a prebuilt NIF for a released version instead of building
 ```
 
 ## How correctness is checked
