@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   release:
@@ -24,6 +25,13 @@ jobs:
       - name: Check a pushed tag matches the package version
         if: github.ref_type == 'tag'
         run: test "${{ steps.version.outputs.tag }}" = "$GITHUB_REF_NAME"
+      # A release is cut only from a commit whose CI run passed.
+      - name: Check CI passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          passed="$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length)"
+          test "$passed" -gt 0 || { echo "no successful CI run for $GITHUB_SHA"; exit 1; }
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}

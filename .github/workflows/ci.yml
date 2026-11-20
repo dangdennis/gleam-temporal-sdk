@@ -4,33 +4,32 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  # Weekly, because the Temporal CLI and the runners move underneath an unchanged tree.
+  schedule:
+    - cron: "17 5 * * 1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "27"
           gleam-version: "1.19.2"
           rebar3-version: "3"
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: native/temporal_nif
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - uses: temporalio/setup-temporal@v0
 
       - name: Check formatting
         run: |
@@ -46,6 +45,39 @@ jobs:
       - name: Lint the NIF
         run: cargo clippy --release --manifest-path native/temporal_nif/Cargo.toml -- -D warnings
 
+      - name: Build the API docs
+        run: gleam docs build
+
+  # Everything, on every machine a prebuilt library is published for.
+  test:
+    name: test (${{ matrix.name }}, OTP ${{ matrix.otp }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux x86-64, os: ubuntu-24.04, otp: "27" }
+          - { name: Linux x86-64, os: ubuntu-24.04, otp: "28" }
+          - { name: Linux ARM, os: ubuntu-24.04-arm, otp: "27" }
+          - { name: macOS ARM, os: macos-15, otp: "27" }
+          - { name: macOS Intel, os: macos-15-intel, otp: "27" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          gleam-version: "1.19.2"
+          rebar3-version: "3"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/temporal_nif
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: temporalio/setup-temporal@v0
+
       # Builds the NIF, starts a dev server, runs every test, then replays this SDK's
       # histories on the TypeScript SDK.
       - name: Test and check conformance
@@ -57,3 +89,23 @@ jobs:
 
       - name: Load test
         run: LOAD_WORKFLOWS=500 bin/load
+
+  # Alpine: the library is built and the tests run inside Alpine containers.
+  test-musl:
+    name: test (Alpine ${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86-64, os: ubuntu-24.04 }
+          - { name: ARM, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: native/temporal_nif/target/musl
+          key: musl-${{ matrix.os }}-${{ hashFiles('native/temporal_nif/Cargo.lock') }}
+      - name: Build the NIF and run the tests in Alpine
+        run: bin/test-musl

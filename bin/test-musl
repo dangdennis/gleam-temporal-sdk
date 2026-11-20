@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Run the SDK's tests on Alpine Linux: build the musl NIF with bin/build-nif-musl, then run
+# `gleam test` against a dev server inside an Alpine container. Needs Docker.
+#
+# GLEAM_IMAGE names the image to use; it must carry Gleam and Erlang on Alpine.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+image="${GLEAM_IMAGE:-ghcr.io/gleam-lang/gleam:v1.19.2-erlang-alpine}"
+"$root/bin/build-nif-musl"
+
+docker run --rm --volume "$root:/src:ro" "$image" sh -c '
+  set -e
+  apk add --no-cache bash curl openssl git >/dev/null
+  case "$(uname -m)" in
+    x86_64) arch=amd64 ;;
+    aarch64) arch=arm64 ;;
+  esac
+  curl -sSfL "https://temporal.download/cli/archive/latest?platform=linux&arch=$arch" \
+    | tar -xz -C /usr/local/bin temporal
+
+  # A copy, so that the build does not land in the mounted tree with another owner.
+  mkdir -p /work/priv && cd /work
+  tar -C /src --exclude=node_modules -cf - gleam.toml manifest.toml src test | tar -xf -
+  cp /src/native/temporal_nif/target/musl/release/libtemporal_nif.so priv/
+
+  temporal server start-dev --headless --log-level error \
+    --dynamic-config-value system.enableNexus=true \
+    --dynamic-config-value system.enableDeploymentVersions=true \
+    --dynamic-config-value activity.enableStandalone=true >/dev/null 2>&1 &
+  until temporal operator cluster health >/dev/null 2>&1; do sleep 0.5; done
+  gleam test'
