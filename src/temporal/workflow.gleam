@@ -229,7 +229,12 @@ pub fn handler(
         })
       Error(reason) ->
         Error(
-          failure.new("could not decode workflow input: " <> reason)
+          failure.new(
+            "workflow \""
+            <> definition.name
+            <> "\": could not decode the input: "
+            <> reason,
+          )
           |> failure.with_type("InvalidArgument")
           |> failure.non_retryable,
         )
@@ -698,6 +703,7 @@ pub fn start_activity(
       resolution(
         fn() { dict.get(run_state.get().activities, seq) },
         definition.output,
+        "activity \"" <> definition.name <> "\"",
       )
     }
   }
@@ -717,6 +723,7 @@ pub fn execute_activity(
 pub fn resolution(
   lookup: fn() -> Result(bridge.Resolution, Nil),
   output: Codec(a),
+  what: String,
 ) -> Future(Result(a, Failure)) {
   Future(fn() {
     case lookup() {
@@ -725,7 +732,7 @@ pub fn resolution(
         Some(
           codec.decode_arguments(output, option.values([payload]))
           |> result.map_error(fn(reason) {
-            failure.new("could not decode result: " <> reason)
+            failure.new(what <> ": could not decode the result: " <> reason)
             |> failure.with_type("InvalidResult")
             |> failure.non_retryable
           }),
@@ -741,7 +748,8 @@ pub fn resolution(
 // ---- signals and queries ----
 
 /// A future of the next signal of this kind. Signals that arrived before anyone asked are
-/// buffered and delivered in order. A signal whose payload does not decode is dropped.
+/// buffered and delivered in order. A signal whose payload does not decode is dropped,
+/// with a warning in the log.
 pub fn signal(_ctx: Context, definition: SignalDefinition(a)) -> Future(a) {
   once(fn() { next_signal(definition) })
 }
@@ -752,7 +760,16 @@ fn next_signal(definition: SignalDefinition(a)) -> Option(a) {
     Some(payloads) ->
       case codec.decode_arguments(definition.codec, payloads) {
         Ok(value) -> Some(value)
-        Error(_) -> next_signal(definition)
+        Error(reason) -> {
+          log(
+            bridge.Warning,
+            "signal \""
+              <> definition.name
+              <> "\" dropped: could not decode it: "
+              <> reason,
+          )
+          next_signal(definition)
+        }
       }
   }
 }

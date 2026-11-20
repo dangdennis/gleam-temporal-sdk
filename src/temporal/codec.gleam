@@ -172,11 +172,28 @@ pub fn json(to_json: fn(a) -> Json, decoder: Decoder(a)) -> Codec(a) {
     },
     decode: fn(payload: Payload) {
       json.parse_bits(payload.data, decoder)
-      |> result.map_error(fn(error) {
-        "invalid JSON payload: " <> string.inspect(error)
-      })
+      |> result.map_error(describe_json_error)
     },
   )
+}
+
+/// A JSON decoding failure in words: which field, what was expected, what was found.
+fn describe_json_error(error: json.DecodeError) -> String {
+  case error {
+    json.UnexpectedEndOfInput -> "the JSON ends early"
+    json.UnexpectedByte(byte) -> "not valid JSON: unexpected " <> byte
+    json.UnexpectedSequence(sequence) ->
+      "not valid JSON: unexpected " <> sequence
+    json.UnableToDecode(errors) ->
+      list.map(errors, fn(error) {
+        let where = case error.path {
+          [] -> ""
+          path -> "field \"" <> string.join(path, ".") <> "\": "
+        }
+        where <> "expected " <> error.expected <> ", found " <> error.found
+      })
+      |> string.join("; ")
+  }
 }
 
 /// A codec for a JSON string.

@@ -326,7 +326,9 @@ fn run_activity(
           failure.new(
             "activity type \""
             <> activity_type
-            <> "\" is not registered on this worker",
+            <> "\" is not registered on this worker, which has "
+            <> runtime.known(dict.keys(activities))
+            <> ". Add its handler to worker.with_activities.",
           )
           |> failure.with_type("NotFound"),
         )

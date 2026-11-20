@@ -98,7 +98,12 @@ pub fn handler(
         })
       Error(reason) ->
         Error(
-          failure.new("could not decode activity input: " <> reason)
+          failure.new(
+            "activity \""
+            <> definition.name
+            <> "\": could not decode the input: "
+            <> reason,
+          )
           |> failure.with_type("InvalidArgument")
           |> failure.non_retryable,
         )

@@ -98,6 +98,11 @@ pub fn start(
         workflow.resolution(
           fn() { dict.get(run_state.get().nexus_results, seq) },
           operation.output,
+          "Nexus operation \""
+            <> operation.service
+            <> "/"
+            <> operation.name
+            <> "\"",
         )
       Operation(
         started:,

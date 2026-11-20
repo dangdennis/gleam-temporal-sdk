@@ -436,7 +436,9 @@ pub fn result(handle: Handle(output)) -> Result(output, Error) {
     Ok(bridge.OutcomeCompleted(payloads)) ->
       transcode.decode_list(handle.client.codec, payloads)
       |> result.try(codec.decode_arguments(handle.output, _))
-      |> result.map_error(DecodeFailed)
+      |> result.map_error(fn(reason) {
+        DecodeFailed("the workflow's result: " <> reason)
+      })
     Ok(bridge.OutcomeFailed(failure)) ->
       Error(WorkflowFailed(
         transcode.decode_failure(handle.client.codec, failure)
@@ -512,7 +514,11 @@ pub fn query(
     Ok(payloads) ->
       transcode.decode_list(handle.client.codec, payloads)
       |> result.try(codec.decode_arguments(definition.result, _))
-      |> result.map_error(DecodeFailed)
+      |> result.map_error(fn(reason) {
+        DecodeFailed(
+          "the result of query \"" <> definition.name <> "\": " <> reason,
+        )
+      })
     Error(bridge.RpcError(code, message)) if code == not_found ->
       Error(NotFound(message))
     // The server reports a query the workflow could not answer as an invalid argument.
@@ -728,7 +734,9 @@ pub fn update_result(update: UpdateHandle(result)) -> Result(result, Error) {
     Ok(bridge.UpdateSucceeded(payloads)) ->
       transcode.decode_list(update.client.codec, payloads)
       |> result.try(codec.decode_arguments(update.result, _))
-      |> result.map_error(DecodeFailed)
+      |> result.map_error(fn(reason) {
+        DecodeFailed("the update's result: " <> reason)
+      })
     Ok(bridge.UpdatePending) ->
       Error(RequestFailed(
         4,

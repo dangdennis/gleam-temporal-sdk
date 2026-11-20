@@ -37,7 +37,7 @@ fn decodes(
   fn(input) {
     codec.decode_arguments(definition.argument, input)
     |> result.replace(Nil)
-    |> result.map_error(fn(reason) { "invalid update argument: " <> reason })
+    |> result.map_error(fn(reason) { invalid_argument(definition, reason) })
   }
 }
 
@@ -59,7 +59,7 @@ pub fn set_validator(
     fn(input) {
       case codec.decode_arguments(definition.argument, input) {
         Ok(argument) -> validator(argument)
-        Error(reason) -> Error("invalid update argument: " <> reason)
+        Error(reason) -> Error(invalid_argument(definition, reason))
       }
     },
     True,
@@ -96,7 +96,7 @@ fn take(
             pending.protocol_instance_id,
             bridge.UpdateRejected(
               pending.protocol_instance_id,
-              failure.new("invalid update argument: " <> reason),
+              failure.new(invalid_argument(definition, reason)),
             ),
           )
           take(definition)
@@ -149,4 +149,14 @@ pub fn complete(
     Error(failure) ->
       bridge.UpdateRejected(update.protocol_instance_id, failure)
   })
+}
+
+fn invalid_argument(
+  definition: UpdateDefinition(argument, result),
+  reason: String,
+) -> String {
+  "update \""
+  <> definition.name
+  <> "\": could not decode the argument: "
+  <> reason
 }

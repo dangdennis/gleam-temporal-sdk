@@ -16,6 +16,7 @@ import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/set
+import gleam/string
 import temporal/codec.{type Payload}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge.{type Activation, type Command, type Completion}
@@ -59,7 +60,9 @@ pub fn run(
       fail_task(
         "workflow type \""
         <> state.workflow_type
-        <> "\" is not registered on this worker",
+        <> "\" is not registered on this worker, which has "
+        <> known(dict.keys(workflows))
+        <> ". Add its handler to worker.with_workflows.",
       )
     Ok(workflow) ->
       case bridge.rescue(fn() { workflow(state.arguments) }) {
@@ -132,7 +135,13 @@ fn answer_query(query: #(String, String, List(Payload))) -> Command {
   let #(query_id, query_type, arguments) = query
   let result = case dict.get(get().query_handlers, query_type) {
     Error(Nil) ->
-      Error("no handler registered for query \"" <> query_type <> "\"")
+      Error(
+        "no handler for query \""
+        <> query_type
+        <> "\"; this workflow has "
+        <> known(dict.keys(get().query_handlers))
+        <> ". Set one with workflow.set_query_handler.",
+      )
     Ok(handler) ->
       case bridge.rescue(fn() { handler(arguments) }) {
         Ok(result) -> result
@@ -299,5 +308,13 @@ pub fn take_signal(name: String) -> Option(List(Payload)) {
       Some(first)
     }
     _ -> None
+  }
+}
+
+/// The names a worker or workflow does know, for a message about one it does not.
+pub fn known(names: List(String)) -> String {
+  case list.sort(names, string.compare) {
+    [] -> "none registered"
+    sorted -> string.join(sorted, ", ")
   }
 }

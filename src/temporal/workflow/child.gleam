@@ -167,6 +167,7 @@ pub fn start(
         workflow.resolution(
           fn() { dict.get(run_state.get().children, seq) },
           definition.output,
+          "child workflow \"" <> definition.name <> "\"",
         )
       Child(
         workflow_id: call.workflow_id,

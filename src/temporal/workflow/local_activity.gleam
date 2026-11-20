@@ -103,6 +103,7 @@ pub fn start(
       workflow.resolution(
         fn() { dict.get(run_state.get().activities, seq) },
         definition.output,
+        "local activity \"" <> definition.name <> "\"",
       )
     }
   }

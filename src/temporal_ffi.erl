@@ -196,7 +196,14 @@ receive_activation() ->
     end.
 
 get_state() ->
-    erlang:get(temporal_workflow_state).
+    case erlang:get(temporal_workflow_state) of
+        undefined ->
+            erlang:error({temporal_not_in_workflow,
+                          <<"This function works only in workflow code, in the process the "
+                            "worker runs the workflow in. Activities, tests and processes a "
+                            "workflow spawns cannot call it.">>});
+        State -> State
+    end.
 
 put_state(State) ->
     erlang:put(temporal_workflow_state, State),
@@ -208,10 +215,17 @@ rescue(Fun) ->
     try {ok, Fun()}
     catch
         error:Reason:Stack ->
-            {error, unicode:characters_to_binary(io_lib:format("~0tp~n~0tp", [Reason, Stack]))};
+            {error, unicode:characters_to_binary([describe(Reason), io_lib:format("~n~0tp", [Stack])])};
         throw:Reason ->
             {error, unicode:characters_to_binary(io_lib:format("throw: ~0tp", [Reason]))}
     end.
+
+%% A Gleam panic or failed assertion as a sentence; anything else as the Erlang term.
+describe(#{gleam_error := Kind, message := Message, module := Module, function := Function,
+           line := Line}) ->
+    io_lib:format("~ts in ~ts.~ts, line ~b: ~ts", [Kind, Module, Function, Line, Message]);
+describe(Reason) ->
+    io_lib:format("~0tp", [Reason]).
 
 exit_normal() ->
     exit(normal).
