@@ -232,11 +232,14 @@ fn encode_command(
       bridge.CompleteWorkflow(option.map(payload, encode_one(codec, _)))
     bridge.FailWorkflow(failure) ->
       bridge.FailWorkflow(encode_failure(codec, failure))
-    bridge.ContinueAsNew(workflow_type, task_queue, arguments) ->
+    bridge.ContinueAsNew(arguments:, options:, ..) ->
       bridge.ContinueAsNew(
-        workflow_type,
-        task_queue,
-        encode_list(codec, arguments),
+        ..command,
+        arguments: encode_list(codec, arguments),
+        options: bridge.ContinueAsNewOptions(
+          ..options,
+          memo: encode_map(codec, options.memo),
+        ),
       )
     bridge.StartChildWorkflow(input:, options:, ..) ->
       bridge.StartChildWorkflow(

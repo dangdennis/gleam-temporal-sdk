@@ -130,8 +130,9 @@ survives deploys and crashes.
 
 ## Run a worker
 
-A worker polls a task queue and runs what it is given. Run it under a supervisor in
-production.
+A worker polls a task queue and runs what it is given. `worker.run` keeps it going until
+the operating system asks the program to stop with SIGTERM, as every deploy does, then
+lets the activities in flight finish and returns.
 
 ```gleam
 import temporal/client
@@ -139,17 +140,22 @@ import temporal/worker
 
 pub fn main() {
   let assert Ok(client) = client.connect(client.local())
-  let assert Ok(_) =
+  let assert Ok(Nil) =
     worker.new(client, "orders")
     |> worker.with_workflows([workflow.handler(process_order(), process_order_workflow)])
     |> worker.with_activities([
       activity.handler(charge(), charge_activity),
       activity.handler(refund(), refund_activity),
     ])
-    |> worker.start
-  process.sleep_forever()
+    |> worker.run
 }
 ```
+
+Do not keep a worker alive with `process.sleep_forever()`: the VM stops within
+milliseconds of a SIGTERM, and every activity in flight is abandoned until its timeout.
+In an OTP application, add `worker.supervised(config)` to the supervision tree instead;
+the README's [Running a worker](../README.md#running-a-worker) says what a graceful stop
+does, step by step.
 
 ## Start a workflow
 

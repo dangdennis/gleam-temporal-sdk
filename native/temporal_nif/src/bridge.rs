@@ -538,6 +538,7 @@ pub enum Command {
         workflow_type: String,
         task_queue: String,
         arguments: Vec<Payload>,
+        options: ContinueAsNewOptions,
     },
     CancelWorkflowExecution,
     SetPatchMarker {
@@ -673,6 +674,7 @@ impl Wire for Command {
                 workflow_type,
                 task_queue,
                 arguments,
+                options,
             } => record(
                 env,
                 "continue_as_new",
@@ -680,6 +682,7 @@ impl Wire for Command {
                     workflow_type.to_term(env),
                     task_queue.to_term(env),
                     arguments.to_term(env),
+                    options.to_term(env),
                 ],
             ),
             Self::CancelWorkflowExecution => atom(env, "cancel_workflow_execution"),
@@ -869,10 +872,11 @@ impl Wire for Command {
             ("fail_workflow", 1) => Ok(Self::FailWorkflow {
                 failure: at(&f, 0, "FailWorkflow.failure")?,
             }),
-            ("continue_as_new", 3) => Ok(Self::ContinueAsNew {
+            ("continue_as_new", 4) => Ok(Self::ContinueAsNew {
                 workflow_type: at(&f, 0, "ContinueAsNew.workflow_type")?,
                 task_queue: at(&f, 1, "ContinueAsNew.task_queue")?,
                 arguments: at(&f, 2, "ContinueAsNew.arguments")?,
+                options: at(&f, 3, "ContinueAsNew.options")?,
             }),
             ("cancel_workflow_execution", 0) => Ok(Self::CancelWorkflowExecution),
             ("set_patch_marker", 2) => Ok(Self::SetPatchMarker {
@@ -999,6 +1003,48 @@ impl Wire for SignalTarget {
                 workflow_id: at(&f, 0, "ChildWorkflowTarget.workflow_id")?,
             }),
             (tag, count) => Err(unexpected("SignalTarget", tag, count)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContinueAsNewOptions {
+    pub run_timeout_ms: Option<i64>,
+    pub task_timeout_ms: Option<i64>,
+    pub memo: HashMap<String, Payload>,
+    pub search_attributes: HashMap<String, Payload>,
+    pub headers: HashMap<String, Payload>,
+    pub retry: Option<RetryPolicy>,
+}
+
+impl Wire for ContinueAsNewOptions {
+    fn to_term<'a>(&self, env: Env<'a>) -> Term<'a> {
+        record(
+            env,
+            "continue_as_new_options",
+            &[
+                self.run_timeout_ms.to_term(env),
+                self.task_timeout_ms.to_term(env),
+                self.memo.to_term(env),
+                self.search_attributes.to_term(env),
+                self.headers.to_term(env),
+                self.retry.to_term(env),
+            ],
+        )
+    }
+
+    fn from_term(term: Term) -> DecodeResult<Self> {
+        let (tag, f) = untag(term)?;
+        match (tag.as_str(), f.len()) {
+            ("continue_as_new_options", 6) => Ok(Self {
+                run_timeout_ms: at(&f, 0, "ContinueAsNewOptions.run_timeout_ms")?,
+                task_timeout_ms: at(&f, 1, "ContinueAsNewOptions.task_timeout_ms")?,
+                memo: at(&f, 2, "ContinueAsNewOptions.memo")?,
+                search_attributes: at(&f, 3, "ContinueAsNewOptions.search_attributes")?,
+                headers: at(&f, 4, "ContinueAsNewOptions.headers")?,
+                retry: at(&f, 5, "ContinueAsNewOptions.retry")?,
+            }),
+            (tag, count) => Err(unexpected("ContinueAsNewOptions", tag, count)),
         }
     }
 }

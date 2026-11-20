@@ -2,9 +2,10 @@
 
 import gleam/dict.{type Dict}
 import gleam/dynamic
-import gleam/erlang/process.{type Pid}
+import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
-import gleam/option.{type Option}
+import gleam/option.{type Option, Some}
+import gleam/string
 import temporal/activity
 import temporal/codec.{type PayloadCodec}
 import temporal/failure
@@ -184,62 +185,73 @@ fn dispatch(
 }
 
 /// Run activity tasks until the worker shuts down, each in its own process. Local
-/// activities arrive here too.
+/// activities arrive here too. `shutting_down` is what `activity.is_worker_shutting_down`
+/// reads.
+///
+/// Core answers the last poll with `Shutdown` only once every activity it handed out has
+/// been reported, so when this returns no activity of the worker is still running.
 pub fn activity_loop(
   worker: NifWorker,
   activities: Dict(String, activity.Handler),
   task_queue: String,
   codec: Option(PayloadCodec),
   cancellation_grace_ms: Option(Int),
+  shutting_down: fn() -> Bool,
 ) -> Result(Nil, String) {
   do_activity_loop(
-    worker,
-    activities,
-    task_queue,
-    codec,
-    cancellation_grace_ms,
+    ActivityLoop(
+      worker:,
+      activities:,
+      task_queue:,
+      codec:,
+      cancellation_grace_ms:,
+      shutting_down:,
+    ),
     dict.new(),
   )
 }
 
+type ActivityLoop {
+  ActivityLoop(
+    worker: NifWorker,
+    activities: Dict(String, activity.Handler),
+    task_queue: String,
+    codec: Option(PayloadCodec),
+    cancellation_grace_ms: Option(Int),
+    shutting_down: fn() -> Bool,
+  )
+}
+
 fn do_activity_loop(
-  worker: NifWorker,
-  activities: Dict(String, activity.Handler),
-  task_queue: String,
-  codec: Option(PayloadCodec),
-  cancellation_grace_ms: Option(Int),
-  running: Dict(BitArray, Pid),
+  loop: ActivityLoop,
+  running: Dict(BitArray, Subject(Watch)),
 ) -> Result(Nil, String) {
-  let running = dict.filter(running, fn(_, pid) { process.is_alive(pid) })
-  let continue = fn(running) {
-    do_activity_loop(
-      worker,
-      activities,
-      task_queue,
-      codec,
-      cancellation_grace_ms,
-      running,
-    )
-  }
-  case bridge.poll_activity(worker) {
+  let running =
+    dict.filter(running, fn(_, watcher) {
+      case process.subject_owner(watcher) {
+        Ok(pid) -> process.is_alive(pid)
+        Error(Nil) -> False
+      }
+    })
+  case bridge.poll_activity(loop.worker) {
     Error(bridge.Shutdown) -> Ok(Nil)
     Error(bridge.PollFailed(message)) -> Error(message)
     Ok(bridge.ActivityStart(task_token:, activity_id:, ..) as task) ->
-      case transcode.decode_activity_task(codec, task) {
+      case transcode.decode_activity_task(loop.codec, task) {
         Ok(task) -> {
-          let pid = run_activity(worker, activities, task_queue, codec, task)
-          continue(dict.insert(running, task_token, pid))
+          let watcher = start_activity(loop, task)
+          do_activity_loop(loop, dict.insert(running, task_token, watcher))
         }
         Error(reason) -> {
           complete_activity(
-            worker,
+            loop.worker,
             task_token,
             activity_id,
             bridge.ActivityFailed(failure.new(
               "payload codec could not decode the activity task: " <> reason,
             )),
           )
-          continue(running)
+          do_activity_loop(loop, running)
         }
       }
     Ok(bridge.ActivityCancel(task_token:, reason:)) -> {
@@ -247,13 +259,10 @@ fn do_activity_loop(
       // `activity.is_cancelled` and reports its own outcome. An activity that has already
       // finished needs nothing.
       case dict.get(running, task_token) {
-        Ok(pid) -> {
-          bridge.send_activity_cancel(pid, reason)
-          enforce_grace(worker, task_token, pid, cancellation_grace_ms)
-        }
+        Ok(watcher) -> process.send(watcher, CancelRequested(reason))
         Error(Nil) -> Nil
       }
-      continue(running)
+      do_activity_loop(loop, running)
     }
   }
 }
@@ -291,46 +300,146 @@ fn complete_activity(
   }
 }
 
-/// Kill a cancelled activity that outstays its grace period and report it as cancelled, so
-/// that a stuck activity cannot hold its slot on the worker for good.
-fn enforce_grace(
-  worker: NifWorker,
-  task_token: BitArray,
-  pid: Pid,
-  grace_ms: Option(Int),
-) -> Nil {
-  case grace_ms {
-    option.None -> Nil
-    option.Some(grace_ms) -> {
+/// What the process watching one activity is told.
+type Watch {
+  /// The activity's own process, with its outcome, just before it exits.
+  Finished(bridge.ActivityResult)
+  /// The activity's process is gone.
+  Exited(process.Down)
+  /// Core wants the activity to stop; `reason` is its `ActivityCancelReason` value.
+  CancelRequested(reason: Int)
+  /// The activity was asked to stop a grace period ago.
+  GraceOver
+}
+
+/// Start one activity: the process that runs it and the process that watches that one.
+/// Returns where to send the watcher a cancellation.
+///
+/// The watcher is the only process that reports the activity's outcome to core, and it
+/// reports exactly one: the result the activity's process hands it, a failure if that
+/// process dies without handing over a result, or a cancellation if it has to be killed.
+/// Whatever happens to the activity's process, core gets its slot back.
+fn start_activity(
+  loop: ActivityLoop,
+  task: bridge.ActivityTask,
+) -> Subject(Watch) {
+  let assert bridge.ActivityStart(task_token:, activity_id:, ..) = task
+  let ready = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let inbox = process.new_subject()
+    process.send(ready, inbox)
+    let activity =
       process.spawn_unlinked(fn() {
-        process.sleep(grace_ms)
-        case process.is_alive(pid) {
-          False -> Nil
-          True -> {
-            bridge.kill(pid)
-            let _ =
-              bridge.complete_activity(
-                worker,
-                task_token,
-                bridge.ActivityCancelled(failure.cancelled()),
-              )
-            Nil
-          }
-        }
+        process.send(inbox, Finished(run_activity(loop, task)))
       })
+    let monitor = process.monitor(activity)
+    let selector =
+      process.new_selector()
+      |> process.select(inbox)
+      |> process.select_specific_monitor(monitor, Exited)
+    let report = fn(result) {
+      complete_activity(
+        loop.worker,
+        task_token,
+        activity_id,
+        transcode.encode_activity_result(loop.codec, result),
+      )
+    }
+    // The activity's process hands over its outcome as the last thing it does. Waiting
+    // for it to be gone means that an activity core counts as finished is not running.
+    let gone = fn() {
+      let _ =
+        process.new_selector()
+        |> process.select_specific_monitor(monitor, Exited)
+        |> process.selector_receive(5000)
       Nil
+    }
+    watch_activity(
+      Watcher(loop:, activity:, activity_id:, selector:, inbox:, report:, gone:),
+      False,
+    )
+  })
+  process.receive_forever(ready)
+}
+
+type Watcher {
+  Watcher(
+    loop: ActivityLoop,
+    activity: Pid,
+    activity_id: String,
+    selector: process.Selector(Watch),
+    inbox: Subject(Watch),
+    report: fn(bridge.ActivityResult) -> Nil,
+    gone: fn() -> Nil,
+  )
+}
+
+fn watch_activity(watcher: Watcher, grace_running: Bool) -> Nil {
+  let Watcher(loop:, activity:, activity_id:, selector:, inbox:, report:, gone:) =
+    watcher
+  let continue = watch_activity(watcher, _)
+  case process.selector_receive_forever(selector) {
+    Finished(result) -> {
+      gone()
+      report(result)
+    }
+    // Killed from outside, or taken down by a process it was linked to. The failure is
+    // retryable: the server runs the activity again by its retry policy.
+    Exited(down) ->
+      report(bridge.ActivityFailed(
+        failure.new(
+          "the activity process exited before reporting a result: "
+          <> exit_reason(down),
+        )
+        |> failure.with_type("ActivityProcessExited"),
+      ))
+    CancelRequested(reason) -> {
+      bridge.send_activity_cancel(activity, reason)
+      case loop.cancellation_grace_ms, grace_running {
+        Some(grace_ms), False -> {
+          process.send_after(inbox, grace_ms, GraceOver)
+          continue(True)
+        }
+        _, _ -> continue(grace_running)
+      }
+    }
+    // A stuck activity must not hold its slot on the worker for good.
+    GraceOver -> {
+      bridge.kill(activity)
+      gone()
+      bridge.log(
+        bridge.Warning,
+        "temporal: killed an activity that was still running after its cancellation grace",
+        [#("activity_id", dynamic.string(activity_id))],
+      )
+      report(bridge.ActivityCancelled(failure.cancelled()))
     }
   }
 }
 
-/// Start the process that runs one activity and reports its outcome.
+fn exit_reason(down: process.Down) -> String {
+  case down {
+    process.ProcessDown(reason: process.Killed, ..) -> "killed"
+    process.ProcessDown(reason: process.Normal, ..) -> "normal"
+    process.ProcessDown(reason: process.Abnormal(reason), ..) ->
+      string.inspect(reason)
+    process.PortDown(..) -> "unknown"
+  }
+}
+
+/// Run one activity in the calling process and return its outcome.
 fn run_activity(
-  worker: NifWorker,
-  activities: Dict(String, activity.Handler),
-  task_queue: String,
-  codec: Option(PayloadCodec),
+  loop: ActivityLoop,
   task: bridge.ActivityTask,
-) -> Pid {
+) -> bridge.ActivityResult {
+  let ActivityLoop(
+    worker:,
+    activities:,
+    task_queue:,
+    codec:,
+    shutting_down:,
+    ..,
+  ) = loop
   let assert bridge.ActivityStart(
     task_token:,
     activity_type:,
@@ -382,45 +491,38 @@ fn run_activity(
       cancel_reason: fn() {
         option.map(bridge.activity_cancel_reason(), cancel_reason)
       },
+      worker_shutting_down: shutting_down,
     )
-  process.spawn_unlinked(fn() {
-    let result = case dict.get(activities, activity_type) {
-      Error(Nil) ->
-        bridge.ActivityFailed(
-          failure.new(
-            "activity type \""
-            <> activity_type
-            <> "\" is not registered on this worker, which has "
-            <> runtime.known(dict.keys(activities))
-            <> ". Add its handler to worker.with_activities.",
-          )
-          |> failure.with_type("NotFound"),
+  case dict.get(activities, activity_type) {
+    Error(Nil) ->
+      bridge.ActivityFailed(
+        failure.new(
+          "activity type \""
+          <> activity_type
+          <> "\" is not registered on this worker, which has "
+          <> runtime.known(dict.keys(activities))
+          <> ". Add its handler to worker.with_activities.",
         )
-      // Exits are caught too: this process must always report an outcome, or the
-      // activity would hang until its timeout.
-      Ok(handler) ->
-        case
-          bridge.rescue_all(fn() { handler.run(ctx, input) }),
-          bridge.activity_deferred()
-        {
-          // Whatever a deferred activity returns, its outcome comes later.
-          Ok(_), True -> bridge.ActivityWillCompleteAsync
-          Ok(Ok(payload)), False -> bridge.ActivityCompleted(payload)
-          Ok(Error(failure.Failure(kind: failure.Cancelled, ..) as failure)),
-            False
-          -> bridge.ActivityCancelled(failure)
-          Ok(Error(failure)), False -> bridge.ActivityFailed(failure)
-          Error(crash), _ ->
-            bridge.ActivityFailed(failure.new("activity crashed: " <> crash))
-        }
-    }
-    complete_activity(
-      worker,
-      task_token,
-      activity_id,
-      transcode.encode_activity_result(codec, result),
-    )
-  })
+        |> failure.with_type("NotFound"),
+      )
+    // Exits raised inside the activity are caught too, so that it fails with what it
+    // exited with. One that is killed from outside is the watcher's to report.
+    Ok(handler) ->
+      case
+        bridge.rescue_all(fn() { handler.run(ctx, input) }),
+        bridge.activity_deferred()
+      {
+        // Whatever a deferred activity returns, its outcome comes later.
+        Ok(_), True -> bridge.ActivityWillCompleteAsync
+        Ok(Ok(payload)), False -> bridge.ActivityCompleted(payload)
+        Ok(Error(failure.Failure(kind: failure.Cancelled, ..) as failure)),
+          False
+        -> bridge.ActivityCancelled(failure)
+        Ok(Error(failure)), False -> bridge.ActivityFailed(failure)
+        Error(crash), _ ->
+          bridge.ActivityFailed(failure.new("activity crashed: " <> crash))
+      }
+  }
 }
 
 /// Core's `ActivityCancelReason` values.

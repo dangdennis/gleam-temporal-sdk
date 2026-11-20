@@ -71,8 +71,8 @@ fn count(ctx: activity.Context, left: Int, steps: Int) -> Result(Int, Failure) {
 
 /// What the activity returned and the heartbeat details it recorded.
 pub fn activity_alone() -> #(Result(Int, Failure), List(Int)) {
-  // `testing.activity_info()` is the info of a first attempt; change fields with a record
-  // update to test a retry or a resume from heartbeat details.
+  // `testing.activity_info()` is the info of a first attempt; `testing.with_attempt` and
+  // `testing.with_heartbeat_details` make it a retry or a resume from recorded progress.
   let env = testing.activity_env(testing.activity_info())
   let outcome = count_down_activity(testing.activity_context(env), 3)
   #(outcome, testing.heartbeats(env, codec.int()))

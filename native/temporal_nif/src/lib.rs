@@ -87,8 +87,6 @@ pub struct ConnectionRes {
 
 pub struct WorkerRes {
     pub worker: Arc<Worker>,
-    /// How long shutting down waits for tasks in flight.
-    pub shutdown_grace: Duration,
     /// The namespace commands that name another workflow are addressed to.
     pub namespace: String,
 }
@@ -569,7 +567,6 @@ fn worker_new<'a>(
         Err(e) => return err(env, format!("invalid worker options: {e}")),
     };
     let fut = async move {
-        let shutdown_grace = options.shutdown_grace;
         let config = worker_config(conn.namespace.clone(), task_queue, options)?;
         let conn = conn.clone();
         let worker = temporalio_sdk_core::init_worker(runtime(), config, conn.connection.clone())
@@ -580,7 +577,6 @@ fn worker_new<'a>(
             .map_err(|e| format!("worker validation failed: {e}"))?;
         Ok::<_, String>(WorkerRes {
             worker: Arc::new(worker),
-            shutdown_grace,
             namespace: conn.namespace.clone(),
         })
     };
@@ -638,7 +634,6 @@ fn replay_worker_new<'a>(
             env,
             ResourceArc::new(WorkerRes {
                 worker: Arc::new(worker),
-                shutdown_grace: Duration::from_secs(1),
                 namespace: "replay".to_string(),
             })
             .encode(env),
@@ -854,15 +849,24 @@ fn worker_complete_nexus<'a>(
     atoms::ok().encode(env)
 }
 
-/// Stop polling. Outstanding polls resolve with `{error, shutdown}` once in-flight tasks finish.
+/// Stop polling and wait until core's worker has shut down, which it has once every task in
+/// flight has been completed and every poll has returned `{error, shutdown}`. `limit_ms`
+/// bounds the wait; zero waits for as long as it takes.
 #[rustler::nif]
-fn worker_shutdown<'a>(pid: LocalPid, reference: Term<'a>, w: ResourceArc<WorkerRes>) -> Atom {
+fn worker_shutdown<'a>(
+    pid: LocalPid,
+    reference: Term<'a>,
+    w: ResourceArc<WorkerRes>,
+    limit_ms: u64,
+) -> Atom {
     let fut = async move {
         w.worker.initiate_shutdown();
-        // Bounded so a task that never finishes cannot hang the caller: the grace period
-        // activities are given, and a little more for core to wind down.
-        let limit = w.shutdown_grace + Duration::from_secs(5);
-        let _ = tokio::time::timeout(limit, w.worker.shutdown()).await;
+        if limit_ms == 0 {
+            w.worker.shutdown().await;
+        } else {
+            let limit = Duration::from_millis(limit_ms);
+            let _ = tokio::time::timeout(limit, w.worker.shutdown()).await;
+        }
     };
     spawn_reply(pid, reference, fut, |env, ()| atoms::nil().encode(env));
     atoms::ok()

@@ -128,6 +128,7 @@ pub type Command {
     workflow_type: String,
     task_queue: String,
     arguments: List(Payload),
+    options: ContinueAsNewOptions,
   )
   CancelWorkflowExecution
   SetPatchMarker(patch_id: String, deprecated: Bool)
@@ -188,6 +189,21 @@ pub type SignalTarget {
   /// An empty `run_id` means the workflow's current run.
   ExternalWorkflow(workflow_id: String, run_id: String)
   ChildWorkflowTarget(workflow_id: String)
+}
+
+pub type ContinueAsNewOptions {
+  ContinueAsNewOptions(
+    run_timeout_ms: Option(Int),
+    task_timeout_ms: Option(Int),
+    /// Empty keeps the memo of the run that ends.
+    memo: Dict(String, Payload),
+    /// Empty keeps the search attributes of the run that ends.
+    search_attributes: Dict(String, Payload),
+    /// The new run gets exactly these: core does not carry headers over.
+    headers: Dict(String, Payload),
+    /// `None` keeps the retry policy of the run that ends.
+    retry: Option(RetryPolicy),
+  )
 }
 
 pub type ChildStartOptions {
@@ -632,8 +648,32 @@ pub type LogLevel {
   Error
 }
 
+/// Stop polling and wait until core's worker has shut down: every task in flight completed
+/// and every poll answered with `Shutdown`. `limit_ms` bounds the wait; zero waits for as
+/// long as it takes.
 @external(erlang, "temporal_ffi", "worker_shutdown")
-pub fn worker_shutdown(worker: NifWorker) -> Nil
+pub fn worker_shutdown(worker: NifWorker, limit_ms: Int) -> Nil
+
+/// A switch that any process can read and that only ever goes from off to on.
+pub type Flag
+
+@external(erlang, "temporal_ffi", "new_flag")
+pub fn new_flag() -> Flag
+
+@external(erlang, "temporal_ffi", "raise_flag")
+pub fn raise_flag(flag: Flag) -> Nil
+
+@external(erlang, "temporal_ffi", "flag_raised")
+pub fn flag_raised(flag: Flag) -> Bool
+
+/// Block until the operating system asks the VM to stop with SIGTERM. Returns at once if
+/// it already has.
+@external(erlang, "temporal_signal", "await")
+pub fn await_shutdown_signal() -> Nil
+
+/// Take SIGTERM over from the VM's default handler, which would stop the VM at once.
+@external(erlang, "temporal_signal", "install")
+pub fn trap_shutdown_signal() -> Nil
 
 /// Start a workflow and return its run id. With `signal`, signal the workflow instead,
 /// starting it first if it is not running.

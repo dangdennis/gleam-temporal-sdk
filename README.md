@@ -85,6 +85,10 @@ pub fn main() {
 }
 ```
 
+That starts a worker, uses it and stops it, as a script or a test does. A worker that
+serves a task queue for real ends its pipeline with `worker.run` instead of
+`worker.start`: see [Running a worker](#running-a-worker).
+
 Options are always built the same way: a constructor that takes what is required, then one
 `with_` function for each thing to change, as with `workflow.activity_options` and the
 worker above.
@@ -98,6 +102,7 @@ The modules:
 | `temporal/workflow/query` | Answering queries |
 | `temporal/workflow/update` | Taking and answering updates |
 | `temporal/workflow/child` | Child workflows |
+| `temporal/workflow/continue_as_new` | Continue-as-new with options |
 | `temporal/workflow/local_activity` | Local activities |
 | `temporal/workflow/operation` | Calling Nexus operations |
 | `temporal/activity` | Writing activities |
@@ -108,6 +113,7 @@ The modules:
 | `temporal/retry` | Retry policies, for activities, child workflows, workflows and schedules |
 | `temporal/codec`, `temporal/encryption` | Value codecs and payload codecs |
 | `temporal/schema` | Describing a JSON object once, for both encoding and decoding |
+| `temporal/middleware` | What outbound middleware rewrites |
 | `temporal/log` | Fields for structured log lines |
 | `temporal/telemetry` | Prometheus metrics, and the core library's log level |
 | `temporal/failure` | Failures |
@@ -121,16 +127,16 @@ So is passing a bare number where a length of time is wanted: every timeout and 
 
 | Area | Supported |
 |---|---|
-| Workflows | Activities, local activities, durable timers, signals, queries, updates, child workflows, continue-as-new, patching and `deprecate_patch`, memo and search attribute changes, headers, deterministic `now` / `random_int` / `uuid4`, logging with fields that is silent on replay |
+| Workflows | Activities, local activities, durable timers, signals, queries, updates, child workflows, continue-as-new with or without options, patching and `deprecate_patch`, memo and search attribute changes, headers, deterministic `now` / `random_int` / `uuid4`, logging with fields that is silent on replay |
 | Cancellation | Scopes carried by the `Context`: `with_scope`, `with_timeout`, `non_cancellable`, `cancel`; cancelling a scope cancels its timers, activities, local activities, child workflows, Nexus operations and pending signals |
 | Concurrency | `Future` values with `map`, `race`, `await`, `await_all`, `try_await_all`, `await_timeout`, `await_cancellable` |
-| Activities | Typed handlers, retry policies, all four timeouts, heartbeats with details, cancellation delivered to the activity, activity info with the retry policy and `is_final_attempt`, logging with fields, failure details, completion from outside by task token |
+| Activities | Typed handlers, retry policies, all four timeouts, heartbeats with details, cancellation delivered to the activity, notice that the worker is shutting down, a failure in place of an activity whose process dies, activity info with the retry policy and `is_final_attempt`, logging with fields, failure details, completion from outside by task token |
 | Child workflows | Start and await separately, signal, parent close policy, id reuse policy, timeouts, retries, memo, cancellation type |
 | Other workflows | Signal and request cancellation of any workflow by id from workflow code |
 | Nexus | Call operations from workflows; serve operations from a worker, answered directly or backed by a workflow |
 | Client | Start with options (memo, search attributes, id reuse and conflict policies, timeouts, retries, start delay, cron), signal-with-start, update-with-start, execute, result, signal, query, update, cancel, terminate, describe, list, count, fetch history; typed errors |
 | Schedules | Create, describe, update, pause, unpause, trigger, backfill, delete, list; intervals with offsets, calendars, cron expressions, time zones, overlap policies |
-| Workers | Concurrency limits, the number of polls kept open, activity rate limits, workflow-only and activity-only workers, workflow and activity middleware, outbound rewriting, worker deployment versioning with pinned and auto-upgrading workflows, graceful shutdown, Prometheus metrics |
+| Workers | Concurrency limits, the number of polls kept open, activity rate limits, workflow-only and activity-only workers, workflow and activity middleware, outbound rewriting with the workflow's context, worker deployment versioning with pinned and auto-upgrading workflows, graceful shutdown on `stop`, on SIGTERM and under a supervisor, Prometheus metrics |
 | Data | JSON and binary payloads (`json/plain`, `binary/plain`), compatible with the Temporal CLI and other SDKs; JSON object schemas that give the encoder and the decoder from one description; payload codecs, with an AES-256-GCM encryption codec included |
 | Connection | Plaintext, TLS, mutual TLS, API keys, HTTP/2 keep-alive (on by default), a connect timeout |
 | Testing | `replayer.replay` for recorded histories; `temporal/testing` for a time-skipping server, a local dev server, and activity contexts that need no server |
@@ -148,6 +154,13 @@ So is passing a bare number where a length of time is wanted: every timeout and 
 - Protobuf payloads, HTTP proxies, standalone activities
 - Enforcement of determinism: nothing stops workflow code from calling a clock or spawning a
   process. Replay tests are how such mistakes are found.
+- Waiting for SIGINT (Ctrl-C): the VM does not hand it to Erlang code. `worker.run` and
+  `worker.await_shutdown_signal` wait for SIGTERM.
+- Integers beyond 2^53 for JavaScript: Gleam's integers have no size limit, but a
+  TypeScript workflow or activity reads every JSON number as a 64-bit float, so a larger
+  integer arrives there rounded. Send such values as strings.
+- A way to read back half of a UTF-16 surrogate pair: a JSON string that JavaScript cut
+  through an emoji is read with U+FFFD in place of the stray half.
 - A Hex release. Prebuilt NIFs are built by the release workflow for Linux and macOS on
   x86-64 and ARM, but only Linux x86-64 has been run.
 
@@ -205,6 +218,13 @@ pub fn cleanup() {
 
 Schemas nest, with `schema.list`, `schema.optional` and `schema.dict` around them.
 `codec.json` takes a hand-written encoder and decoder for anything a schema cannot describe.
+
+The JSON codecs read what the other SDKs write. A value that is not there, which
+TypeScript sends for `undefined` and every SDK for an argument the caller left out, is a
+`binary/null` payload: it reads as JSON `null`, so `schema.optional` gives `None` and
+`codec.nil()` gives `Nil`, and a codec that needs a value fails with a message such as
+`argument 2: expected Int, found Nil`. `codec.float()` reads `10`, and `codec.int()` reads
+`1e21` or `7.0`, which is how JavaScript writes such numbers.
 
 Every client call returns `Result(_, client.Error)`: one type, whose variants say whether
 the workflow failed, was cancelled, timed out, was not found, and so on.
@@ -389,6 +409,12 @@ workflow.log_info(ctx, "order shipped", [log.string("carrier", carrier), log.int
 activity.log_warning(ctx, "card declined", [log.string("reason", reason)])
 ```
 
+The worker's own warnings and errors go the same way. All of these lines reach `logger`'s
+default handler as it comes. `logger` starts at level `notice`, so `log_info` and
+`log_debug` lines show once the level is lowered, for instance with
+`logger:set_primary_config(level, info)` or the `logging` package's `configure`. Every
+line the SDK logs carries the metadata `temporal => true`, for a filter to match on.
+
 `telemetry.serve_prometheus("0.0.0.0:9464")` serves the worker's and client's metrics, the
 same ones Temporal's other SDKs report, for Prometheus to scrape. Call it before the first
 `client.connect`; its `telemetry.Error` says whether it was called too late, given a bad
@@ -412,10 +438,60 @@ in the queue while the worker has slots free, raise them with
 `worker.with_max_concurrent_activity_task_polls`: the further away the service, the more
 polls it takes to keep a worker busy.
 
+## Running a worker
+
+`worker.run` starts the worker and keeps it going until the operating system asks the
+program to stop with SIGTERM, which is what `docker stop`, Kubernetes and systemd send.
+Then it stops the worker gracefully and returns:
+
+```gleam
+pub fn main() {
+  let assert Ok(client) = client.connect(client.local())
+  let assert Ok(Nil) =
+    worker.new(client, "orders")
+    |> worker.with_workflows([workflow.handler(order(), order_workflow)])
+    |> worker.with_activities([activity.handler(charge(), charge_activity)])
+    |> worker.run
+}
+```
+
+Left alone, the VM answers SIGTERM by stopping within milliseconds, and every activity in
+flight is abandoned until its timeout passes. A program with several workers starts each
+with `worker.start`, calls `worker.await_shutdown_signal()`, then stops each with
+`worker.stop`. Under an OTP application's supervision tree, `worker.supervised` needs
+neither: the VM shuts the tree down on SIGTERM and the worker drains as its supervisor
+stops it.
+
+A graceful stop, however it is asked for, goes in this order:
+
+1. The worker stops asking for tasks, and `activity.is_worker_shutting_down(ctx)` turns
+   true in every running activity. A long activity that checks it can record its progress
+   with a heartbeat and return an error at once, for the retry to pick up elsewhere.
+2. Workflow tasks in flight are finished. Another worker carries the workflows on.
+3. Activities in flight run on for the shutdown grace: `worker.with_shutdown_grace`, ten
+   seconds by default.
+4. Those still running are told to cancel: `activity.cancel_reason(ctx)` is
+   `Some(WorkerShutdown)`. One that returns `Error(failure.cancelled())` is reported as
+   failed by the shutdown and retried by its retry policy; one that finishes is reported
+   with its result.
+5. Those still running after the activity cancellation grace,
+   `worker.with_activity_cancellation_grace`, thirty seconds by default, are killed, and
+   retried the same way.
+
+`worker.stop` returns when all of that is over, so give whatever stops the process at
+least the two graces together: Kubernetes' `terminationGracePeriodSeconds` is thirty
+seconds unless set.
+
+An activity always answers for its slot on the worker. If its process is killed, or dies
+with a process it was linked to, the activity fails with a retryable
+`ActivityProcessExited` failure. If it hangs past its start-to-close or heartbeat timeout
+it is asked to stop five seconds later, and killed after the activity cancellation grace.
+
 ## Middleware
 
 Middleware is a function. Inbound middleware wraps every workflow or activity on a worker;
-outbound middleware rewrites what a workflow schedules.
+outbound middleware rewrites what a workflow schedules, and is given the workflow's
+context, so it can ship a change behind `workflow.patched`.
 
 ```gleam
 worker.new(client, "main")
@@ -438,8 +514,11 @@ worker.new(client, "main")
     ok -> ok
   }
 })
-|> worker.with_outbound_activity(fn(call) {
-  middleware.ActivityCall(..call, activity_type: rename(call.activity_type))
+|> worker.with_outbound_activity(fn(ctx, call) {
+  case call.activity_type, workflow.patched(ctx, "send-email-v2") {
+    "send_email", True -> middleware.with_activity_type(call, "send_email_v2")
+    _, _ -> call
+  }
 })
 ```
 
@@ -462,7 +541,9 @@ testing.stop(env)
 
 The test server is downloaded on first use; `testing.start_time_skipping_with` uses one
 already on disk. `testing.activity_env` builds a context for calling an activity
-function directly, records its heartbeats, and can deliver a cancellation.
+function directly, records its heartbeats, and can deliver a cancellation or the news
+that the worker is shutting down. `testing.activity_info()` is the info it starts from,
+adjusted with `testing.with_attempt`, `testing.with_heartbeat_details` and their siblings.
 
 ## Building and testing
 
@@ -511,13 +592,15 @@ bin/codegen     # regenerate the Rust boundary types after changing bridge.gleam
    TypeScript SDK.
 
 The features are: basics (timers, activities, signals, children), several arguments,
-cancellation scopes, waiting with a deadline, updates, signalling and cancelling other workflows, local
-activities, patching with memo changes and continue-as-new, Nexus calls, and encrypted
-payloads. Steps 1 to 3 run as part of `bin/test`; step 4 needs Node.js.
+missing values (an argument left out, `undefined` results), cancellation scopes, waiting
+with a deadline, updates, signalling and cancelling other workflows, local activities,
+patching with memo changes and continue-as-new, continue-as-new with options, Nexus calls,
+and encrypted payloads. Steps 1 to 3 run as part of `bin/test`; step 4 needs Node.js.
 
 Adding a feature means adding its twin to both `test/conformance_test.gleam` and
 `test/conformance/typescript/workflows.js`, a driver to `harness.js`, and re-recording with
-`npm run record`.
+`npm run record`, or `node harness.js record ../../fixtures/conformance <feature>` for
+that feature alone.
 
 Not yet done: running under Temporal's own [features](https://github.com/temporalio/features)
 harness (its scenarios are ported by hand here), load testing with

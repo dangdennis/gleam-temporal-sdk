@@ -15,6 +15,7 @@
 //// `test/conformance/typescript`.
 
 import gleam/bit_array
+import gleam/dict
 import gleam/erlang/process
 import gleam/int
 import gleam/list
@@ -31,9 +32,11 @@ import temporal/failure.{type Failure}
 import temporal/nexus
 import temporal/replayer
 import temporal/retry
+import temporal/schema
 import temporal/worker
 import temporal/workflow.{type Context}
 import temporal/workflow/child
+import temporal/workflow/continue_as_new
 import temporal/workflow/local_activity
 import temporal/workflow/operation
 import temporal/workflow/signal
@@ -70,6 +73,13 @@ fn stray() {
 fn activities() -> List(activity.Handler) {
   [
     activity.handler(double(), fn(_, n) { Ok(n * 2) }),
+    activity.handler(maybe(), fn(_, present) {
+      Ok(case present {
+        True -> Some("value")
+        False -> None
+      })
+    }),
+    activity.handler(nothing(), fn(_, _) { Ok(Nil) }),
     activity.handler(slow(), fn(_, ms) { Ok(process.sleep(ms)) }),
     activity.handler(join(), fn(_, arguments) {
       let #(text, times) = arguments
@@ -429,8 +439,109 @@ fn several_arguments_workflow(
   }
 }
 
+fn maybe() {
+  activity.Definition(
+    "maybe",
+    codec.bool(),
+    schema.codec(schema.optional(schema.string())),
+  )
+}
+
+fn nothing() {
+  activity.Definition("nothing", codec.no_args(), codec.nil())
+}
+
+fn silent() {
+  workflow.Definition(
+    "silent",
+    codec.no_args(),
+    schema.codec(schema.optional(schema.string())),
+  )
+}
+
+fn optional() {
+  workflow.Definition(
+    "optional",
+    codec.args2(codec.string(), schema.codec(schema.optional(schema.string()))),
+    codec.string(),
+  )
+}
+
+/// Values that are not there: an argument the caller left out, and activities and a child
+/// workflow that return nothing. TypeScript sends each as a `binary/null` payload.
+fn optional_workflow(
+  ctx: Context,
+  arguments: #(String, Option(String)),
+) -> Result(String, Failure) {
+  let #(label, suffix) = arguments
+  use absent <- result.try(workflow.execute_activity(
+    ctx,
+    maybe(),
+    False,
+    options(),
+  ))
+  use present <- result.try(workflow.execute_activity(
+    ctx,
+    maybe(),
+    True,
+    options(),
+  ))
+  use _ <- result.try(workflow.execute_activity(ctx, nothing(), Nil, options()))
+  let child =
+    child.options(workflow_id: workflow.info(ctx).workflow_id <> "-silent")
+  use said <- result.try(child.execute(ctx, silent(), Nil, child))
+  Ok(
+    label
+    <> option.unwrap(suffix, "")
+    <> ": "
+    <> string.join(
+      list.map([absent, present, said], option.unwrap(_, "none")),
+      ", ",
+    ),
+  )
+}
+
+fn handover() {
+  workflow.Definition("handover", codec.int(), codec.string())
+}
+
+/// Continue-as-new with options: the next run gets a memo and timeouts of its own.
+fn handover_workflow(ctx: Context, remaining: Int) -> Result(String, Failure) {
+  use _ <- result.try(workflow.sleep(ctx, duration.milliseconds(5)))
+  case remaining > 0 {
+    True ->
+      continue_as_new.run(
+        ctx,
+        handover(),
+        remaining - 1,
+        continue_as_new.options()
+          |> continue_as_new.with_memo(
+            dict.from_list([
+              #(
+                "generation",
+                codec.encode(
+                  codec.string(),
+                  int.to_string(remaining - 1) <> " to go",
+                ),
+              ),
+            ]),
+          )
+          |> continue_as_new.with_run_timeout(duration.minutes(1))
+          |> continue_as_new.with_task_timeout(duration.seconds(5)),
+      )
+    False ->
+      Ok(option.unwrap(
+        workflow.memo(ctx, "generation", codec.string()),
+        "first",
+      ))
+  }
+}
+
 fn workflows() -> List(workflow.Handler) {
   [
+    workflow.handler(optional(), optional_workflow),
+    workflow.handler(silent(), fn(_, _) { Ok(None) }),
+    workflow.handler(handover(), handover_workflow),
     workflow.handler(several_arguments(), several_arguments_workflow),
     workflow.handler(basics(), basics_workflow),
     workflow.handler(double_child(), double_child_workflow),
@@ -685,5 +796,23 @@ pub fn several_arguments_conform_test() {
   use env <- record_gleam_history("arguments", None)
   let handle = start(env, several_arguments(), #("hey", 3, True))
   assert client.result(handle) == Ok("HEY HEY HEY")
+  handle
+}
+
+pub fn missing_values_conform_test() {
+  // The TypeScript run was started with one argument and its activities and child
+  // returned `undefined`: the Gleam twin has to read all of that to follow the history.
+  check_typescript_history("optional", None)
+  use env <- record_gleam_history("optional", None)
+  let handle = start(env, optional(), #("hey", None))
+  assert client.result(handle) == Ok("hey: none, value, none")
+  handle
+}
+
+pub fn continue_as_new_with_options_conforms_test() {
+  check_typescript_history("handover", None)
+  use env <- record_gleam_history("handover", None)
+  let handle = start(env, handover(), 1)
+  assert client.result(handle) == Ok("0 to go")
   handle
 }

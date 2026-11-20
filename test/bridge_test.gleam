@@ -224,10 +224,26 @@ fn commands() -> List(#(bridge.Command, List(String))) {
       "FailWorkflowExecution", "message: \"w failed\"", "type: \"SampleType\"",
       "non_retryable: true",
     ]),
-    #(bridge.ContinueAsNew("c-type", "c-queue", [payload("4")]), [
-      "ContinueAsNewWorkflowExecution", "workflow_type: \"c-type\"",
-      "task_queue: \"c-queue\"",
-    ]),
+    #(
+      bridge.ContinueAsNew(
+        "c-type",
+        "c-queue",
+        [payload("4")],
+        bridge.ContinueAsNewOptions(
+          run_timeout_ms: Some(61_000),
+          task_timeout_ms: Some(7000),
+          memo: dict.from_list([#("c-memo", payload("5"))]),
+          search_attributes: dict.from_list([#("c-attribute", payload("6"))]),
+          headers: dict.from_list([#("c-header", payload("7"))]),
+          retry: Some(bridge.RetryPolicy(1000, 2.0, None, 9, [])),
+        ),
+      ),
+      [
+        "ContinueAsNewWorkflowExecution", "workflow_type: \"c-type\"",
+        "task_queue: \"c-queue\"", "seconds: 61", "seconds: 7", "c-memo",
+        "c-attribute", "c-header", "maximum_attempts: 9",
+      ],
+    ),
     #(bridge.CancelWorkflowExecution, ["CancelWorkflowExecution"]),
     #(bridge.SetPatchMarker("p-id", True), [
       "SetPatchMarker", "patch_id: \"p-id\"", "deprecated: true",

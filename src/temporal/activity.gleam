@@ -72,7 +72,8 @@ pub type CancelReason {
   NotFound
   /// A timeout passed. Whatever the activity returns now is ignored.
   TimedOut
-  /// The worker is stopping.
+  /// The worker is stopping and its shutdown grace has passed. See
+  /// `is_worker_shutting_down` for the earlier notice.
   WorkerShutdown
   /// An operator paused the activity.
   Paused
@@ -88,6 +89,7 @@ pub opaque type Context {
     task_token: BitArray,
     heartbeat: fn(List(Payload)) -> Nil,
     cancel_reason: fn() -> Option(CancelReason),
+    worker_shutting_down: fn() -> Bool,
   )
 }
 
@@ -145,8 +147,9 @@ pub fn new_context(
   task_token task_token: BitArray,
   heartbeat heartbeat: fn(List(Payload)) -> Nil,
   cancel_reason cancel_reason: fn() -> Option(CancelReason),
+  worker_shutting_down worker_shutting_down: fn() -> Bool,
 ) -> Context {
-  Context(info:, task_token:, heartbeat:, cancel_reason:)
+  Context(info:, task_token:, heartbeat:, cancel_reason:, worker_shutting_down:)
 }
 
 /// The task the activity is running for.
@@ -257,6 +260,24 @@ pub fn is_cancelled(ctx: Context) -> Bool {
 /// Why the activity was asked to stop, or `None` if it was not.
 pub fn cancel_reason(ctx: Context) -> Option(CancelReason) {
   ctx.cancel_reason()
+}
+
+/// Whether the worker running the activity has been asked to stop. It turns true the
+/// moment shutdown begins, which is the worker's shutdown grace earlier than the
+/// `WorkerShutdown` cancellation, and needs no heartbeat to be seen.
+///
+/// A long activity that checks it can save its progress with `heartbeat_with` and return
+/// an error straight away, so that a deploy does not wait for it and the retry picks up
+/// where it stopped:
+///
+/// ```gleam
+/// case activity.is_worker_shutting_down(ctx) {
+///   True -> Error(failure.new("worker is shutting down"))
+///   False -> process_next_batch(ctx, cursor)
+/// }
+/// ```
+pub fn is_worker_shutting_down(ctx: Context) -> Bool {
+  ctx.worker_shutting_down()
 }
 
 /// The token that names this activity task to the server. Hand it to whatever will finish

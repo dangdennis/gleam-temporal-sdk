@@ -14,6 +14,19 @@
 //// Keys become atoms, as `logger` metadata keys are, so use a fixed set of keys written in
 //// the code, never keys built from data. A field cannot replace the identity keys the SDK
 //// sets itself, such as `workflow_id`.
+////
+//// The lines reach `logger`'s default handler as it comes. `logger` starts at level
+//// `notice`, so info and debug lines show once the level is lowered, for instance with
+//// `logger:set_primary_config(level, info)`. Every line the SDK logs, these and the
+//// worker's own warnings and errors, carries the metadata `temporal => true` and no
+//// `domain`, so a handler or filter can pick the SDK's lines out by that key:
+////
+//// ```erlang
+//// logger:add_handler_filter(default, no_temporal, {fun
+////     (#{meta := #{temporal := true}}, _) -> stop;
+////     (_, _) -> ignore
+//// end, []}).
+//// ```
 
 import gleam/dynamic.{type Dynamic}
 import gleam/list

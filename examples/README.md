@@ -29,7 +29,7 @@ returns what happened.
 | [`search_attributes.gleam`](src/examples/search_attributes.gleam) | Search attributes and memo, `client.list`, `client.count`, `client.describe` |
 | [`versioning.gleam`](src/examples/versioning.gleam) | `patched` and `deprecate_patch`, with the replays that show a change is safe |
 | [`testing.gleam`](src/examples/testing.gleam) | An activity tested without a server, a workflow on a time-skipping server, a history replayed |
-| [`otp.gleam`](src/examples/otp.gleam) | A worker under a supervisor, graceful shutdown |
+| [`otp.gleam`](src/examples/otp.gleam) | A worker under a supervisor, graceful shutdown, waiting for SIGTERM |
 | [`interop.gleam`](src/examples/interop.gleam) | Calling activities that another SDK's worker implements, with its names and JSON shapes |
 | [`cloud.gleam`](src/examples/cloud.gleam) | Connecting to Temporal Cloud with an API key or a client certificate. Compiled, not run |
 | [`nexus.gleam`](src/examples/nexus.gleam) | Nexus operations: a handler, and a workflow that calls them |

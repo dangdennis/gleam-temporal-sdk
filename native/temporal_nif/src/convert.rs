@@ -572,12 +572,35 @@ fn command(command: bridge::Command, namespace: &str) -> DecodeResult<WorkflowCo
             workflow_type,
             task_queue,
             arguments,
-        } => Cmd::ContinueAsNewWorkflowExecution(wc::ContinueAsNewWorkflowExecution {
-            workflow_type,
-            task_queue,
-            arguments,
-            ..Default::default()
-        }),
+            options,
+        } => {
+            let bridge::ContinueAsNewOptions {
+                run_timeout_ms,
+                task_timeout_ms,
+                memo,
+                search_attributes: attributes,
+                headers,
+                retry,
+            } = options;
+            Cmd::ContinueAsNewWorkflowExecution(wc::ContinueAsNewWorkflowExecution {
+                workflow_type,
+                task_queue,
+                arguments,
+                workflow_run_timeout: opt_ms(
+                    run_timeout_ms,
+                    "ContinueAsNewOptions.run_timeout_ms",
+                )?,
+                workflow_task_timeout: opt_ms(
+                    task_timeout_ms,
+                    "ContinueAsNewOptions.task_timeout_ms",
+                )?,
+                memo,
+                search_attributes: search_attributes(attributes),
+                headers,
+                retry_policy: retry.map(retry_policy).transpose()?,
+                ..Default::default()
+            })
+        }
         C::CancelWorkflowExecution => {
             Cmd::CancelWorkflowExecution(wc::CancelWorkflowExecution::default())
         }

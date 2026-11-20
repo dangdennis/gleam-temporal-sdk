@@ -25,9 +25,9 @@ temporal server start-dev       # a local service, from the Temporal CLI
 | Module | For |
 |---|---|
 | `temporal/workflow` | Definitions, workflow code: activities, timers, futures, scopes, `now`, `random_int`, `uuid4`, logging, `patched`, `continue_as_new` |
-| `temporal/workflow/{signal,query,update,child,local_activity,operation}` | One module per thing a workflow does besides activities |
-| `temporal/activity` | Activity definitions and code: info, heartbeats, cancellation, logging |
-| `temporal/worker` | Running workflows and activities; middleware; `supervised` |
+| `temporal/workflow/{signal,query,update,child,local_activity,operation,continue_as_new}` | One module per thing a workflow does besides activities |
+| `temporal/activity` | Activity definitions and code: info, heartbeats, cancellation, `is_worker_shutting_down`, logging |
+| `temporal/worker` | Running workflows and activities: `run`, `start`/`stop`, `await_shutdown_signal`, `supervised`; middleware |
 | `temporal/client` | Connect; start, execute, signal, query, update, cancel, describe, list |
 | `temporal/retry`, `temporal/failure` | Retry policies; the `Failure` type |
 | `temporal/codec`, `temporal/schema` | Codecs for values; JSON objects described once |
@@ -79,21 +79,39 @@ fn say_hello_activity(
   Ok("Hello, " <> name <> "!")
 }
 
+/// The worker: the task queue it polls and what it can run.
+fn worker_config(client: Client) -> worker.Config {
+  worker.new(client, task_queue)
+  |> worker.with_workflows([workflow.handler(greet(), greet_workflow)])
+  |> worker.with_activities([activity.handler(say_hello(), say_hello_activity)])
+}
+
+/// Start the worker, run one workflow and stop the worker again, as a script or a test
+/// does.
 pub fn run(client: Client) -> Result(String, client.Error) {
-  use worker <- result.try(
-    worker.new(client, task_queue)
-    |> worker.with_workflows([workflow.handler(greet(), greet_workflow)])
-    |> worker.with_activities([
-      activity.handler(say_hello(), say_hello_activity),
-    ])
-    |> worker.start,
-  )
+  use worker <- result.try(worker.start(worker_config(client)))
   let options = client.start_options(workflow_id: "examples-hello", task_queue:)
   let greeting = client.execute(client, greet(), "Gleam", options)
   worker.stop(worker)
   greeting
 }
+
+/// How a worker runs for real: `worker.run` serves the task queue until the operating
+/// system asks the program to stop with SIGTERM, as a deploy does, then lets the
+/// activities in flight finish and returns. Never keep a worker alive with
+/// `process.sleep_forever`: SIGTERM would stop the VM under its activities.
+pub fn main() -> Nil {
+  let assert Ok(client) = client.connect(client.local())
+  let assert Ok(Nil) = worker.run(worker_config(client))
+  Nil
+}
 ```
+
+`run` is for scripts and tests. A deployed worker is `main`: `worker.run(config)` serves
+until SIGTERM and then stops gracefully. Never keep a worker alive with
+`process.sleep_forever()`; a deploy would abandon every activity in flight. For several
+workers use `worker.start` on each, `worker.await_shutdown_signal()`, then `worker.stop`
+on each; in an OTP application's supervision tree use `worker.supervised(config)`.
 
 The client comes from `client.connect(client.local())`. Workflow and activity functions
 always have the shape `fn(Context, input) -> Result(output, Failure)`. One input, one
@@ -223,6 +241,34 @@ An activity learns of cancellation only by heartbeating: call `activity.heartbea
 check `activity.is_cancelled(ctx)`, and return `Error(failure.cancelled())`. See
 [`heartbeats.gleam`](../../examples/src/examples/heartbeats.gleam).
 
+**Worker shutdown.** When a worker is asked to stop (`worker.stop`, SIGTERM under
+`worker.run`, a supervisor shutting down), in order: polling stops and
+`activity.is_worker_shutting_down(ctx)` turns true; workflow tasks in flight finish;
+activities run on for the shutdown grace (`worker.with_shutdown_grace`, 10 s); those left
+are told to cancel with `activity.cancel_reason(ctx) == Some(activity.WorkerShutdown)`;
+those left after the activity cancellation grace
+(`worker.with_activity_cancellation_grace`, 30 s) are killed. An activity cancelled or
+killed this way is retried on another worker. `worker.stop` returns when all of it is
+over. A long activity should check `is_worker_shutting_down`, heartbeat its progress
+with `activity.heartbeat_with` and return an error, so a deploy does not wait for it.
+
+**Continue-as-new** is `workflow.continue_as_new(ctx, definition, input)`; the new run
+keeps the task queue, memo, search attributes, retry policy and headers. To change them
+or set timeouts: `continue_as_new.options() |> continue_as_new.with_task_queue(..)` and
+`continue_as_new.run(ctx, definition, input, options)`, from
+`temporal/workflow/continue_as_new`.
+
+**Outbound middleware** takes the workflow's context first:
+`worker.with_outbound_activity(fn(ctx, call) { .. })`. Change the call with
+`middleware.with_activity_type` and its siblings, and guard a change with
+`workflow.patched(ctx, ..)`. See
+[`middleware.gleam`](../../examples/src/examples/middleware.gleam).
+
+**Values from other SDKs.** TypeScript's `undefined`, and any argument a caller leaves
+out, arrive as a null: declare them `schema.codec(schema.optional(..))`, or `codec.nil()`
+for a result that is nothing. `codec.float()` reads `10`; `codec.int()` reads `1e21`.
+Integers above 2^53 lose precision in JavaScript: send them as strings.
+
 Everything else has an example: see the table in
 [`examples/README.md`](../../examples/README.md) (timers, child workflows, saga,
 continue-as-new, local activities, schedules, middleware, supervised workers, other SDKs'
@@ -313,6 +359,11 @@ replays every workflow task.
 | Activity failure `activity type "x" is not registered on this worker, which has ... Add its handler to worker.with_activities.` (type `NotFound`) | Same for activities. Also check `workflow.with_task_queue` and outbound middleware renames |
 | `workflow "x": could not decode the input: field "id": expected String, found Int` (type `InvalidArgument`, not retried) | The caller's codec and the definition's disagree, or another SDK sends different JSON. Same message shape for `activity "x"` |
 | `activity "x": could not decode the result: ...` (type `InvalidResult`) | The activity's output codec does not match what the worker returned |
+| `could not decode the input: argument 2: expected Int, found Nil`, or `... the result: expected String, found Nil` | The other side sent nothing: a TypeScript `undefined`, or an argument left out. Make that value `schema.optional(..)`, or the result `codec.nil()` |
+| Activity failure `the activity process exited before reporting a result: killed` (type `ActivityProcessExited`, retried) | The activity's process was killed, or died with a process it had linked to (`process.spawn`, a port, a pool). Use `process.spawn_unlinked` and monitors, or trap exits |
+| Log warning `temporal: killed an activity that was still running after its cancellation grace` | An activity ignored a cancellation, a timeout or the worker's shutdown for the whole `worker.with_activity_cancellation_grace`. Heartbeat and check `activity.is_cancelled(ctx)` in long activities |
+| Every deploy makes activities time out and run again | The worker is kept alive with `process.sleep_forever()`, so SIGTERM stops the VM at once. Use `worker.run`, or `worker.await_shutdown_signal()` then `worker.stop` |
+| `workflow.log_info` lines do not show | Erlang's `logger` starts at level `notice`. Lower it: `logger:set_primary_config(level, info)`, or the `logging` package's `configure`. Warnings and errors show as they are; SDK lines carry the metadata `temporal => true` |
 | `client.DecodeFailed(..)` from `client.result` or `client.query` | The handle's definition has the wrong output codec, or the client lacks the payload codec the worker uses |
 | Crash `temporal_not_in_workflow`: `This function works only in workflow code, in the process the worker runs the workflow in. Activities, tests and processes a workflow spawns cannot call it.` | A `workflow.*` function called from an activity, a test or a spawned process |
 | `replayer.Nondeterminism(..)`, or workflow tasks failing with a nondeterminism error after a deploy | The code issues different commands than the history records. Guard the change with `workflow.patched` |

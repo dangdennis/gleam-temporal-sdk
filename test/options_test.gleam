@@ -3,6 +3,7 @@
 
 import gleam/dict
 import gleam/erlang/process
+import gleam/option
 import gleam/result
 import gleam/string
 import gleam/time/duration
@@ -18,6 +19,7 @@ import temporal/search_attributes
 import temporal/worker
 import temporal/workflow.{type Context}
 import temporal/workflow/child
+import temporal/workflow/continue_as_new
 import temporal/workflow/operation
 
 fn nap() {
@@ -94,6 +96,65 @@ fn tagging_workflow(ctx: Context, attribute: String) -> Result(Nil, Failure) {
   workflow.sleep(ctx, duration.milliseconds(10))
 }
 
+fn relay() {
+  workflow.Definition(
+    "relay",
+    codec.args2(codec.string(), codec.string()),
+    codec.string(),
+  )
+}
+
+fn trace(ctx: Context) -> String {
+  dict.get(workflow.headers(ctx), "trace")
+  |> result.try(fn(payload) {
+    codec.decode(codec.string(), payload) |> result.replace_error(Nil)
+  })
+  |> result.unwrap("none")
+}
+
+/// Three runs. The first continues as new as it comes; the second with every option set;
+/// the third reports what each of them was started with.
+fn relay_workflow(
+  ctx: Context,
+  input: #(String, String),
+) -> Result(String, Failure) {
+  let #(attribute, seen) = input
+  let seen = seen <> trace(ctx) <> " "
+  case string.split(string.trim(seen), " ") {
+    [_] -> workflow.continue_as_new(ctx, relay(), #(attribute, seen))
+    [_, _] ->
+      continue_as_new.run(
+        ctx,
+        relay(),
+        #(attribute, seen),
+        continue_as_new.options()
+          |> continue_as_new.with_task_queue(workflow.info(ctx).task_queue)
+          |> continue_as_new.with_run_timeout(duration.seconds(61))
+          |> continue_as_new.with_task_timeout(duration.seconds(7))
+          |> continue_as_new.with_memo(
+            dict.from_list([
+              #("note", codec.encode(codec.string(), "handed on")),
+            ]),
+          )
+          |> continue_as_new.with_search_attributes(
+            dict.from_list([#(attribute, search_attributes.Keyword("relayed"))]),
+          )
+          |> continue_as_new.with_headers(
+            dict.from_list([
+              #("trace", codec.encode(codec.string(), "replaced")),
+            ]),
+          )
+          |> continue_as_new.with_retry(retry.policy(maximum_attempts: 2)),
+      )
+    _ ->
+      Ok(
+        seen
+        <> "memo "
+        <> option.unwrap(workflow.memo(ctx, "note", codec.string()), "none"),
+      )
+  }
+}
+
 fn linger() {
   workflow.NexusOperation("waiting", "linger", codec.nil(), codec.string())
 }
@@ -125,6 +186,7 @@ fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
     workflow.handler(nursery(), nursery_workflow),
     workflow.handler(tagging(), tagging_workflow),
     workflow.handler(calling(), calling_workflow),
+    workflow.handler(relay(), relay_workflow),
   ])
   |> worker.with_activities([
     activity.handler(nap(), fn(_, ms) { Ok(process.sleep(ms)) }),
@@ -211,6 +273,42 @@ pub fn a_workflow_can_change_its_search_attributes_test() {
       Error(Nil) -> False
     }
   })
+}
+
+pub fn continue_as_new_passes_headers_on_and_takes_options_test() {
+  use env <- in_both_modes("relay")
+  let attribute = support.register_search_attribute()
+  let options =
+    start_options(env)
+    |> client.with_headers(
+      dict.from_list([#("trace", codec.encode(codec.string(), "original"))]),
+    )
+  let assert Ok(handle) =
+    client.start(env.client, relay(), #(attribute, ""), options)
+  // The second run was started with the first one's headers, the third with new ones.
+  assert client.result(handle)
+    == Ok("original original replaced memo handed on")
+  // The last run is the one the workflow id names now.
+  let last = client.handle(env.client, relay(), client.workflow_id(handle))
+  let assert Ok(description) = client.describe(last)
+  assert dict.get(description.memo, "note")
+    == Ok(codec.encode(codec.string(), "handed on"))
+  assert eventually(fn() {
+    let assert Ok(description) = client.describe(last)
+    case dict.get(description.search_attributes, attribute) {
+      Ok(payload) -> payload.data == <<"\"relayed\"":utf8>>
+      Error(Nil) -> False
+    }
+  })
+  let shown =
+    support.cmd(
+      "temporal workflow show --output json --workflow-id "
+      <> client.workflow_id(handle)
+      <> " 2>&1",
+    )
+  assert string.contains(shown, "\"workflowRunTimeout\": \"61s\"")
+  assert string.contains(shown, "\"workflowTaskTimeout\": \"7s\"")
+  assert string.contains(shown, "\"maximumAttempts\": 2")
 }
 
 pub fn cancelling_a_nexus_operation_cancels_the_workflow_behind_it_test() {

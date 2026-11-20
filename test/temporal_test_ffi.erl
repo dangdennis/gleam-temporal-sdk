@@ -1,5 +1,6 @@
 -module(temporal_test_ffi).
--export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, capture_log_metadata/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1, memory_mb/0, env_int/2, tcp_proxy/1, tcp_proxy_mode/2, silent_listener/0, run_only/1, await_log/2]).
+-export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, capture_log_metadata/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1, memory_mb/0, env_int/2, tcp_proxy/1, tcp_proxy_mode/2, silent_listener/0, run_only/1, await_log/2, record_self/1, recorded_pid/1, os_pid/0,
+         start_application/2]).
 
 unique() ->
     integer_to_binary(erlang:system_time(microsecond)).
@@ -84,7 +85,7 @@ relay(Recv, Send, Owner) ->
         {error, _} -> Owner ! closed
     end.
 
-%% Run Fun and return the messages logged under the temporal domain meanwhile, with the
+%% Run Fun and return the messages the SDK logged meanwhile, with the
 %% workflow id each carried. The default handler is silenced so the lines do not also reach
 %% the test output.
 capture_logs(Fun) ->
@@ -131,7 +132,7 @@ drain_logs(Seen) ->
     end.
 
 %% logger handler callback.
-log(#{level := Level, msg := {Format, Args}, meta := #{domain := [temporal]} = Meta},
+log(#{level := Level, msg := {Format, Args}, meta := #{temporal := true} = Meta},
     #{config := {Pid, Detail}}) ->
     Text = unicode:characters_to_binary(io_lib:format(Format, Args)),
     Pid ! {temporal_log, {Level, Text, detail(Detail, Meta)}},
@@ -142,7 +143,7 @@ log(_, _) ->
 detail(workflow_id, Meta) ->
     maps:get(workflow_id, Meta, <<>>);
 detail(everything, Meta) ->
-    Given = maps:without([domain, pid, gl, time, mfa, file, line], Meta),
+    Given = maps:without([temporal, pid, gl, time, mfa, file, line], Meta),
     [unicode:characters_to_binary(io_lib:format("~ts=~0tp", [K, V]))
      || {K, V} <- lists:sort(maps:to_list(Given))].
 
@@ -320,3 +321,29 @@ run_only(Modules) ->
         ok -> halt(0);
         _ -> halt(1)
     end.
+
+%% The calling process, kept where the test that started it can find it.
+record_self(Key) ->
+    persistent_term:put({temporal_test_pid, Key}, self()),
+    nil.
+
+recorded_pid(Key) ->
+    case persistent_term:get({temporal_test_pid, Key}, none) of
+        none -> {error, nil};
+        Pid -> {ok, Pid}
+    end.
+
+os_pid() ->
+    list_to_binary(os:getpid()).
+
+%% Start an OTP application whose top supervisor is the one StartSupervisor starts, so
+%% that `init:stop()` shuts it down the way it shuts down any application.
+start_application(Name, StartSupervisor) ->
+    App = binary_to_atom(Name),
+    ok = application:load({application, App,
+                           [{description, "temporal_gleam test application"},
+                            {vsn, "1"},
+                            {applications, [kernel, stdlib]},
+                            {mod, {temporal_test_app, StartSupervisor}}]}),
+    ok = application:start(App),
+    nil.

@@ -15,9 +15,7 @@ import temporal/activity
 import temporal/client.{type Client}
 import temporal/internal/bridge
 import temporal/internal/poller
-import temporal/middleware.{
-  type ActivityCall, type ChildCall, type Outbound, Outbound,
-}
+import temporal/middleware.{type ActivityCall, type ChildCall, type Outbound}
 import temporal/nexus
 import temporal/workflow
 
@@ -52,7 +50,8 @@ pub type Config {
     /// How long a cancelled activity gets to stop by itself before its process is killed
     /// and it is reported as cancelled. `None` never kills.
     activity_cancellation_grace: Option(Duration),
-    /// How long stopping the worker waits for activities in flight.
+    /// How long activities in flight carry on undisturbed after the worker is asked to
+    /// stop, before they are told to cancel.
     shutdown_grace: Duration,
   )
 }
@@ -210,31 +209,33 @@ pub fn with_activity_middleware(
   )
 }
 
-/// Rewrite every activity a workflow schedules, for example to rename an activity type.
-/// See `temporal/middleware` for the rules such a function must follow.
+/// Rewrite every activity a workflow schedules, local activities included: for example
+/// to rename an activity type. `rewrite` is given the context the workflow scheduled the
+/// activity with, so it can call `workflow.patched` and the rest of `temporal/workflow`;
+/// change the call with the `with_activity_` functions of `temporal/middleware`, which
+/// also has the rules such a function must follow. A rewrite added later sees what the
+/// earlier ones made of the call.
 pub fn with_outbound_activity(
   config: Config,
-  rewrite: fn(ActivityCall) -> ActivityCall,
+  rewrite: fn(workflow.Context, ActivityCall) -> ActivityCall,
 ) -> Config {
-  let previous = config.outbound.activity
   Config(
     ..config,
-    outbound: Outbound(..config.outbound, activity: fn(call) {
-      rewrite(previous(call))
+    outbound: middleware.add_activity(config.outbound, fn(scope, call) {
+      rewrite(workflow.context_of(scope), call)
     }),
   )
 }
 
-/// Rewrite every child workflow a workflow starts.
+/// Rewrite every child workflow a workflow starts. See `with_outbound_activity`.
 pub fn with_outbound_child(
   config: Config,
-  rewrite: fn(ChildCall) -> ChildCall,
+  rewrite: fn(workflow.Context, ChildCall) -> ChildCall,
 ) -> Config {
-  let previous = config.outbound.child
   Config(
     ..config,
-    outbound: Outbound(..config.outbound, child: fn(call) {
-      rewrite(previous(call))
+    outbound: middleware.add_child(config.outbound, fn(scope, call) {
+      rewrite(workflow.context_of(scope), call)
     }),
   )
 }
@@ -258,7 +259,14 @@ pub fn with_deployment(config: Config, deployment: Deployment) -> Config {
 /// Kill an activity that is still running this long after it was asked to stop, and report
 /// it as cancelled. The default is thirty seconds. An activity that checks
 /// `activity.is_cancelled` stops well within that; the limit is for one that is stuck, which
-/// would otherwise hold its slot on the worker for good. `None` never kills.
+/// would otherwise hold its slot on the worker for good.
+///
+/// An activity is asked to stop when its workflow cancels it, when the worker's shutdown
+/// grace runs out, and when one of its timeouts has passed: an activity that hangs is
+/// killed this long after its start-to-close or heartbeat timeout, plus the five seconds
+/// the worker allows the server's clock.
+///
+/// `None` never kills. `stop` then waits for as long as the slowest activity takes.
 pub fn with_activity_cancellation_grace(
   config: Config,
   grace: Option(Duration),
@@ -266,10 +274,9 @@ pub fn with_activity_cancellation_grace(
   Config(..config, activity_cancellation_grace: grace)
 }
 
-/// How long `stop` waits for activities in flight, ten seconds by default. When the
-/// worker is asked to stop, running activities see a `WorkerShutdown` cancellation at
-/// once, so that they can finish or checkpoint; whatever is still running when the time is
-/// up is abandoned, and the server gives it to another worker when its timeout passes.
+/// How long activities in flight carry on undisturbed once the worker is asked to stop,
+/// ten seconds by default. Set it to what a typical activity needs to finish. See `stop`
+/// for everything that happens, in order.
 pub fn with_shutdown_grace(config: Config, grace: Duration) -> Config {
   Config(..config, shutdown_grace: grace)
 }
@@ -298,6 +305,16 @@ pub fn start(config: Config) -> Result(Worker, client.Error) {
 
 /// A child specification for running the worker under a `gleam/otp` supervisor, which
 /// restarts it if it gives up.
+///
+/// When the supervisor shuts down, the worker stops as `stop` describes, and the
+/// supervisor waits for it: the shutdown grace, the activity cancellation grace and
+/// fifteen seconds more. With no activity cancellation grace it waits for thirty seconds
+/// in its place and then kills the worker.
+///
+/// The VM answers SIGTERM with `init:stop()`, which shuts down supervisors that belong to
+/// an OTP application and kills every other process. A worker supervised under an
+/// application's supervision tree therefore drains on SIGTERM as it is; anywhere else, use
+/// `run` or `await_shutdown_signal`.
 pub fn supervised(config: Config) -> supervision.ChildSpecification(Worker) {
   supervision.worker(fn() {
     case start(config) {
@@ -306,9 +323,60 @@ pub fn supervised(config: Config) -> supervision.ChildSpecification(Worker) {
     }
   })
   // Stopping waits for tasks in flight, which is longer than a supervisor waits by default.
-  |> supervision.timeout(
-    duration.to_milliseconds(config.shutdown_grace) + 10_000,
-  )
+  |> supervision.timeout(case stop_limit_ms(config) {
+    0 ->
+      duration.to_milliseconds(config.shutdown_grace)
+      + 30_000
+      + stop_margin_ms
+      + loops_margin_ms
+    limit -> limit + loops_margin_ms
+  })
+}
+
+/// Start the worker and run it until the operating system asks the program to stop with
+/// SIGTERM, which is what `docker stop`, Kubernetes and systemd send. Then stop it
+/// gracefully, as `stop` describes, and return. This is how to run a worker in production:
+///
+/// ```gleam
+/// pub fn main() {
+///   let assert Ok(client) = client.connect(client.local())
+///   let assert Ok(Nil) =
+///     worker.new(client, "orders")
+///     |> worker.with_workflows([...])
+///     |> worker.run
+/// }
+/// ```
+///
+/// Without this, SIGTERM stops the VM within milliseconds and every activity in flight is
+/// abandoned until its timeout. The process manager has to allow the time a graceful stop
+/// takes: the shutdown grace plus the activity cancellation grace at most.
+///
+/// For several workers in one program, use `start`, `await_shutdown_signal` and `stop`.
+pub fn run(config: Config) -> Result(Nil, client.Error) {
+  // Before the worker starts, so that a signal during start-up is not lost.
+  bridge.trap_shutdown_signal()
+  use worker <- result.map(start(config))
+  await_shutdown_signal()
+  stop(worker)
+}
+
+/// Block until the operating system asks the program to stop with SIGTERM, for programs
+/// that stop their workers themselves:
+///
+/// ```gleam
+/// let assert Ok(orders) = worker.start(orders_config)
+/// let assert Ok(billing) = worker.start(billing_config)
+/// worker.await_shutdown_signal()
+/// worker.stop(orders)
+/// worker.stop(billing)
+/// ```
+///
+/// The first call takes SIGTERM over from the VM, which would otherwise stop at once; from
+/// then on the program is responsible for exiting. Once the signal has arrived every call
+/// returns immediately, and further SIGTERMs change nothing. Other signals keep their
+/// usual effect. SIGINT cannot be waited for: the VM does not hand it to Erlang code.
+pub fn await_shutdown_signal() -> Nil {
+  bridge.await_shutdown_signal()
 }
 
 @internal
@@ -316,8 +384,28 @@ pub fn manager(worker: Worker) -> Pid {
   worker.manager
 }
 
-/// Stop polling and wait for tasks in flight to finish, for as long as the worker's
-/// shutdown grace allows.
+/// Stop the worker gracefully and return once it has stopped: no activity of the worker
+/// is still running and nothing more will be reported to the server. In order:
+///
+/// 1. The worker stops asking for tasks, and `activity.is_worker_shutting_down` turns
+///    true in every running activity.
+/// 2. Workflow tasks in flight are finished. Workflows are not harmed by a worker
+///    stopping: another worker carries them on.
+/// 3. Activities in flight keep running for the shutdown grace
+///    (`with_shutdown_grace`, ten seconds by default). One that finishes in that time is
+///    reported as usual.
+/// 4. Activities still running are then told to cancel, with the reason `WorkerShutdown`:
+///    see `activity.cancel_reason`. One that accepts, by returning
+///    `Error(failure.cancelled())`, is reported to the server as failed by the shutdown,
+///    and retried on another worker by its retry policy. One that finishes its work
+///    instead is reported with its result.
+/// 5. Activities still running the activity cancellation grace later
+///    (`with_activity_cancellation_grace`, thirty seconds by default) are killed, and
+///    reported and retried the same way.
+///
+/// So `stop` takes at most the two graces and a little more, and usually as long as the
+/// slowest activity. The same happens when the process that started the worker exits, or
+/// its supervisor shuts down.
 pub fn stop(worker: Worker) -> Nil {
   case process.is_alive(worker.manager) {
     True -> process.call_forever(worker.control, Stop)
@@ -336,6 +424,8 @@ type Manager {
     /// Where a loop reports that polling failed.
     failures: Subject(Event),
     nif: bridge.NifWorker,
+    /// What the worker's activities read to learn that it is shutting down.
+    shutting_down: bridge.Flag,
     /// How many times the worker has registered with core. A loop reports a failed poll
     /// with the registration it polled for, so that a late report about an earlier one is
     /// not taken for news about this one.
@@ -365,6 +455,12 @@ const restart_window_ms = 60_000
 /// The longest wait between attempts to register again after polling failed.
 const max_register_wait_ms = 30_000
 
+/// How long stopping waits for core beyond the two grace periods.
+const stop_margin_ms = 10_000
+
+/// How long stopping waits for the polling loops to end once core has shut down.
+const loops_margin_ms = 5000
+
 @external(erlang, "temporal_ffi", "system_time_ms")
 fn now_ms() -> Int
 
@@ -389,7 +485,17 @@ fn manage(
         |> process.select_trapped_exits(Exited)
       let manager =
         start_loops(
-          Manager(config, parent, events, failures, nif, 1, dict.new(), []),
+          Manager(
+            config:,
+            parent:,
+            events:,
+            failures:,
+            nif:,
+            shutting_down: bridge.new_flag(),
+            registration: 1,
+            loops: dict.new(),
+            restarts: [],
+          ),
         )
       process.send(started, Ok(control))
       supervise(manager)
@@ -421,7 +527,7 @@ fn register(config: Config, attempts: Int) -> Result(bridge.NifWorker, String) {
 
 fn start_loops(manager: Manager) -> Manager {
   let loops =
-    loops(manager.config, manager.nif)
+    loops(manager.config, manager.nif, manager.shutting_down)
     |> list.map(fn(loop) { #(start_loop(manager, loop), loop) })
     |> dict.from_list
   Manager(..manager, loops:)
@@ -451,7 +557,7 @@ fn leave(reason: process.ExitReason) -> Nil {
 fn supervise(manager: Manager) -> Nil {
   case process.selector_receive_forever(manager.events) {
     Control(Stop(reply)) -> {
-      bridge.worker_shutdown(manager.nif)
+      shut_down(manager)
       process.send(reply, Nil)
     }
     PollingFailed(registration:, ..) if registration != manager.registration ->
@@ -467,14 +573,23 @@ fn supervise(manager: Manager) -> Nil {
         <> "\" failed, registering the worker again: "
         <> message,
       ))
-      bridge.worker_shutdown(manager.nif)
+      // Core has stopped this worker's polling already. Its activities are told so, and
+      // given the shutdown grace to finish before the worker registers afresh.
+      bridge.raise_flag(manager.shutting_down)
+      bridge.worker_shutdown(
+        manager.nif,
+        duration.to_milliseconds(manager.config.shutdown_grace) + 5000,
+      )
       // The old loops end by themselves, and are no longer this worker's to restart.
-      register_again(Manager(..manager, loops: dict.new()), 1000)
+      register_again(
+        Manager(..manager, loops: dict.new(), shutting_down: bridge.new_flag()),
+        1000,
+      )
     }
     Exited(process.ExitMessage(pid, reason)) ->
       case dict.get(manager.loops, pid), reason {
         Error(Nil), _ if pid == manager.parent -> {
-          bridge.worker_shutdown(manager.nif)
+          shut_down(manager)
           leave(reason)
         }
         // Something else that was linked to this process.
@@ -494,7 +609,9 @@ fn supervise(manager: Manager) -> Nil {
           ))
           case list.length(recent) >= max_restarts {
             True -> {
-              bridge.worker_shutdown(manager.nif)
+              shut_down(
+                Manager(..manager, loops: dict.delete(manager.loops, pid)),
+              )
               report(config_error(
                 "giving up on task queue \""
                 <> manager.config.task_queue
@@ -514,6 +631,48 @@ fn supervise(manager: Manager) -> Nil {
               )
           }
         }
+      }
+  }
+}
+
+/// Stop the worker in core and wait until it has stopped: see `stop`.
+fn shut_down(manager: Manager) -> Nil {
+  bridge.raise_flag(manager.shutting_down)
+  bridge.worker_shutdown(manager.nif, stop_limit_ms(manager.config))
+  // Core is done once every poll has been answered with a shutdown, which is what ends
+  // the loops. They are given a moment to be gone before this returns.
+  await_loops(manager, now_ms() + loops_margin_ms)
+}
+
+/// The longest a graceful stop can take in core: both grace periods and a margin. Zero,
+/// which is no limit, when activities are never killed.
+fn stop_limit_ms(config: Config) -> Int {
+  case config.activity_cancellation_grace {
+    None -> 0
+    Some(grace) ->
+      duration.to_milliseconds(config.shutdown_grace)
+      + duration.to_milliseconds(grace)
+      + stop_margin_ms
+  }
+}
+
+fn await_loops(manager: Manager, until: Int) -> Nil {
+  let remaining = int.max(until - now_ms(), 0)
+  case dict.is_empty(manager.loops) {
+    True -> Nil
+    False ->
+      // Only exits are taken, so that a request to stop that arrives now is not lost.
+      case
+        process.new_selector()
+        |> process.select_trapped_exits(fn(exit) { exit.pid })
+        |> process.selector_receive(remaining)
+      {
+        Ok(pid) ->
+          await_loops(
+            Manager(..manager, loops: dict.delete(manager.loops, pid)),
+            until,
+          )
+        Error(Nil) -> Nil
       }
   }
 }
@@ -606,7 +765,11 @@ fn worker_options(config: Config) -> bridge.WorkerOptions {
 }
 
 /// The polling loops this worker needs.
-fn loops(config: Config, nif: bridge.NifWorker) -> List(Loop) {
+fn loops(
+  config: Config,
+  nif: bridge.NifWorker,
+  shutting_down: bridge.Flag,
+) -> List(Loop) {
   let codec = client.payload_codec(config.client)
   let workflows =
     dict.from_list(
@@ -646,6 +809,7 @@ fn loops(config: Config, nif: bridge.NifWorker) -> List(Loop) {
         config.task_queue,
         codec,
         option.map(config.activity_cancellation_grace, duration.to_milliseconds),
+        fn() { bridge.flag_raised(shutting_down) },
       )
     })
   let nexus_loop =

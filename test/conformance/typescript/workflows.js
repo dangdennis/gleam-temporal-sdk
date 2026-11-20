@@ -164,6 +164,36 @@ exports.doubling = async function doubling(n) {
 
 const { join } = wf.proxyActivities({ startToCloseTimeout: '10 seconds' });
 
+const { maybe, nothing } = wf.proxyActivities({ startToCloseTimeout: '10 seconds' });
+
+// Values that are not there: an argument the caller left out, and activities and a child
+// workflow that return undefined. Each travels as a binary/null payload.
+exports.optional = async function optional(label, suffix) {
+  const absent = await maybe(false);
+  const present = await maybe(true);
+  await nothing();
+  const said = await wf.executeChild('silent', { workflowId: `${wf.workflowInfo().workflowId}-silent` });
+  return `${label}${suffix ?? ''}: ${[absent, present, said].map((value) => value ?? 'none').join(', ')}`;
+};
+
+exports.silent = async function silent() {
+  return undefined;
+};
+
+// Continue-as-new with options: the next run gets a memo and timeouts of its own.
+exports.handover = async function handover(remaining) {
+  await wf.sleep(5);
+  if (remaining > 0) {
+    const next = wf.makeContinueAsNewFunc({
+      memo: { generation: `${remaining - 1} to go` },
+      workflowRunTimeout: '1 minute',
+      workflowTaskTimeout: '5 seconds',
+    });
+    await next(remaining - 1);
+  }
+  return wf.workflowInfo().memo?.generation ?? 'first';
+};
+
 // Several arguments, to a workflow and to an activity.
 exports.arguments = async function severalArguments(greeting, times, loud) {
   const joined = await join(greeting, times);

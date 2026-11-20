@@ -100,11 +100,19 @@ fn record_activity(seen: Subject(String)) -> activity.Middleware {
 
 /// Outbound middleware: rewrites an activity as the workflow schedules it. It runs inside
 /// workflow code and its answer is recorded in history, so it must keep giving the same
-/// answer for as long as those histories can be replayed.
-fn redirect(call: middleware.ActivityCall) -> middleware.ActivityCall {
+/// answer for as long as those histories can be replayed. It is given the workflow's
+/// context for that: `workflow.patched` keeps runs that started before the redirect on
+/// the activity they recorded.
+fn redirect(
+  ctx: workflow.Context,
+  call: middleware.ActivityCall,
+) -> middleware.ActivityCall {
   case call.activity_type {
     "send_email" ->
-      middleware.ActivityCall(..call, activity_type: "send_email_v2")
+      case workflow.patched(ctx, "send-email-v2") {
+        True -> middleware.with_activity_type(call, "send_email_v2")
+        False -> call
+      }
     _ -> call
   }
 }

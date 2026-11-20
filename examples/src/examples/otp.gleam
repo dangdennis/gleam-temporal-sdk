@@ -4,10 +4,16 @@
 //// A service adds `worker.supervised` to its supervision tree instead: the supervisor
 //// restarts the worker if it gives up, and stops it in order when the application stops.
 ////
-//// Stopping is graceful. The worker stops polling, activities in flight see a
-//// `WorkerShutdown` cancellation and get the shutdown grace to finish, and whatever they
-//// return in that time is reported. Work that is not finished is not lost: the server
-//// hands it to another worker when its timeout passes.
+//// Stopping is graceful. The worker stops polling, and activities in flight get the
+//// shutdown grace to finish; `activity.is_worker_shutting_down` tells them from the start
+//// that the time is running. Those still going when it is up are told to cancel with the
+//// reason `WorkerShutdown`, and killed if they outstay the activity cancellation grace
+//// too. Work that is not finished is not lost: the server retries it on another worker.
+////
+//// A deploy stops the program with SIGTERM. In an OTP application the VM answers by
+//// shutting down the supervision tree, and a supervised worker drains as described. A
+//// program that is not an application has to wait for the signal itself: `worker.run`
+//// for one worker, as in `hello.gleam`, or `main` below for a supervisor.
 
 import gleam/erlang/process
 import gleam/otp/actor
@@ -54,7 +60,8 @@ fn worker_config(
       Ok("rendered " <> page)
     }),
   ])
-  // How long stopping waits for activities in flight. The default is ten seconds.
+  // How long activities in flight are left to finish before they are told to cancel.
+  // The default is ten seconds.
   |> worker.with_shutdown_grace(duration.seconds(20))
 }
 
@@ -71,8 +78,8 @@ pub fn start_supervisor(
 }
 
 /// Stop the supervisor and wait until it is down. A supervisor stops when its parent, here
-/// the calling process, tells it to, and stops the worker first, giving it its grace
-/// period. In an application the VM does this as it shuts down.
+/// the calling process, tells it to, and stops the worker first, waiting while it
+/// drains. In an application the VM does this as it shuts down.
 fn stop_supervisor(supervisor: actor.Started(Supervisor)) -> Nil {
   let monitor = process.monitor(supervisor.pid)
   process.send_exit(supervisor.pid)
@@ -104,6 +111,15 @@ pub fn run(client: Client) -> Result(#(String, Int), client.Error) {
   }
   stop_supervisor(supervisor)
   outcome
+}
+
+/// A program that is not an OTP application: supervise the worker, wait until the
+/// operating system asks the program to stop with SIGTERM, then shut the tree down.
+pub fn main() -> Nil {
+  let assert Ok(client) = client.connect(client.local())
+  let assert Ok(supervisor) = start_supervisor(client, process.new_subject())
+  worker.await_shutdown_signal()
+  stop_supervisor(supervisor)
 }
 
 fn count(started: process.Subject(String), seen: Int) -> Int {

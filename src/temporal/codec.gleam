@@ -3,10 +3,29 @@
 //// Gleam has no runtime reflection, so every workflow, activity, signal and query declares
 //// a codec for the values it sends. The JSON codecs produce `json/plain` payloads, the same
 //// encoding the other Temporal SDKs use by default, so values interoperate across languages.
+////
+//// Reading what other SDKs write, the JSON codecs make these allowances:
+////
+//// - A `binary/null` payload, which is how TypeScript sends `undefined` and how every SDK
+////   sends an argument the caller left out, reads as JSON `null`. An optional value takes
+////   it as `None`; anything else fails with `expected String, found Nil` and the like.
+//// - `float()` reads a number written without a fraction, such as `10`, which is how
+////   JavaScript writes a whole float.
+//// - `int()` reads a number written with a fraction or an exponent when its value is
+////   whole, such as `1e21`, which is how JavaScript writes large numbers.
+//// - A `\\u` escape for half of a UTF-16 surrogate pair with no other half, which a
+////   JavaScript string cut through an emoji produces, reads as U+FFFD, the replacement
+////   character.
+////
+//// One thing cannot be allowed for. Gleam integers have no size limit, and JavaScript
+//// reads every JSON number as a 64-bit float: an integer beyond 2^53 (9007199254740992)
+//// sent to a TypeScript workflow or activity arrives rounded. Send such values as strings.
 
 import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode.{type Decoder}
+import gleam/float
+import gleam/int
 import gleam/json.{type Json}
 import gleam/list
 import gleam/result
@@ -161,7 +180,8 @@ fn argument(
   })
 }
 
-/// A codec for values encoded as JSON.
+/// A codec for values encoded as JSON. A `binary/null` payload, which other SDKs send for
+/// a missing value, is read as JSON `null`.
 pub fn json(to_json: fn(a) -> Json, decoder: Decoder(a)) -> Codec(a) {
   Codec(
     encode: fn(value) {
@@ -171,19 +191,47 @@ pub fn json(to_json: fn(a) -> Json, decoder: Decoder(a)) -> Codec(a) {
       )
     },
     decode: fn(payload: Payload) {
-      json.parse_bits(payload.data, decoder)
-      |> result.map_error(describe_json_error)
+      let text = case dict.get(payload.metadata, "encoding") {
+        Ok(<<"binary/null":utf8>>) -> <<"null":utf8>>
+        _ -> payload.data
+      }
+      parse_json(text, decoder) |> result.map_error(describe_json_error)
     },
   )
 }
+
+/// Parse JSON text. Erlang's parser refuses an escaped lone surrogate, which JavaScript
+/// writes without complaint, so text it refuses is tried again with those replaced.
+fn parse_json(
+  text: BitArray,
+  decoder: Decoder(a),
+) -> Result(a, json.DecodeError) {
+  case json.parse_bits(text, decoder) {
+    Error(json.UnableToDecode(_)) as mismatch -> mismatch
+    Error(error) ->
+      case replace_lone_surrogates(text) {
+        repaired if repaired != text -> json.parse_bits(repaired, decoder)
+        _ -> Error(error)
+      }
+    Ok(value) -> Ok(value)
+  }
+}
+
+@external(erlang, "temporal_ffi", "replace_lone_surrogates")
+fn replace_lone_surrogates(json: BitArray) -> BitArray
 
 /// A JSON decoding failure in words: which field, what was expected, what was found.
 fn describe_json_error(error: json.DecodeError) -> String {
   case error {
     json.UnexpectedEndOfInput -> "the JSON ends early"
     json.UnexpectedByte(byte) -> "not valid JSON: unexpected " <> byte
+    // The parser quotes the input, which need not be text.
     json.UnexpectedSequence(sequence) ->
-      "not valid JSON: unexpected " <> sequence
+      "not valid JSON: unexpected "
+      <> case bit_array.to_string(bit_array.from_string(sequence)) {
+        Ok(sequence) -> sequence
+        Error(Nil) -> bit_array.inspect(bit_array.from_string(sequence))
+      }
     json.UnableToDecode(errors) ->
       list.map(errors, fn(error) {
         let where = case error.path {
@@ -201,14 +249,36 @@ pub fn string() -> Codec(String) {
   json(json.string, decode.string)
 }
 
-/// A codec for a JSON integer.
+/// A codec for a JSON integer. A number written with a fraction or an exponent is read
+/// too when its value is whole, such as `1e21`: JavaScript writes large numbers that way.
 pub fn int() -> Codec(Int) {
-  json(json.int, decode.int)
+  json(json.int, int_decoder())
 }
 
-/// A codec for a JSON number.
+/// A codec for a JSON number, read as a float. A number written without a fraction, such
+/// as `10`, is read too, since JavaScript writes whole floats that way.
 pub fn float() -> Codec(Float) {
-  json(json.float, decode.float)
+  json(json.float, float_decoder())
+}
+
+/// Decodes an integer, however the number was written. `schema.int()` uses it too.
+@internal
+pub fn int_decoder() -> Decoder(Int) {
+  decode.one_of(decode.int, [
+    decode.then(decode.float, fn(number) {
+      let whole = float.truncate(number)
+      case int.to_float(whole) == number {
+        True -> decode.success(whole)
+        False -> decode.failure(0, "Int")
+      }
+    }),
+  ])
+}
+
+/// Decodes a float, with or without a fraction. `schema.float()` uses it too.
+@internal
+pub fn float_decoder() -> Decoder(Float) {
+  decode.one_of(decode.float, [decode.map(decode.int, int.to_float)])
 }
 
 /// A codec for a JSON boolean.
@@ -229,7 +299,8 @@ pub fn bytes() -> Codec(BitArray) {
   )
 }
 
-/// A codec for `Nil`, encoded as Temporal's null payload. Any payload decodes to `Nil`.
+/// A codec for `Nil`, encoded as Temporal's null payload. Any payload decodes to `Nil`:
+/// the `binary/null` payload and the JSON `null` that other SDKs send for nothing alike.
 pub fn nil() -> Codec(Nil) {
   Codec(encode: fn(_) { null_payload() }, decode: fn(_) { Ok(Nil) })
 }

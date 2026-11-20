@@ -1,5 +1,6 @@
 //// The test helpers themselves: a time-skipping server and server-less activity contexts.
 
+import gleam/dict
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
@@ -130,9 +131,10 @@ pub fn an_activity_can_be_tested_without_a_server_test() {
 
   // A retry resumes from the progress the last attempt recorded.
   let info =
-    activity.Info(..testing.activity_info(), attempt: 2, heartbeat_details: [
-      codec.encode(codec.int(), 2),
-    ])
+    testing.activity_info()
+    |> testing.with_attempt(2)
+    |> testing.with_heartbeat_details(codec.int(), 2)
+  assert info.attempt == 2
   let env = testing.activity_env(info)
   assert counting(testing.activity_context(env), 3) == Ok(3)
   assert testing.heartbeats(env, codec.int()) == [3]
@@ -160,6 +162,20 @@ pub fn the_final_attempt_is_the_one_the_retry_policy_ends_on_test() {
   assert !on_attempt(1000, Some(retry.policy(maximum_attempts: 0)))
   assert !on_attempt(1000, None)
   assert testing.activity_info().retry == None
+  // The same, built with the setters.
+  let third =
+    testing.activity_info()
+    |> testing.with_attempt(3)
+    |> testing.with_retry(retry.policy(maximum_attempts: 3))
+    |> testing.with_activity_type("charge")
+    |> testing.with_headers(
+      dict.from_list([#("tenant", codec.encode(codec.string(), "acme"))]),
+    )
+  assert activity.is_final_attempt(
+    testing.activity_context(testing.activity_env(third)),
+  )
+  assert third.activity_type == "charge"
+  assert dict.size(third.headers) == 1
 }
 
 @external(erlang, "temporal_test_ffi", "capture_log_metadata")

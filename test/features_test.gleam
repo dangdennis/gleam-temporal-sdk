@@ -383,9 +383,12 @@ fn workflows() -> List(workflow.Handler) {
 
 // ---- middleware ----
 
-fn rename_double(call: middleware.ActivityCall) -> middleware.ActivityCall {
+fn rename_double(
+  _ctx: Context,
+  call: middleware.ActivityCall,
+) -> middleware.ActivityCall {
   case call.activity_type {
-    "double" -> middleware.ActivityCall(..call, activity_type: "double_v2")
+    "double" -> middleware.with_activity_type(call, "double_v2")
     _ -> call
   }
 }

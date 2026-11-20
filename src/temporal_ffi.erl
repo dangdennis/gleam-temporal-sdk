@@ -5,11 +5,11 @@
 -export([connect/1, schedule_create/4, schedule_update/5, update_with_start/4, complete_activity_async/3, defer_activity/0,
          activity_deferred/0, follow/1, new_cell/0, read_cell/1, write_cell/2, update_workflow/4, poll_update/4, poll_nexus/1, complete_nexus/3, aes_gcm_encrypt/2, aes_gcm_decrypt/2, schedule_describe/2, schedule_delete/2,
          schedule_patch/3, schedule_list/1, system_time_ms/0, server_start/2, server_stop/1, time_control/2, worker_new/3, replay_worker_new/2, poll_workflow/1, complete_workflow/2,
-         poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/3, worker_shutdown/1,
+         poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/3, worker_shutdown/2, new_flag/0, raise_flag/1, flag_raised/1,
          start_workflow/3, describe_workflow/3, list_workflows/3, count_workflows/2, signal_workflow/5, query_workflow/5, cancel_workflow/3,
          terminate_workflow/4, workflow_result/3, fetch_history/3,
          send_activation/2, receive_activation/0, get_state/0, put_state/1, rescue/1,
-         exit_normal/0, kill/1]).
+         exit_normal/0, kill/1, replace_lone_surrogates/1]).
 
 %% Start an asynchronous NIF call and wait for its reply. A NIF that rejects its arguments
 %% returns the error directly and never replies.
@@ -120,10 +120,14 @@ activity_cancel_reason() ->
 %% Metadata is a list of {Key, Value}; a later entry replaces an earlier one with the same
 %% key. Keys are written in code, by this library or as log fields, so making atoms of them
 %% is safe.
+%%
+%% The event carries no `domain`: OTP's default handler drops every event whose domain is
+%% not `[otp]` or `[otp, sasl]`, so a domain of our own would hide the SDK's lines from
+%% anyone who has not reconfigured logger. `temporal => true` marks them instead.
 log(Level, Message, Metadata) ->
     Meta = lists:foldl(fun({K, V}, Acc) -> Acc#{binary_to_atom(K) => V} end,
                        #{}, Metadata),
-    logger:log(Level, "~ts", [Message], Meta#{domain => [temporal]}),
+    logger:log(Level, "~ts", [Message], Meta#{temporal => true}),
     nil.
 
 rescue_all(Fun) ->
@@ -134,8 +138,19 @@ rescue_all(Fun) ->
                       io_lib:format("~p: ~0tp~n~0tp", [Class, Reason, Stack]))}
     end.
 
-worker_shutdown(Worker) ->
-    call(fun(P, R) -> temporal_nif:worker_shutdown(P, R, Worker) end).
+worker_shutdown(Worker, LimitMs) ->
+    call(fun(P, R) -> temporal_nif:worker_shutdown(P, R, Worker, LimitMs) end).
+
+%% A flag that processes share without messages: an activity reads its worker's.
+new_flag() ->
+    atomics:new(1, []).
+
+raise_flag(Flag) ->
+    atomics:put(Flag, 1, 1),
+    nil.
+
+flag_raised(Flag) ->
+    atomics:get(Flag, 1) =:= 1.
 
 start_workflow(Conn, Request, Signal) ->
     call(fun(P, R) -> temporal_nif:start_workflow(P, R, Conn, Request, Signal) end).
@@ -253,3 +268,41 @@ aes_gcm_decrypt(Key, <<Nonce:12/binary, Rest/binary>>) when byte_size(Rest) >= 1
     end;
 aes_gcm_decrypt(_, _) ->
     {error, nil}.
+
+%% JSON text with every escaped UTF-16 surrogate that has no partner replaced by the
+%% escape of U+FFFD. A backslash appears in JSON only inside a string and always starts an
+%% escape, so the escapes can be walked without parsing anything else.
+replace_lone_surrogates(Json) ->
+    replace_lone_surrogates(Json, <<>>).
+
+replace_lone_surrogates(<<"\\u", High:4/binary, "\\u", Low:4/binary, Rest/binary>>, Acc) ->
+    case {surrogate(High), surrogate(Low)} of
+        {high, low} ->
+            replace_lone_surrogates(Rest, <<Acc/binary, "\\u", High/binary, "\\u", Low/binary>>);
+        {none, _} ->
+            replace_lone_surrogates(<<"\\u", Low/binary, Rest/binary>>,
+                                    <<Acc/binary, "\\u", High/binary>>);
+        {_, _} ->
+            replace_lone_surrogates(<<"\\u", Low/binary, Rest/binary>>,
+                                    <<Acc/binary, "\\ufffd">>)
+    end;
+replace_lone_surrogates(<<"\\u", Code:4/binary, Rest/binary>>, Acc) ->
+    case surrogate(Code) of
+        none -> replace_lone_surrogates(Rest, <<Acc/binary, "\\u", Code/binary>>);
+        _ -> replace_lone_surrogates(Rest, <<Acc/binary, "\\ufffd">>)
+    end;
+replace_lone_surrogates(<<$\\, Escaped, Rest/binary>>, Acc) ->
+    replace_lone_surrogates(Rest, <<Acc/binary, $\\, Escaped>>);
+replace_lone_surrogates(<<Byte, Rest/binary>>, Acc) ->
+    replace_lone_surrogates(Rest, <<Acc/binary, Byte>>);
+replace_lone_surrogates(<<>>, Acc) ->
+    Acc.
+
+surrogate(<<D, X, _, _>>) when (D =:= $d orelse D =:= $D) ->
+    if
+        X =:= $8; X =:= $9; X =:= $a; X =:= $b; X =:= $A; X =:= $B -> high;
+        X =:= $c; X =:= $d; X =:= $e; X =:= $f; X =:= $C; X =:= $D; X =:= $E; X =:= $F -> low;
+        true -> none
+    end;
+surrogate(_) ->
+    none.

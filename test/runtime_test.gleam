@@ -17,8 +17,11 @@ import temporal/internal/runtime
 import temporal/internal/runtime/run_state
 import temporal/log
 import temporal/middleware
+import temporal/retry
+import temporal/search_attributes
 import temporal/workflow
 import temporal/workflow/child
+import temporal/workflow/continue_as_new
 import temporal/workflow/local_activity
 import temporal/workflow/operation
 import temporal/workflow/query
@@ -631,15 +634,13 @@ pub fn outbound_middleware_rewrites_scheduled_activities_test() {
         runtime.run(
           dict.from_list([#(handler.name, handler.run)]),
           "queue",
-          middleware.Outbound(
-            activity: fn(call) {
-              middleware.ActivityCall(
-                ..call,
-                activity_type: "legacy_" <> call.activity_type,
+          middleware.none()
+            |> middleware.add_activity(fn(_scope, call) {
+              middleware.with_activity_type(
+                call,
+                "legacy_" <> call.activity_type,
               )
-            },
-            child: fn(call) { call },
-          ),
+            }),
           fn(completion) { process.send(completions, completion) },
         )
       })
@@ -675,7 +676,89 @@ pub fn continue_as_new_test() {
       }),
     )
   assert activate(run, [init("looper", 1)])
-    == [bridge.ContinueAsNew("looper", "queue", [codec.encode(codec.int(), 2)])]
+    == [
+      bridge.ContinueAsNew(
+        "looper",
+        "queue",
+        [codec.encode(codec.int(), 2)],
+        bridge.ContinueAsNewOptions(
+          run_timeout_ms: None,
+          task_timeout_ms: None,
+          memo: dict.new(),
+          search_attributes: dict.new(),
+          headers: dict.new(),
+          retry: None,
+        ),
+      ),
+    ]
+}
+
+pub fn continue_as_new_passes_the_headers_on_test() {
+  let definition = workflow.Definition("looper", codec.int(), codec.int())
+  let run =
+    start(
+      workflow.handler(definition, fn(ctx, n) {
+        workflow.continue_as_new(ctx, definition, n + 1)
+      }),
+    )
+  let headers = dict.from_list([#("trace", codec.encode(codec.string(), "t"))])
+  let init =
+    bridge.InitializeWorkflow(
+      workflow_type: "looper",
+      workflow_id: "wf-id",
+      arguments: [codec.encode(codec.int(), 1)],
+      randomness_seed: 42,
+      attempt: 1,
+      first_execution_run_id: "run-1",
+      continued_from_run_id: "",
+      memo: dict.new(),
+      headers:,
+    )
+  let assert [bridge.ContinueAsNew(options:, ..)] = activate(run, [init])
+  assert options.headers == headers
+}
+
+pub fn continue_as_new_with_options_test() {
+  let definition = workflow.Definition("looper", codec.int(), codec.int())
+  let memo = dict.from_list([#("note", codec.encode(codec.string(), "n"))])
+  let headers = dict.from_list([#("trace", codec.encode(codec.string(), "t"))])
+  let attributes =
+    dict.from_list([#("Tier", search_attributes.Keyword("gold"))])
+  let policy = retry.policy(maximum_attempts: 3)
+  let run =
+    start(
+      workflow.handler(definition, fn(ctx, n) {
+        continue_as_new.run(
+          ctx,
+          definition,
+          n + 1,
+          continue_as_new.options()
+            |> continue_as_new.with_task_queue("other")
+            |> continue_as_new.with_run_timeout(duration.seconds(60))
+            |> continue_as_new.with_task_timeout(duration.seconds(5))
+            |> continue_as_new.with_memo(memo)
+            |> continue_as_new.with_search_attributes(attributes)
+            |> continue_as_new.with_headers(headers)
+            |> continue_as_new.with_retry(policy),
+        )
+      }),
+    )
+  assert activate(run, [init("looper", 1)])
+    == [
+      bridge.ContinueAsNew(
+        "looper",
+        "other",
+        [codec.encode(codec.int(), 2)],
+        bridge.ContinueAsNewOptions(
+          run_timeout_ms: Some(60_000),
+          task_timeout_ms: Some(5000),
+          memo:,
+          search_attributes: search_attributes.encode(attributes),
+          headers:,
+          retry: Some(retry.to_bridge(policy)),
+        ),
+      ),
+    ]
 }
 
 pub fn random_values_depend_only_on_the_seed_test() {

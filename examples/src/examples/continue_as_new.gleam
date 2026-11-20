@@ -59,7 +59,9 @@ fn sync_pages_workflow(
     True -> Ok(rows)
     // Ends this run and starts a new one with an empty history. Does not return.
     // `workflow.info(ctx).continue_as_new_suggested` is the server's own hint that a
-    // history has grown long, for loops with no natural batch size.
+    // history has grown long, for loops with no natural batch size. The new run keeps
+    // the task queue, memo, search attributes and headers of this one; to change them
+    // or set timeouts, use `temporal/workflow/continue_as_new`.
     False ->
       workflow.continue_as_new(
         ctx,

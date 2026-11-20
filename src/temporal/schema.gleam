@@ -26,7 +26,6 @@
 
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode.{type Decoder}
-import gleam/int
 import gleam/json.{type Json}
 import gleam/option.{type Option, None, Some}
 import temporal/codec.{type Codec}
@@ -52,19 +51,16 @@ pub fn string() -> Schema(String) {
   Schema(json.string, decode.string, None)
 }
 
-/// A JSON integer.
+/// A JSON integer. A number written with a fraction or an exponent is read too when its
+/// value is whole, since JavaScript writes large numbers that way.
 pub fn int() -> Schema(Int) {
-  Schema(json.int, decode.int, None)
+  Schema(json.int, codec.int_decoder(), None)
 }
 
 /// A JSON number, read as a float. A number written without a fraction, such as `3`, is
 /// read too, since other SDKs write whole floats that way.
 pub fn float() -> Schema(Float) {
-  Schema(
-    json.float,
-    decode.one_of(decode.float, [decode.map(decode.int, int.to_float)]),
-    None,
-  )
+  Schema(json.float, codec.float_decoder(), None)
 }
 
 /// A JSON boolean.

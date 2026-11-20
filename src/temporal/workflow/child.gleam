@@ -174,13 +174,17 @@ pub fn start(
     None -> {
       let state = run_state.get()
       let call =
-        state.outbound.child(middleware.ChildCall(
-          workflow_type: definition.name,
-          workflow_id: options.workflow_id,
-          task_queue: option.unwrap(options.task_queue, state.task_queue),
-          arguments: codec.encode_arguments(definition.input, input),
-          headers: state.headers,
-        ))
+        middleware.rewrite_child(
+          state.outbound,
+          workflow.scope_of(ctx),
+          middleware.ChildCall(
+            workflow_type: definition.name,
+            workflow_id: options.workflow_id,
+            task_queue: option.unwrap(options.task_queue, state.task_queue),
+            arguments: codec.encode_arguments(definition.input, input),
+            headers: state.headers,
+          ),
+        )
       run_state.push(bridge.StartChildWorkflow(
         seq:,
         workflow_id: call.workflow_id,

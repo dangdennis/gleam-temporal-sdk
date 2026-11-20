@@ -14,7 +14,7 @@
 //// testing.stop(env)
 //// ```
 
-import gleam/dict
+import gleam/dict.{type Dict}
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -26,6 +26,7 @@ import temporal/client.{type Client}
 import temporal/codec.{type Payload}
 import temporal/internal/bridge
 import temporal/internal/time
+import temporal/retry
 import temporal/workflow
 
 /// A server started for a test, and a client connected to it.
@@ -154,10 +155,12 @@ pub opaque type ActivityEnv {
     context: activity.Context,
     heartbeats: process.Subject(List(Payload)),
     cancellation: process.Subject(activity.CancelReason),
+    shutting_down: bridge.Flag,
   )
 }
 
-/// The info of a first attempt, to adjust with record update syntax.
+/// The info of a first attempt of an activity called `"test"`. Adjust it with the `with_`
+/// functions below.
 pub fn activity_info() -> activity.Info {
   activity.Info(
     activity_id: "test",
@@ -177,10 +180,47 @@ pub fn activity_info() -> activity.Info {
   )
 }
 
+/// The info of a later attempt: `attempt` is 1 for the first.
+pub fn with_attempt(info: activity.Info, attempt: Int) -> activity.Info {
+  activity.Info(..info, attempt:)
+}
+
+/// The info of an activity of another type.
+pub fn with_activity_type(
+  info: activity.Info,
+  activity_type: String,
+) -> activity.Info {
+  activity.Info(..info, activity_type:)
+}
+
+/// The info of an activity whose previous attempt last heartbeated with `details`, for
+/// `activity.heartbeat_details` to read.
+pub fn with_heartbeat_details(
+  info: activity.Info,
+  value_codec: codec.Codec(a),
+  details: a,
+) -> activity.Info {
+  activity.Info(..info, heartbeat_details: [codec.encode(value_codec, details)])
+}
+
+/// The info of an activity retried by this policy, for `activity.is_final_attempt`.
+pub fn with_retry(info: activity.Info, policy: retry.Policy) -> activity.Info {
+  activity.Info(..info, retry: Some(policy))
+}
+
+/// The info of an activity whose workflow passed these headers.
+pub fn with_headers(
+  info: activity.Info,
+  headers: Dict(String, Payload),
+) -> activity.Info {
+  activity.Info(..info, headers:)
+}
+
 /// Create a context. Call it from the process that will inspect the results.
 pub fn activity_env(info: activity.Info) -> ActivityEnv {
   let heartbeats = process.new_subject()
   let cancellation = process.new_subject()
+  let shutting_down = bridge.new_flag()
   // The activity may run in another process, so the cancellation is kept where both the
   // test and the activity can reach it: in a subject the context re-fills after reading.
   let cancel_reason = fn() {
@@ -198,9 +238,11 @@ pub fn activity_env(info: activity.Info) -> ActivityEnv {
       task_token: <<"test":utf8>>,
       heartbeat: fn(details) { process.send(heartbeats, details) },
       cancel_reason:,
+      worker_shutting_down: fn() { bridge.flag_raised(shutting_down) },
     ),
     heartbeats:,
     cancellation:,
+    shutting_down:,
   )
 }
 
@@ -212,6 +254,12 @@ pub fn activity_context(env: ActivityEnv) -> activity.Context {
 /// Make the activity see a cancellation request from now on.
 pub fn cancel_activity(env: ActivityEnv, reason: activity.CancelReason) -> Nil {
   process.send(env.cancellation, reason)
+}
+
+/// Make `activity.is_worker_shutting_down` true from now on, as a worker that has been
+/// asked to stop does.
+pub fn begin_worker_shutdown(env: ActivityEnv) -> Nil {
+  bridge.raise_flag(env.shutting_down)
 }
 
 /// The details of every heartbeat so far, oldest first, decoded with `codec`. Heartbeats

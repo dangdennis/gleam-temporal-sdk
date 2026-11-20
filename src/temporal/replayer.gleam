@@ -16,9 +16,7 @@ import temporal/client.{type History}
 import temporal/codec.{type PayloadCodec}
 import temporal/internal/bridge
 import temporal/internal/poller
-import temporal/middleware.{
-  type ActivityCall, type ChildCall, type Outbound, Outbound,
-}
+import temporal/middleware.{type ActivityCall, type ChildCall, type Outbound}
 import temporal/workflow
 
 /// Why a history did not replay.
@@ -54,13 +52,12 @@ pub fn options() -> Options {
 /// `worker.with_outbound_activity` did.
 pub fn with_outbound_activity(
   options: Options,
-  rewrite: fn(ActivityCall) -> ActivityCall,
+  rewrite: fn(workflow.Context, ActivityCall) -> ActivityCall,
 ) -> Options {
-  let previous = options.outbound.activity
   Options(
     ..options,
-    outbound: Outbound(..options.outbound, activity: fn(call) {
-      rewrite(previous(call))
+    outbound: middleware.add_activity(options.outbound, fn(scope, call) {
+      rewrite(workflow.context_of(scope), call)
     }),
   )
 }
@@ -69,13 +66,12 @@ pub fn with_outbound_activity(
 /// `worker.with_outbound_child` did.
 pub fn with_outbound_child(
   options: Options,
-  rewrite: fn(ChildCall) -> ChildCall,
+  rewrite: fn(workflow.Context, ChildCall) -> ChildCall,
 ) -> Options {
-  let previous = options.outbound.child
   Options(
     ..options,
-    outbound: Outbound(..options.outbound, child: fn(call) {
-      rewrite(previous(call))
+    outbound: middleware.add_child(options.outbound, fn(scope, call) {
+      rewrite(workflow.context_of(scope), call)
     }),
   )
 }

@@ -1,7 +1,9 @@
 // The TypeScript half of the conformance harness.
 //
-//   node harness.js record <dir>   run every twin on the official TypeScript SDK and write
-//                                  each history, protobuf-encoded, to <dir>/<feature>.bin
+//   node harness.js record <dir> [feature...]
+//                                  run every twin, or the named ones, on the official
+//                                  TypeScript SDK and write each history,
+//                                  protobuf-encoded, to <dir>/<feature>.bin
 //   node harness.js replay <dir>   replay the histories this SDK's tests wrote to <dir>
 //                                  against the TypeScript twins; exits 1 if any diverges
 //
@@ -55,6 +57,8 @@ const activities = {
   double: async (n) => n * 2,
   slow: async (ms) => sleep(ms),
   join: async (text, times) => Array(times).fill(text).join(' '),
+  maybe: async (present) => (present ? 'value' : undefined),
+  nothing: async () => {},
   stubborn: async (attempts) => {
     const { Context } = require('@temporalio/activity');
     const attempt = Context.current().info.attempt;
@@ -133,6 +137,9 @@ const features = {
   },
   local: { args: [3] },
   arguments: { args: ['hey', 3, true] },
+  // The second argument is left out.
+  optional: { args: ['hey'] },
+  handover: { args: [1] },
   lifecycle: { args: [2] },
   nexus_caller: {
     args: ({ endpoint }) => [endpoint],
@@ -146,10 +153,11 @@ const features = {
   },
 };
 
-async function record(dir) {
+async function record(dir, only) {
   fs.mkdirSync(dir, { recursive: true });
   const connection = await Connection.connect();
   for (const [name, feature] of Object.entries(features)) {
+    if (only.length > 0 && !only.includes(name)) continue;
     const taskQueue = `conformance-ts-${name}-${Date.now()}`;
     const workflowId = `${name}-typescript`;
     const endpoint = `conformance-ts-${Date.now()}`;
@@ -243,8 +251,8 @@ async function replay(dir) {
   process.exit(failed === 0 ? 0 : 1);
 }
 
-const [mode, dir] = process.argv.slice(2);
-(mode === 'record' ? record(dir) : replay(dir)).catch((error) => {
+const [mode, dir, ...only] = process.argv.slice(2);
+(mode === 'record' ? record(dir, only) : replay(dir)).catch((error) => {
   console.error(error);
   process.exit(1);
 });

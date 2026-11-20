@@ -102,12 +102,16 @@ pub fn start(
     None -> {
       let state = run_state.get()
       let call =
-        state.outbound.activity(middleware.ActivityCall(
-          activity_type: definition.name,
-          task_queue: state.task_queue,
-          arguments: codec.encode_arguments(definition.input, input),
-          headers: state.headers,
-        ))
+        middleware.rewrite_activity(
+          state.outbound,
+          workflow.scope_of(ctx),
+          middleware.ActivityCall(
+            activity_type: definition.name,
+            task_queue: state.task_queue,
+            arguments: codec.encode_arguments(definition.input, input),
+            headers: state.headers,
+          ),
+        )
       let seq =
         local_activities.start(fn(seq) {
           bridge.ScheduleLocalActivity(

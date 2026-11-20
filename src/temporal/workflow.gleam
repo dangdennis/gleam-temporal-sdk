@@ -195,6 +195,12 @@ pub fn scope_of(ctx: Context) -> Int {
   ctx.scope
 }
 
+/// The context that names a cancellation scope.
+@internal
+pub fn context_of(scope: Int) -> Context {
+  Context(scope)
+}
+
 /// The future's value if it has one, without waiting.
 @internal
 pub fn peek(future: Future(a)) -> Option(a) {
@@ -742,12 +748,16 @@ pub fn start_activity(
     None -> {
       let state = run_state.get()
       let call =
-        state.outbound.activity(middleware.ActivityCall(
-          activity_type: definition.name,
-          task_queue: option.unwrap(options.task_queue, state.task_queue),
-          arguments: codec.encode_arguments(definition.input, input),
-          headers: state.headers,
-        ))
+        middleware.rewrite_activity(
+          state.outbound,
+          ctx.scope,
+          middleware.ActivityCall(
+            activity_type: definition.name,
+            task_queue: option.unwrap(options.task_queue, state.task_queue),
+            arguments: codec.encode_arguments(definition.input, input),
+            headers: state.headers,
+          ),
+        )
       run_state.push(bridge.ScheduleActivity(
         seq:,
         activity_id: option.unwrap(options.activity_id, int.to_string(seq)),
@@ -841,16 +851,46 @@ pub fn take_signal(definition: SignalDefinition(a)) -> Option(a) {
 // ---- lifecycle ----
 
 /// End this run and start a fresh one with a new input and an empty history. Does not return.
+///
+/// The new run is on the same task queue and keeps this run's memo, search attributes,
+/// retry policy and headers. To change any of them, or to set timeouts, use
+/// `temporal/workflow/continue_as_new`.
 pub fn continue_as_new(
   _ctx: Context,
   definition: Definition(input, output),
   input: input,
 ) -> Result(output, Failure) {
+  let state = run_state.get()
+  continue_as_new_with(
+    definition,
+    input,
+    state.task_queue,
+    bridge.ContinueAsNewOptions(
+      run_timeout_ms: None,
+      task_timeout_ms: None,
+      memo: dict.new(),
+      search_attributes: dict.new(),
+      headers: state.headers,
+      retry: None,
+    ),
+  )
+}
+
+/// Issue the command that ends this run and starts the next, for
+/// `temporal/workflow/continue_as_new`.
+@internal
+pub fn continue_as_new_with(
+  definition: Definition(input, output),
+  input: input,
+  task_queue: String,
+  options: bridge.ContinueAsNewOptions,
+) -> Result(output, Failure) {
   updates.abandon()
   run_state.push(bridge.ContinueAsNew(
     definition.name,
-    run_state.get().task_queue,
+    task_queue,
     codec.encode_arguments(definition.input, input),
+    options,
   ))
   runtime.serve()
 }
