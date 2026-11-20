@@ -8,7 +8,7 @@
 ////
 //// ```gleam
 //// let codec = encryption.codec(encryption.Key(id: "2026-01", secret: key_bytes), [])
-//// client.connect(client.Options(..client.local(), codec: Some(codec)))
+//// client.connect(client.local() |> client.with_codec(codec))
 //// ```
 ////
 //// With encryption on, the Temporal UI and CLI show ciphertext. The key never leaves your

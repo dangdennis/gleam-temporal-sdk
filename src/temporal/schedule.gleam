@@ -4,19 +4,23 @@
 //// ```gleam
 //// let nightly =
 ////   schedule.new(
-////     schedule.every(duration.hours(24)),
+////     schedule.every(duration.hours(24)) |> schedule.with_offset(duration.hours(3)),
 ////     schedule.action(
 ////       cleanup(),
 ////       Nil,
 ////       client.start_options(workflow_id: "cleanup", task_queue: "main"),
 ////     ),
 ////   )
+////   |> schedule.with_overlap(schedule.BufferOne)
 //// let assert Ok(Nil) = schedule.create(client, "nightly-cleanup", nightly)
 //// ```
+////
+//// A timetable is a `Spec`, from `every`, `on` or `cron`. What it starts is an `Action`,
+//// from `action`. Each is adjusted with the `with_` functions that take it.
 
 import gleam/dict.{type Dict}
 import gleam/list
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/time/duration.{type Duration}
 import gleam/time/timestamp.{type Timestamp}
@@ -25,9 +29,11 @@ import temporal/codec.{type Payload}
 import temporal/internal/bridge
 import temporal/internal/time
 import temporal/internal/transcode
+import temporal/retry
 import temporal/workflow
 
 /// When the schedule fires: the union of its intervals, calendars and cron expressions.
+/// Build with `every`, `on` or `cron`, then `with_offset`, `with_timezone` and `with_jitter`.
 pub type Spec {
   Spec(
     intervals: List(Interval),
@@ -48,7 +54,8 @@ pub type Interval {
   Interval(every: Duration, offset: Duration)
 }
 
-/// Fire when the time matches every field. An empty `year` matches every year.
+/// Fire when the time matches every field. An empty `year` matches every year. Build with
+/// `daily` and the `with_` functions named after the fields.
 pub type Calendar {
   Calendar(
     second: List(Range),
@@ -82,7 +89,7 @@ pub type OverlapPolicy {
   AllowAll
 }
 
-/// The workflow a schedule starts.
+/// The workflow a schedule starts. Build with `action`.
 pub type Action {
   Action(
     workflow_type: String,
@@ -93,24 +100,26 @@ pub type Action {
     execution_timeout: Option(Duration),
     run_timeout: Option(Duration),
     task_timeout: Option(Duration),
-    retry: Option(workflow.RetryPolicy),
+    retry: Option(retry.Policy),
     memo: Dict(String, Payload),
     search_attributes: Dict(String, Payload),
   )
 }
 
-/// A timetable, the workflow it starts, and how it behaves. Build with `new` and change
-/// what differs.
+/// A timetable, the workflow it starts, and how it behaves. Build with `new` and the
+/// `with_` functions that take a schedule.
 pub type Schedule {
   Schedule(
     spec: Spec,
     action: Action,
+    /// What to do when an action falls due while the previous one is still running.
     overlap: OverlapPolicy,
     /// How far back to make up for actions missed while the server was down. `None` uses
     /// the server's default of one year.
     catchup_window: Option(Duration),
     /// Pause the schedule when a workflow it started fails.
     pause_on_failure: Bool,
+    /// A paused schedule takes no actions.
     paused: Bool,
     /// A human-readable note, typically why the schedule is paused.
     note: String,
@@ -159,15 +168,11 @@ fn empty() -> Spec {
   )
 }
 
-/// A spec that fires once every `interval`, aligned to the Unix epoch.
+/// A spec that fires once every `interval`, at multiples of it since the Unix epoch.
 pub fn every(interval: Duration) -> Spec {
-  every_offset(interval, offset: duration.seconds(0))
-}
-
-/// A spec that fires every `ms`, `offset_ms` after the epoch-aligned times. Give schedules
-/// with the same interval different offsets so they do not all fire together.
-pub fn every_offset(interval: Duration, offset offset: Duration) -> Spec {
-  Spec(..empty(), intervals: [Interval(every: interval, offset:)])
+  Spec(..empty(), intervals: [
+    Interval(every: interval, offset: duration.seconds(0)),
+  ])
 }
 
 /// A spec that fires when the calendar matches.
@@ -180,14 +185,39 @@ pub fn cron(expression: String) -> Spec {
   Spec(..empty(), cron_expressions: [expression])
 }
 
+/// Fire the spec's intervals `offset` after the epoch-aligned times. Give schedules with
+/// the same interval different offsets so they do not all fire together. Calendars and
+/// cron expressions are not affected.
+pub fn with_offset(spec: Spec, offset: Duration) -> Spec {
+  Spec(
+    ..spec,
+    intervals: list.map(spec.intervals, fn(interval) {
+      Interval(..interval, offset:)
+    }),
+  )
+}
+
 /// Interpret the spec's calendars and cron expressions in an IANA time zone, such as
-/// `Europe/Lisbon`.
-pub fn in_timezone(spec: Spec, timezone: String) -> Spec {
-  Spec(..spec, timezone: option.Some(timezone))
+/// `Europe/Lisbon`, instead of UTC.
+pub fn with_timezone(spec: Spec, timezone: String) -> Spec {
+  Spec(..spec, timezone: Some(timezone))
+}
+
+/// Delay each action by a random amount up to `jitter`, to spread load.
+pub fn with_jitter(spec: Spec, jitter: Duration) -> Spec {
+  Spec(..spec, jitter: Some(jitter))
 }
 
 /// A calendar that matches midnight every day: second, minute and hour 0, any date. Narrow
-/// or widen it with record update syntax and `exactly`, `between` and `stepping`.
+/// or widen it with the `with_` functions below and `exactly`, `between` and `stepping`:
+///
+/// ```gleam
+/// // 09:30 on weekdays
+/// schedule.daily()
+/// |> schedule.with_hour(schedule.exactly(9))
+/// |> schedule.with_minute(schedule.exactly(30))
+/// |> schedule.with_day_of_week(schedule.between(1, 5))
+/// ```
 pub fn daily() -> Calendar {
   Calendar(
     second: exactly(0),
@@ -199,6 +229,46 @@ pub fn daily() -> Calendar {
     day_of_week: between(0, 6),
     comment: "",
   )
+}
+
+/// The seconds the calendar matches, 0 to 59.
+pub fn with_second(calendar: Calendar, ranges: List(Range)) -> Calendar {
+  Calendar(..calendar, second: ranges)
+}
+
+/// The minutes the calendar matches, 0 to 59.
+pub fn with_minute(calendar: Calendar, ranges: List(Range)) -> Calendar {
+  Calendar(..calendar, minute: ranges)
+}
+
+/// The hours the calendar matches, 0 to 23.
+pub fn with_hour(calendar: Calendar, ranges: List(Range)) -> Calendar {
+  Calendar(..calendar, hour: ranges)
+}
+
+/// The days of the month the calendar matches, 1 to 31.
+pub fn with_day_of_month(calendar: Calendar, ranges: List(Range)) -> Calendar {
+  Calendar(..calendar, day_of_month: ranges)
+}
+
+/// The months the calendar matches, 1 to 12.
+pub fn with_month(calendar: Calendar, ranges: List(Range)) -> Calendar {
+  Calendar(..calendar, month: ranges)
+}
+
+/// The years the calendar matches. An empty list matches every year.
+pub fn with_year(calendar: Calendar, ranges: List(Range)) -> Calendar {
+  Calendar(..calendar, year: ranges)
+}
+
+/// The days of the week the calendar matches, 0 for Sunday to 6 for Saturday.
+pub fn with_day_of_week(calendar: Calendar, ranges: List(Range)) -> Calendar {
+  Calendar(..calendar, day_of_week: ranges)
+}
+
+/// A note stored with the calendar, for whoever reads the schedule later.
+pub fn with_comment(calendar: Calendar, comment: String) -> Calendar {
+  Calendar(..calendar, comment:)
 }
 
 /// The single value `value`.
@@ -243,6 +313,46 @@ pub fn new(spec: Spec, action: Action) -> Schedule {
   )
 }
 
+/// Replace the schedule's timetable. For `update`.
+pub fn with_spec(schedule: Schedule, spec: Spec) -> Schedule {
+  Schedule(..schedule, spec:)
+}
+
+/// Replace the workflow the schedule starts. For `update`.
+pub fn with_action(schedule: Schedule, action: Action) -> Schedule {
+  Schedule(..schedule, action:)
+}
+
+/// What to do when an action falls due while the previous one is still running.
+pub fn with_overlap(schedule: Schedule, overlap: OverlapPolicy) -> Schedule {
+  Schedule(..schedule, overlap:)
+}
+
+/// How far back to make up for actions missed while the server was down, instead of the
+/// server's default of one year.
+pub fn with_catchup_window(schedule: Schedule, window: Duration) -> Schedule {
+  Schedule(..schedule, catchup_window: Some(window))
+}
+
+/// Whether the schedule pauses itself when a workflow it started fails.
+pub fn with_pause_on_failure(
+  schedule: Schedule,
+  pause_on_failure: Bool,
+) -> Schedule {
+  Schedule(..schedule, pause_on_failure:)
+}
+
+/// Whether the schedule is paused. Use it to create a schedule paused; to pause one that
+/// exists, use `pause`.
+pub fn with_paused(schedule: Schedule, paused: Bool) -> Schedule {
+  Schedule(..schedule, paused:)
+}
+
+/// A human-readable note, typically why the schedule is paused.
+pub fn with_note(schedule: Schedule, note: String) -> Schedule {
+  Schedule(..schedule, note:)
+}
+
 // ---- conversion ----
 
 fn overlap_value(policy: OverlapPolicy) -> Int {
@@ -265,7 +375,7 @@ fn from_request(request: bridge.StartRequest) -> Action {
     execution_timeout: time.option_from_ms(request.execution_timeout_ms),
     run_timeout: time.option_from_ms(request.run_timeout_ms),
     task_timeout: time.option_from_ms(request.task_timeout_ms),
-    retry: option.map(request.retry, workflow.from_bridge_retry),
+    retry: option.map(request.retry, retry.from_bridge),
     memo: request.memo,
     search_attributes: request.search_attributes,
   )
@@ -282,7 +392,7 @@ fn to_request(action: Action) -> bridge.StartRequest {
     execution_timeout_ms: time.option_to_ms(action.execution_timeout),
     run_timeout_ms: time.option_to_ms(action.run_timeout),
     task_timeout_ms: time.option_to_ms(action.task_timeout),
-    retry: option.map(action.retry, workflow.to_bridge_retry),
+    retry: option.map(action.retry, retry.to_bridge),
     memo: action.memo,
     search_attributes: action.search_attributes,
     start_delay_ms: None,
@@ -368,7 +478,7 @@ fn from_bridge(client: Client, schedule: bridge.Schedule) -> Schedule {
       cron_expressions: spec.cron_expressions,
       timezone: case spec.timezone {
         "" -> None
-        name -> option.Some(name)
+        name -> Some(name)
       },
       jitter: time.option_from_ms(spec.jitter_ms),
     ),
@@ -430,7 +540,7 @@ pub fn describe(
 }
 
 /// Change a schedule: `change` receives the schedule as the server has it and returns the
-/// one to store. The update is rejected if the schedule changed in between. Unlike deleting
+/// one to store, usually by passing it through `with_` functions. The update is rejected if the schedule changed in between. Unlike deleting
 /// and recreating, this keeps the schedule's history and the timing of its intervals.
 pub fn update(
   client: Client,
@@ -445,7 +555,7 @@ pub fn update(
     client.connection(client),
     schedule_id,
     to_bridge(client, change(from_bridge(client, schedule))),
-    option.Some(conflict_token),
+    Some(conflict_token),
     False,
   )
   |> result.map_error(client.request_error)

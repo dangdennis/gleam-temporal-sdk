@@ -57,7 +57,15 @@ use temporalio_sdk_core::{
 use wire::{DecodeResult, Wire};
 
 mod atoms {
-    rustler::atoms! { ok, error, nil, temporal_nif }
+    rustler::atoms! {
+        ok,
+        error,
+        nil,
+        temporal_nif,
+        already_started,
+        invalid_address,
+        bind_failed
+    }
 }
 
 pub struct ConnectionRes {
@@ -129,18 +137,19 @@ pub fn runtime() -> &'static CoreRuntime {
 /// Serve the worker's and client's metrics in Prometheus format on `address`. Has to be
 /// called before anything else here, because the runtime reads it once, when it starts.
 /// Answers the address being served, which differs from the one asked for when that named
-/// port 0.
+/// port 0. The errors are the variants of Gleam's `telemetry.Error`.
 #[rustler::nif]
 fn start_metrics<'a>(env: Env<'a>, address: String) -> Term<'a> {
+    let already_started = || (atoms::error(), atoms::already_started()).encode(env);
     if RUNTIME.get().is_some() {
-        return err(
-            env,
-            "metrics must be configured before the first connection or worker is made",
-        );
+        return already_started();
     }
     let address: SocketAddr = match address.parse() {
         Ok(a) => a,
-        Err(e) => return err(env, format!("invalid address: {e}")),
+        Err(e) => {
+            let reason = (atoms::invalid_address(), format!("\"{address}\": {e}"));
+            return (atoms::error(), reason).encode(env);
+        }
     };
     if let Ok(mut wanted) = METRICS_ADDRESS.lock() {
         *wanted = Some(address);
@@ -148,8 +157,9 @@ fn start_metrics<'a>(env: Env<'a>, address: String) -> Term<'a> {
     runtime();
     match METRICS_BOUND.get() {
         Some(Ok(bound)) => ok(env, Encoder::encode(&bound.to_string(), env)),
-        Some(Err(e)) => err(env, e),
-        None => err(env, "metrics could not be started"),
+        Some(Err(e)) => (atoms::error(), (atoms::bind_failed(), e)).encode(env),
+        // Another process started the runtime between the check above and here.
+        None => already_started(),
     }
 }
 

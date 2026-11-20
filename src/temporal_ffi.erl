@@ -114,11 +114,13 @@ activity_cancel_reason() ->
         Reason -> {some, Reason}
     end.
 
-%% Metadata keys are a fixed set chosen by this library, so making atoms of them is safe.
+%% Metadata is a list of {Key, Value}; a later entry replaces an earlier one with the same
+%% key. Keys are written in code, by this library or as log fields, so making atoms of them
+%% is safe.
 log(Level, Message, Metadata) ->
-    Meta = maps:fold(fun(K, V, Acc) -> Acc#{binary_to_atom(K) => V} end,
-                     #{domain => [temporal]}, Metadata),
-    logger:log(Level, "~ts", [Message], Meta),
+    Meta = lists:foldl(fun({K, V}, Acc) -> Acc#{binary_to_atom(K) => V} end,
+                       #{}, Metadata),
+    logger:log(Level, "~ts", [Message], Meta#{domain => [temporal]}),
     nil.
 
 rescue_all(Fun) ->

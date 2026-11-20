@@ -1,4 +1,12 @@
 //// Connect to a Temporal service and start, signal, query and await workflows.
+////
+//// ```gleam
+//// let assert Ok(client) = client.connect(client.local())
+//// let options =
+////   client.start_options(workflow_id: "greet-ada", task_queue: "greetings")
+////   |> client.with_execution_timeout(duration.minutes(5))
+//// let assert Ok(greeting) = client.execute(client, greet(), "Ada", options)
+//// ```
 
 import gleam/dict.{type Dict}
 import gleam/list
@@ -12,6 +20,7 @@ import temporal/failure.{type Failure}
 import temporal/internal/bridge
 import temporal/internal/time
 import temporal/internal/transcode
+import temporal/retry
 import temporal/search_attributes
 import temporal/workflow
 
@@ -24,11 +33,14 @@ pub opaque type Client {
   )
 }
 
-/// How to reach the service. Start from `local()` or `cloud(..)` and change what differs.
+/// How to reach the service. Start from `local()` or `cloud(..)` and the `with_` functions
+/// that take one: `with_target`, `with_namespace`, `with_identity`, `with_api_key`,
+/// `with_tls` and `with_codec`.
 pub type Options {
   Options(
     /// The frontend address, such as `http://localhost:7233`.
     target: String,
+    /// The namespace every request of the client is made in.
     namespace: String,
     /// Recorded in history as the author of this client's requests.
     identity: String,
@@ -42,7 +54,7 @@ pub type Options {
   )
 }
 
-/// TLS settings. All `None` means TLS with the system's root certificates.
+/// TLS settings. Build with `tls()` and the `with_` functions that take one.
 pub type Tls {
   Tls(
     /// PEM root certificate to trust instead of the system's.
@@ -80,7 +92,8 @@ pub type IdConflictPolicy {
   TerminateExisting
 }
 
-/// How a workflow is started. Build with `start_options` and change what differs.
+/// How a workflow is started. Build with `start_options` and the `with_` functions that
+/// take one.
 pub type StartOptions {
   StartOptions(
     /// The workflow's identity. No two open workflows in a namespace share an id.
@@ -97,7 +110,7 @@ pub type StartOptions {
     /// Longest one workflow task may take. `None` is ten seconds.
     task_timeout: Option(Duration),
     /// `None` does not retry a failed workflow.
-    retry: Option(workflow.RetryPolicy),
+    retry: Option(retry.Policy),
     /// Unindexed data readable by the workflow and by `describe`.
     memo: Dict(String, Payload),
     /// Indexed values, for finding the workflow with `list`.
@@ -202,9 +215,64 @@ pub fn cloud(
     namespace:,
     identity: "temporal-gleam",
     api_key: Some(api_key),
-    tls: Some(Tls(server_root_ca: None, domain: None, client_certificate: None)),
+    tls: Some(tls()),
     codec: None,
   )
+}
+
+/// The frontend address, with its scheme, such as `http://temporal.internal:7233`.
+pub fn with_target(options: Options, target: String) -> Options {
+  Options(..options, target:)
+}
+
+/// The namespace to work in.
+pub fn with_namespace(options: Options, namespace: String) -> Options {
+  Options(..options, namespace:)
+}
+
+/// The name history records as the author of this client's requests.
+pub fn with_identity(options: Options, identity: String) -> Options {
+  Options(..options, identity:)
+}
+
+/// Send this API key with every request. Needs TLS: see `with_tls`.
+pub fn with_api_key(options: Options, api_key: String) -> Options {
+  Options(..options, api_key: Some(api_key))
+}
+
+/// Connect over TLS with these settings.
+pub fn with_tls(options: Options, tls: Tls) -> Options {
+  Options(..options, tls: Some(tls))
+}
+
+/// Apply a payload codec to every payload this client, and any worker started with it,
+/// sends or receives. See `codec.PayloadCodec` and `temporal/encryption`.
+pub fn with_codec(options: Options, codec: PayloadCodec) -> Options {
+  Options(..options, codec: Some(codec))
+}
+
+/// TLS with the system's root certificates and no client certificate.
+pub fn tls() -> Tls {
+  Tls(server_root_ca: None, domain: None, client_certificate: None)
+}
+
+/// Trust this PEM root certificate instead of the system's.
+pub fn with_server_root_ca(tls: Tls, pem: BitArray) -> Tls {
+  Tls(..tls, server_root_ca: Some(pem))
+}
+
+/// Verify the server's certificate against this name instead of the target's host.
+pub fn with_domain(tls: Tls, domain: String) -> Tls {
+  Tls(..tls, domain: Some(domain))
+}
+
+/// Present this PEM certificate and private key, for mutual TLS.
+pub fn with_client_certificate(
+  tls: Tls,
+  certificate certificate: BitArray,
+  private_key private_key: BitArray,
+) -> Tls {
+  Tls(..tls, client_certificate: Some(#(certificate, private_key)))
 }
 
 /// Connect to the service. Fails if it cannot be reached or refuses the credentials.
@@ -262,6 +330,92 @@ pub fn start_options(
   )
 }
 
+/// Whether the id may be used again once a workflow with it has closed.
+pub fn with_id_reuse_policy(
+  options: StartOptions,
+  policy: workflow.IdReusePolicy,
+) -> StartOptions {
+  StartOptions(..options, id_reuse_policy: policy)
+}
+
+/// What to do if a workflow with the id is still running.
+pub fn with_id_conflict_policy(
+  options: StartOptions,
+  policy: IdConflictPolicy,
+) -> StartOptions {
+  StartOptions(..options, id_conflict_policy: policy)
+}
+
+/// The longest the workflow may take across retries and continue-as-new.
+pub fn with_execution_timeout(
+  options: StartOptions,
+  timeout: Duration,
+) -> StartOptions {
+  StartOptions(..options, execution_timeout: Some(timeout))
+}
+
+/// The longest a single run may take.
+pub fn with_run_timeout(
+  options: StartOptions,
+  timeout: Duration,
+) -> StartOptions {
+  StartOptions(..options, run_timeout: Some(timeout))
+}
+
+/// The longest one workflow task may take, instead of ten seconds.
+pub fn with_task_timeout(
+  options: StartOptions,
+  timeout: Duration,
+) -> StartOptions {
+  StartOptions(..options, task_timeout: Some(timeout))
+}
+
+/// Retry the workflow by this policy when it fails. Without one it is not retried.
+pub fn with_retry(options: StartOptions, policy: retry.Policy) -> StartOptions {
+  StartOptions(..options, retry: Some(policy))
+}
+
+/// Unindexed data readable by the workflow, with `workflow.memo`, and by `describe`.
+pub fn with_memo(
+  options: StartOptions,
+  memo: Dict(String, Payload),
+) -> StartOptions {
+  StartOptions(..options, memo:)
+}
+
+/// Indexed values, for finding the workflow with `list`.
+pub fn with_search_attributes(
+  options: StartOptions,
+  attributes: Dict(String, search_attributes.Value),
+) -> StartOptions {
+  StartOptions(..options, search_attributes: attributes)
+}
+
+/// Wait this long before the workflow's first task.
+pub fn with_start_delay(
+  options: StartOptions,
+  delay: Duration,
+) -> StartOptions {
+  StartOptions(..options, start_delay: Some(delay))
+}
+
+/// Run the workflow again on this cron timetable. Prefer `temporal/schedule`.
+pub fn with_cron_schedule(
+  options: StartOptions,
+  expression: String,
+) -> StartOptions {
+  StartOptions(..options, cron_schedule: Some(expression))
+}
+
+/// Context, such as a trace id, that travels beside the arguments to the workflow and on
+/// to the activities and child workflows it starts.
+pub fn with_headers(
+  options: StartOptions,
+  headers: Dict(String, Payload),
+) -> StartOptions {
+  StartOptions(..options, headers:)
+}
+
 /// The start request for a workflow type and its options, before the codec is applied.
 @internal
 pub fn start_request(
@@ -287,7 +441,7 @@ pub fn start_request(
     execution_timeout_ms: time.option_to_ms(options.execution_timeout),
     run_timeout_ms: time.option_to_ms(options.run_timeout),
     task_timeout_ms: time.option_to_ms(options.task_timeout),
-    retry: option.map(options.retry, workflow.to_bridge_retry),
+    retry: option.map(options.retry, retry.to_bridge),
     memo: options.memo,
     search_attributes: search_attributes.encode(options.search_attributes),
     start_delay_ms: time.option_to_ms(options.start_delay),
@@ -749,9 +903,9 @@ pub fn update_result(update: UpdateHandle(result)) -> Result(result, Error) {
 /// one request, and wait for the workflow's answer. Use it when the first thing a caller
 /// does to a workflow is ask it something, such as adding the first item to a cart.
 ///
-/// The start options must say what to do if the workflow is already running: set
-/// `id_conflict_policy` to `UseExisting`, the usual choice, or leave it at `FailIfRunning`
-/// to insist on a new workflow.
+/// The start options must say what to do if the workflow is already running: pass
+/// `UseExisting` to `with_id_conflict_policy`, the usual choice, or leave it at
+/// `FailIfRunning` to insist on a new workflow.
 pub fn execute_update_with_start(
   client: Client,
   definition: workflow.Definition(input, output),

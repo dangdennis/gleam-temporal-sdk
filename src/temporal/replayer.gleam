@@ -3,15 +3,22 @@
 //// Replaying is how to check that a change to workflow code is compatible with workflows
 //// already running: fetch histories from production with `client.history`, keep them as
 //// fixtures, and replay them in tests.
+////
+//// ```gleam
+//// let assert Ok(history) = client.history(handle)
+//// assert replayer.replay([workflow.handler(greet(), greet_workflow)], history) == Ok(Nil)
+//// ```
 
 import gleam/dict
 import gleam/list
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import temporal/client.{type History}
 import temporal/codec.{type PayloadCodec}
 import temporal/internal/bridge
 import temporal/internal/poller
-import temporal/middleware.{type Outbound}
+import temporal/middleware.{
+  type ActivityCall, type ChildCall, type Outbound, Outbound,
+}
 import temporal/workflow
 
 /// Why a history did not replay.
@@ -28,13 +35,54 @@ const nondeterminism = 3
 const benign_reasons = [1, 5, 10]
 
 /// What the worker that recorded a history ran with, where it changes what replay sees.
+/// Build with `options` and the `with_` functions.
 pub type Options {
-  Options(outbound: Outbound, codec: Option(PayloadCodec))
+  Options(
+    /// The worker's outbound middleware.
+    outbound: Outbound,
+    /// The payload codec of the worker's client.
+    codec: Option(PayloadCodec),
+  )
 }
 
 /// No outbound middleware and no codec.
 pub fn options() -> Options {
   Options(outbound: middleware.none(), codec: None)
+}
+
+/// Rewrite every activity the workflow schedules, as the recording worker's
+/// `worker.with_outbound_activity` did.
+pub fn with_outbound_activity(
+  options: Options,
+  rewrite: fn(ActivityCall) -> ActivityCall,
+) -> Options {
+  let previous = options.outbound.activity
+  Options(
+    ..options,
+    outbound: Outbound(..options.outbound, activity: fn(call) {
+      rewrite(previous(call))
+    }),
+  )
+}
+
+/// Rewrite every child workflow the workflow starts, as the recording worker's
+/// `worker.with_outbound_child` did.
+pub fn with_outbound_child(
+  options: Options,
+  rewrite: fn(ChildCall) -> ChildCall,
+) -> Options {
+  let previous = options.outbound.child
+  Options(
+    ..options,
+    outbound: Outbound(..options.outbound, child: fn(call) {
+      rewrite(previous(call))
+    }),
+  )
+}
+
+/// Replay with the payload codec the recording worker's client used.
+pub fn with_codec(options: Options, codec: PayloadCodec) -> Options {
+  Options(..options, codec: Some(codec))
 }
 
 /// Run the workflow code against a recorded history. `Ok` means the code issues the
@@ -47,7 +95,7 @@ pub fn replay(
 }
 
 /// Replay with the outbound middleware and payload codec of the worker that recorded the
-/// history.
+/// history, given as `options()` and its `with_` functions.
 pub fn replay_with(
   workflows: List(workflow.Handler),
   history: History,

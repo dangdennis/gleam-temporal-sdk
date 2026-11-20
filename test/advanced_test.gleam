@@ -7,6 +7,7 @@ import gleam/bit_array
 import gleam/dict
 import gleam/erlang/process
 import gleam/int
+import gleam/io
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
@@ -22,11 +23,13 @@ import temporal/encryption
 import temporal/failure.{type Failure}
 import temporal/nexus
 import temporal/replayer
+import temporal/retry
 import temporal/telemetry
 import temporal/worker
 import temporal/workflow.{type Context}
 import temporal/workflow/local_activity
 import temporal/workflow/operation
+import temporal/workflow/signal
 import temporal/workflow/update
 
 // ---- activities ----
@@ -93,7 +96,7 @@ fn counter_workflow(ctx: Context, total: Int) -> Result(Int, Failure) {
   let next =
     workflow.race([
       update.next(ctx, add()) |> workflow.map(Some),
-      workflow.signal(ctx, finish()) |> workflow.map(fn(_) { None }),
+      signal.next(ctx, finish()) |> workflow.map(fn(_) { None }),
     ])
   case workflow.await(next) {
     None -> Ok(total)
@@ -136,7 +139,7 @@ fn listener() {
 }
 
 fn listener_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
-  case workflow.await_cancellable(ctx, workflow.signal(ctx, poke())) {
+  case workflow.await_cancellable(ctx, signal.next(ctx, poke())) {
     Ok(text) -> Ok("poked: " <> text)
     Error(cancelled) -> Error(cancelled)
   }
@@ -151,16 +154,12 @@ fn hasty() {
 /// Cancels a local activity while it waits to be retried.
 fn hasty_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   let retrying =
-    local_activity.Options(
-      ..local_activity.options(start_to_close: duration.milliseconds(5000)),
-      retry: Some(
-        workflow.RetryPolicy(
-          ..workflow.retry_policy(maximum_attempts: 5),
-          initial_interval: duration.milliseconds(60_000),
-        ),
-      ),
-      local_retry_threshold: Some(duration.milliseconds(1000)),
+    local_activity.options(start_to_close: duration.milliseconds(5000))
+    |> local_activity.with_retry(
+      retry.policy(maximum_attempts: 5)
+      |> retry.with_initial_interval(duration.milliseconds(60_000)),
     )
+    |> local_activity.with_local_retry_threshold(duration.milliseconds(1000))
   let outcome =
     workflow.with_timeout(ctx, duration.milliseconds(1500), fn(scope) {
       local_activity.execute(scope, stubborn(), 2, retrying)
@@ -259,7 +258,7 @@ fn versioned_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
     Nil,
     options(),
   ))
-  workflow.receive_signal(ctx, go())
+  signal.receive(ctx, go())
   use after <- result.map(workflow.execute_activity(
     ctx,
     which_build(),
@@ -367,10 +366,7 @@ fn key(id: String, byte: Int) -> encryption.Key {
 fn encrypted_client(current: encryption.Key, retired) -> Client {
   let assert Ok(client) =
     client.connect(
-      client.Options(
-        ..client.local(),
-        codec: Some(encryption.codec(current, retired)),
-      ),
+      client.local() |> client.with_codec(encryption.codec(current, retired)),
     )
   client
 }
@@ -380,11 +376,9 @@ pub fn an_encryption_codec_hides_payloads_from_the_server_test() {
   let new = key("2026", 9)
   use env <- in_both_modes_with("encrypted", encrypted_client(old, []))
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      memo: dict.from_list([
-        #("note", codec.encode(codec.string(), "memo-secret")),
-      ]),
+    start_options(env)
+    |> client.with_memo(
+      dict.from_list([#("note", codec.encode(codec.string(), "memo-secret"))]),
     )
   let assert Ok(handle) = client.start(env.client, counter(), 4100, options)
   assert client.execute_update(handle, add(), 21) == Ok(4142)
@@ -410,10 +404,7 @@ pub fn an_encryption_codec_hides_payloads_from_the_server_test() {
 
   // The history replays only with the codec.
   let with_codec =
-    replayer.Options(
-      ..replayer.options(),
-      codec: Some(encryption.codec(old, [])),
-    )
+    replayer.options() |> replayer.with_codec(encryption.codec(old, []))
   assert replayer.replay_with(workflows(), history, with_codec) == Ok(Nil)
   let assert Error(_) = replayer.replay(workflows(), history)
 
@@ -679,10 +670,8 @@ pub fn a_local_activity_runs_again_after_its_worker_is_killed_test() {
     )
     |> string.trim
   let options =
-    client.StartOptions(
-      ..client.start_options(workflow_id: task_queue, task_queue:),
-      task_timeout: Some(duration.milliseconds(2000)),
-    )
+    client.start_options(workflow_id: task_queue, task_queue:)
+    |> client.with_task_timeout(duration.milliseconds(2000))
   let assert Ok(handle) = client.start(client, fragile(), Nil, options)
   assert eventually(fn() { runs_so_far(task_queue) == 1 })
 
@@ -716,10 +705,7 @@ fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
 pub fn an_update_can_start_the_workflow_it_is_sent_to_test() {
   use env <- in_both_modes("update-with-start")
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      id_conflict_policy: client.UseExisting,
-    )
+    start_options(env) |> client.with_id_conflict_policy(client.UseExisting)
   // The first call starts the counter at 100 and adds to it.
   let assert Ok(#(first, 102)) =
     client.execute_update_with_start(
@@ -764,10 +750,7 @@ fn approving_workflow(
     ctx,
     approval(),
     request,
-    workflow.ActivityOptions(
-      ..options(),
-      retry: Some(workflow.retry_policy(maximum_attempts: 1)),
-    ),
+    options() |> workflow.with_retry(retry.policy(maximum_attempts: 1)),
   )
 }
 
@@ -861,7 +844,28 @@ pub fn metrics_are_served_for_prometheus_test() {
   assert served
 }
 
+/// Entry point of a process that asks for metrics on `address` and prints the answer. A
+/// process of its own, because the answer depends on the runtime not having started.
+pub fn try_metrics(address: String) -> Nil {
+  io.println(string.inspect(telemetry.serve_prometheus(address)))
+}
+
+pub fn metrics_refuse_an_address_they_cannot_serve_test() {
+  let attempt = fn(address) {
+    cmd(
+      "erl -noshell -pa build/dev/erlang/*/ebin -eval 'advanced_test:try_metrics(<<\""
+      <> address
+      <> "\">>), halt().' 2>/dev/null",
+    )
+  }
+  // Not an IP address and port.
+  assert string.starts_with(attempt("localhost:9464"), "Error(InvalidAddress(")
+  // An address this machine does not have.
+  assert string.starts_with(attempt("192.0.2.1:9464"), "Error(BindFailed(")
+}
+
 pub fn metrics_cannot_be_configured_once_the_runtime_has_started_test() {
   let _ = support.local_client()
-  let assert Error(_) = telemetry.serve_prometheus("127.0.0.1:0")
+  assert telemetry.serve_prometheus("127.0.0.1:0")
+    == Error(telemetry.AlreadyStarted)
 }

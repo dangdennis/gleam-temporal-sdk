@@ -2,7 +2,6 @@
 //// demands a client certificate. Certificates are made with `openssl` for the test.
 
 import gleam/int
-import gleam/option.{None, Some}
 import gleam/string
 import gleam/time/duration
 import support.{cmd, read_file, unique}
@@ -49,36 +48,25 @@ pub fn workflows_run_over_mutual_tls_test() {
   let assert Ok(certificate) = read_file(dir <> "/client.pem")
   let assert Ok(key) = read_file(dir <> "/client.key")
   let options = fn(tls) {
-    client.Options(..client.local(), target:, tls: Some(tls))
+    client.local() |> client.with_target(target) |> client.with_tls(tls)
   }
 
   // The proxy's certificate is not signed by a system authority.
   let assert Error(_) =
-    client.connect(
-      options(client.Tls(
-        server_root_ca: None,
-        domain: None,
-        client_certificate: Some(#(certificate, key)),
-      )),
-    )
+    client.connect(options(
+      client.tls()
+      |> client.with_client_certificate(certificate:, private_key: key),
+    ))
   // Trusted server, but the proxy insists on a client certificate.
   let assert Error(_) =
-    client.connect(
-      options(client.Tls(
-        server_root_ca: Some(ca),
-        domain: None,
-        client_certificate: None,
-      )),
-    )
+    client.connect(options(client.tls() |> client.with_server_root_ca(ca)))
 
   let assert Ok(client) =
-    client.connect(
-      options(client.Tls(
-        server_root_ca: Some(ca),
-        domain: None,
-        client_certificate: Some(#(certificate, key)),
-      )),
-    )
+    client.connect(options(
+      client.tls()
+      |> client.with_server_root_ca(ca)
+      |> client.with_client_certificate(certificate:, private_key: key),
+    ))
   let task_queue = "tls-" <> unique()
   let assert Ok(worker) =
     worker.new(client, task_queue)

@@ -11,7 +11,9 @@
 //// }
 ////
 //// pub fn greet_workflow(ctx: workflow.Context, name: String) {
-////   let options = workflow.activity_options(start_to_close: duration.seconds(10))
+////   let options =
+////     workflow.activity_options(start_to_close: duration.seconds(10))
+////     |> workflow.with_retry(retry.policy(maximum_attempts: 3))
 ////   workflow.execute_activity(ctx, say_hello(), name, options)
 //// }
 //// ```
@@ -22,9 +24,13 @@
 //// cancel the workflow cancels the context the workflow function was given. Use
 //// `with_scope`, `with_timeout` and `non_cancellable` to run part of a workflow under a
 //// scope of its own.
+////
+//// Signals, queries, updates, child workflows, local activities and Nexus operations each
+//// have a module of their own under `temporal/workflow/`.
 
 import gleam/bit_array
 import gleam/dict.{type Dict}
+import gleam/dynamic
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -43,7 +49,9 @@ import temporal/internal/runtime/run_state.{State}
 import temporal/internal/runtime/scopes
 import temporal/internal/runtime/updates
 import temporal/internal/time
+import temporal/log
 import temporal/middleware
+import temporal/retry
 import temporal/search_attributes
 
 /// A workflow's name and the codecs for its argument and result. Shared by the code that
@@ -136,23 +144,6 @@ pub type Info {
   )
 }
 
-/// How failures are retried. The wait before attempt `n` is `initial_interval` times
-/// `backoff_coefficient` to the power `n - 1`, capped at `maximum_interval`.
-pub type RetryPolicy {
-  RetryPolicy(
-    /// The wait before the second attempt.
-    initial_interval: Duration,
-    /// What the wait is multiplied by after each attempt.
-    backoff_coefficient: Float,
-    /// The longest wait. `None` is one hundred times the initial interval.
-    maximum_interval: Option(Duration),
-    /// Zero means unlimited.
-    maximum_attempts: Int,
-    /// Failures whose `error_type` is listed here are not retried.
-    non_retryable_error_types: List(String),
-  )
-}
-
 /// What cancelling an activity from the workflow does.
 pub type ActivityCancellation {
   /// Ask the activity to cancel and fail the workflow's wait at once. The default.
@@ -163,7 +154,8 @@ pub type ActivityCancellation {
   AbandonActivity
 }
 
-/// How an activity is run. Build with `activity_options` and change what differs.
+/// How an activity is run. Build with `activity_options` and the `with_` functions that
+/// take one.
 pub type ActivityOptions {
   ActivityOptions(
     /// Longest a single attempt may run.
@@ -176,7 +168,7 @@ pub type ActivityOptions {
     /// an attempt for silence.
     heartbeat_timeout: Option(Duration),
     /// `None` uses the server's default policy, which retries without limit.
-    retry: Option(RetryPolicy),
+    retry: Option(retry.Policy),
     /// `None` runs the activity on the workflow's own task queue.
     task_queue: Option(String),
     /// What cancelling the activity's scope does.
@@ -356,7 +348,11 @@ pub fn unless_replaying(_ctx: Context, effect: fn() -> Nil) -> Nil {
 
 // ---- logging ----
 
-fn log(level: bridge.LogLevel, message: String) -> Nil {
+fn log(
+  level: bridge.LogLevel,
+  message: String,
+  fields: List(log.Field),
+) -> Nil {
   let state = run_state.get()
   case state.is_replaying {
     True -> Nil
@@ -364,35 +360,52 @@ fn log(level: bridge.LogLevel, message: String) -> Nil {
       bridge.log(
         level,
         message,
-        dict.from_list([
-          #("workflow_id", state.workflow_id),
-          #("run_id", state.run_id),
-          #("workflow_type", state.workflow_type),
-          #("task_queue", state.task_queue),
+        list.append(log.metadata(fields), [
+          #("workflow_id", dynamic.string(state.workflow_id)),
+          #("run_id", dynamic.string(state.run_id)),
+          #("workflow_type", dynamic.string(state.workflow_type)),
+          #("task_queue", dynamic.string(state.task_queue)),
         ]),
       )
   }
 }
 
-/// Log through Erlang's `logger`, with the workflow's identity as metadata. Nothing is
-/// logged on replay, so each line appears once however often the workflow is replayed.
-pub fn log_debug(_ctx: Context, message: String) -> Nil {
-  log(bridge.Debug, message)
+/// Log through Erlang's `logger`. The workflow's id, run id, type and task queue are
+/// attached as metadata, and so are `fields`: see `temporal/log`. Nothing is logged on
+/// replay, so each line appears once however often the workflow is replayed.
+pub fn log_debug(
+  _ctx: Context,
+  message: String,
+  fields: List(log.Field),
+) -> Nil {
+  log(bridge.Debug, message, fields)
 }
 
 /// Log at info level. See `log_debug`.
-pub fn log_info(_ctx: Context, message: String) -> Nil {
-  log(bridge.Info, message)
+pub fn log_info(
+  _ctx: Context,
+  message: String,
+  fields: List(log.Field),
+) -> Nil {
+  log(bridge.Info, message, fields)
 }
 
 /// Log at warning level. See `log_debug`.
-pub fn log_warning(_ctx: Context, message: String) -> Nil {
-  log(bridge.Warning, message)
+pub fn log_warning(
+  _ctx: Context,
+  message: String,
+  fields: List(log.Field),
+) -> Nil {
+  log(bridge.Warning, message, fields)
 }
 
 /// Log at error level. See `log_debug`.
-pub fn log_error(_ctx: Context, message: String) -> Nil {
-  log(bridge.Error, message)
+pub fn log_error(
+  _ctx: Context,
+  message: String,
+  fields: List(log.Field),
+) -> Nil {
+  log(bridge.Error, message, fields)
 }
 
 // ---- futures ----
@@ -449,6 +462,35 @@ pub fn poll(check: fn() -> Option(a)) -> Future(a) {
 /// progress concurrently; only the waiting is sequential.
 pub fn await_all(futures: List(Future(a))) -> List(a) {
   list.map(futures, await)
+}
+
+/// Wait for every future to succeed and return their values in the order given, or stop
+/// at the first failure: as soon as any future has failed, its error is returned without
+/// waiting for the rest. When several have failed by then, it is the error of the one
+/// earliest in the list.
+///
+/// The futures still pending are not cancelled. To cancel them, start them in a scope of
+/// their own with `with_scope` and `cancel` it when this fails.
+pub fn try_await_all(
+  futures: List(Future(Result(a, Failure))),
+) -> Result(List(a), Failure) {
+  await(
+    Future(fn() {
+      let polled = list.map(futures, fn(future) { future.poll() })
+      case list.find_map(polled, first_error) {
+        Ok(failure) -> Some(Error(failure))
+        Error(Nil) ->
+          option.all(polled) |> option.map(fn(results) { result.all(results) })
+      }
+    }),
+  )
+}
+
+fn first_error(polled: Option(Result(a, Failure))) -> Result(Failure, Nil) {
+  case polled {
+    Some(Error(failure)) -> Ok(failure)
+    _ -> Error(Nil)
+  }
 }
 
 /// A future of the first value to become available. Earlier futures in the list win ties,
@@ -611,7 +653,8 @@ pub fn sleep(ctx: Context, lasting: Duration) -> Result(Nil, Failure) {
 
 // ---- activities ----
 
-/// Options with only the per-attempt timeout set: default retries, the workflow's task queue.
+/// Options with only the per-attempt timeout set: the server's default retries, the
+/// workflow's task queue, no other timeouts.
 pub fn activity_options(
   start_to_close start_to_close: Duration,
 ) -> ActivityOptions {
@@ -627,38 +670,62 @@ pub fn activity_options(
   )
 }
 
-/// A retry policy that gives up after `maximum_attempts` attempts, one second apart at first
-/// and doubling.
-pub fn retry_policy(maximum_attempts maximum_attempts: Int) -> RetryPolicy {
-  RetryPolicy(
-    initial_interval: duration.seconds(1),
-    backoff_coefficient: 2.0,
-    maximum_interval: None,
-    maximum_attempts:,
-    non_retryable_error_types: [],
-  )
+/// The longest the activity may take across all retries.
+pub fn with_schedule_to_close(
+  options: ActivityOptions,
+  timeout: Duration,
+) -> ActivityOptions {
+  ActivityOptions(..options, schedule_to_close: Some(timeout))
 }
 
-@internal
-pub fn to_bridge_retry(retry: RetryPolicy) -> bridge.RetryPolicy {
-  bridge.RetryPolicy(
-    initial_interval_ms: time.to_ms(retry.initial_interval),
-    backoff_coefficient: retry.backoff_coefficient,
-    maximum_interval_ms: time.option_to_ms(retry.maximum_interval),
-    maximum_attempts: retry.maximum_attempts,
-    non_retryable_error_types: retry.non_retryable_error_types,
-  )
+/// The longest the activity may wait for a worker to pick it up.
+pub fn with_schedule_to_start(
+  options: ActivityOptions,
+  timeout: Duration,
+) -> ActivityOptions {
+  ActivityOptions(..options, schedule_to_start: Some(timeout))
 }
 
-@internal
-pub fn from_bridge_retry(retry: bridge.RetryPolicy) -> RetryPolicy {
-  RetryPolicy(
-    initial_interval: time.from_ms(retry.initial_interval_ms),
-    backoff_coefficient: retry.backoff_coefficient,
-    maximum_interval: time.option_from_ms(retry.maximum_interval_ms),
-    maximum_attempts: retry.maximum_attempts,
-    non_retryable_error_types: retry.non_retryable_error_types,
-  )
+/// Fail an attempt when the activity goes this long without a heartbeat.
+pub fn with_heartbeat_timeout(
+  options: ActivityOptions,
+  timeout: Duration,
+) -> ActivityOptions {
+  ActivityOptions(..options, heartbeat_timeout: Some(timeout))
+}
+
+/// Retry the activity by this policy instead of the server's default, which retries
+/// without limit.
+pub fn with_retry(
+  options: ActivityOptions,
+  policy: retry.Policy,
+) -> ActivityOptions {
+  ActivityOptions(..options, retry: Some(policy))
+}
+
+/// Run the activity on this task queue instead of the workflow's own.
+pub fn with_task_queue(
+  options: ActivityOptions,
+  task_queue: String,
+) -> ActivityOptions {
+  ActivityOptions(..options, task_queue: Some(task_queue))
+}
+
+/// What cancelling the activity's scope does.
+pub fn with_cancellation(
+  options: ActivityOptions,
+  cancellation: ActivityCancellation,
+) -> ActivityOptions {
+  ActivityOptions(..options, cancellation:)
+}
+
+/// The id the server knows the activity by, instead of its number in the order the
+/// workflow schedules activities.
+pub fn with_activity_id(
+  options: ActivityOptions,
+  activity_id: String,
+) -> ActivityOptions {
+  ActivityOptions(..options, activity_id: Some(activity_id))
 }
 
 /// Schedule an activity. The failure, if any, is an `Activity` failure whose `cause` is the
@@ -690,7 +757,7 @@ pub fn start_activity(
         schedule_to_close_ms: time.option_to_ms(options.schedule_to_close),
         start_to_close_ms: Some(time.to_ms(options.start_to_close)),
         heartbeat_timeout_ms: time.option_to_ms(options.heartbeat_timeout),
-        retry: option.map(options.retry, to_bridge_retry),
+        retry: option.map(options.retry, retry.to_bridge),
         schedule_to_start_ms: time.option_to_ms(options.schedule_to_start),
         cancellation_type: case options.cancellation {
           TryCancel -> 0
@@ -745,16 +812,12 @@ pub fn resolution(
   })
 }
 
-// ---- signals and queries ----
+// ---- signals ----
 
-/// A future of the next signal of this kind. Signals that arrived before anyone asked are
-/// buffered and delivered in order. A signal whose payload does not decode is dropped,
-/// with a warning in the log.
-pub fn signal(_ctx: Context, definition: SignalDefinition(a)) -> Future(a) {
-  once(fn() { next_signal(definition) })
-}
-
-fn next_signal(definition: SignalDefinition(a)) -> Option(a) {
+/// The next buffered signal of this kind, for `temporal/workflow/signal`. A signal whose
+/// payload does not decode is dropped, with a warning in the log.
+@internal
+pub fn take_signal(definition: SignalDefinition(a)) -> Option(a) {
   case runtime.take_signal(definition.name) {
     None -> None
     Some(payloads) ->
@@ -767,46 +830,12 @@ fn next_signal(definition: SignalDefinition(a)) -> Option(a) {
               <> definition.name
               <> "\" dropped: could not decode it: "
               <> reason,
+            [],
           )
-          next_signal(definition)
+          take_signal(definition)
         }
       }
   }
-}
-
-/// Wait for the next signal of this kind.
-pub fn receive_signal(ctx: Context, definition: SignalDefinition(a)) -> a {
-  await(signal(ctx, definition))
-}
-
-/// The next signal of this kind if one has already arrived. Does not wait.
-pub fn try_receive_signal(
-  _ctx: Context,
-  definition: SignalDefinition(a),
-) -> Option(a) {
-  next_signal(definition)
-}
-
-/// Answer queries of this kind with `handler`. Workflow state lives in local variables, so
-/// call this again with a new closure whenever the answer should change. The handler must
-/// not use any other function of this module.
-pub fn set_query_handler(
-  _ctx: Context,
-  definition: QueryDefinition(argument, result),
-  handler: fn(argument) -> result,
-) -> Nil {
-  let erased = fn(arguments) {
-    codec.decode_arguments(definition.argument, arguments)
-    |> result.map(fn(argument) {
-      codec.encode(definition.result, handler(argument))
-    })
-  }
-  run_state.update(fn(state) {
-    State(
-      ..state,
-      query_handlers: dict.insert(state.query_handlers, definition.name, erased),
-    )
-  })
 }
 
 // ---- lifecycle ----
@@ -882,17 +911,6 @@ pub fn send_signal(
       external_outcome(fn() { dict.get(run_state.get().external_signals, seq) })
     }
   }
-}
-
-/// Signal another workflow by id; its current run receives it. The future resolves once
-/// the server has delivered the signal, or fails if there is no such workflow.
-pub fn signal_external(
-  ctx: Context,
-  workflow_id: String,
-  definition: SignalDefinition(a),
-  value: a,
-) -> Future(Result(Nil, Failure)) {
-  send_signal(ctx, bridge.ExternalWorkflow(workflow_id, ""), definition, value)
 }
 
 /// Ask another workflow to cancel. Resolves once the server has passed the request on, not

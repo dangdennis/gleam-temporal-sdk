@@ -1,7 +1,5 @@
 //// The code of docs/guide.md, kept compiling and running so that the guide stays true.
 
-import gleam/dynamic/decode
-import gleam/json
 import gleam/option.{Some}
 import gleam/result
 import gleam/time/duration
@@ -10,28 +8,24 @@ import temporal/activity
 import temporal/client
 import temporal/codec
 import temporal/failure.{type Failure}
+import temporal/log
+import temporal/retry
+import temporal/schema
 import temporal/testing
 import temporal/worker
 import temporal/workflow
+import temporal/workflow/signal
 
 pub type Order {
   Order(id: String, amount: Int)
 }
 
 fn order_codec() {
-  codec.json(
-    fn(order: Order) {
-      json.object([
-        #("id", json.string(order.id)),
-        #("amount", json.int(order.amount)),
-      ])
-    },
-    {
-      use id <- decode.field("id", decode.string)
-      use amount <- decode.field("amount", decode.int)
-      decode.success(Order(id:, amount:))
-    },
-  )
+  schema.codec(schema.object2(
+    Order,
+    schema.field("id", schema.string(), fn(order: Order) { order.id }),
+    schema.field("amount", schema.int(), fn(order: Order) { order.amount }),
+  ))
 }
 
 fn process_order() {
@@ -54,19 +48,18 @@ fn process_order_workflow(
   ctx: workflow.Context,
   order: Order,
 ) -> Result(String, Failure) {
-  let options = workflow.activity_options(start_to_close: duration.seconds(30))
+  let options =
+    workflow.activity_options(start_to_close: duration.seconds(30))
+    |> workflow.with_retry(retry.policy(maximum_attempts: 5))
   use charge_id <- result.try(workflow.execute_activity(
     ctx,
     charge(),
     order,
     options,
   ))
+  workflow.log_info(ctx, "charged", [log.string("charge_id", charge_id)])
   case
-    workflow.await_timeout(
-      ctx,
-      workflow.signal(ctx, shipped()),
-      duration.hours(24),
-    )
+    workflow.await_timeout(ctx, signal.next(ctx, shipped()), duration.hours(24))
   {
     Ok(tracking) -> Ok(tracking)
     Error(_) -> {

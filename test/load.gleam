@@ -8,7 +8,6 @@ import gleam/erlang/process.{type Pid}
 import gleam/int
 import gleam/io
 import gleam/list
-import gleam/option.{Some}
 import gleam/result
 import gleam/string
 import gleam/time/duration
@@ -134,13 +133,11 @@ pub fn main() -> Nil {
           client,
           order(),
           n,
-          client.StartOptions(
-            ..client.start_options(
-              workflow_id: task_queue <> "-" <> int.to_string(n),
-              task_queue:,
-            ),
-            task_timeout: Some(duration.seconds(5)),
-          ),
+          client.start_options(
+            workflow_id: task_queue <> "-" <> int.to_string(n),
+            task_queue:,
+          )
+            |> client.with_task_timeout(duration.seconds(5)),
         )
       #(n, handle)
     })

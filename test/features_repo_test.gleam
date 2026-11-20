@@ -17,9 +17,12 @@ import temporal/client
 import temporal/codec
 import temporal/failure.{type Failure}
 import temporal/replayer
+import temporal/retry
 import temporal/schedule
 import temporal/worker
 import temporal/workflow.{type Context}
+import temporal/workflow/query
+import temporal/workflow/signal
 
 fn options() {
   workflow.activity_options(start_to_close: duration.minutes(1))
@@ -93,18 +96,12 @@ fn retrying_workflow(ctx: Context, _: Nil) -> Result(Nil, Failure) {
     ctx,
     always_fail(),
     Nil,
-    workflow.ActivityOptions(
-      ..options(),
-      retry: Some(
-        workflow.RetryPolicy(
-          initial_interval: duration.milliseconds(1),
-          backoff_coefficient: 1.0,
-          maximum_interval: option.None,
-          maximum_attempts: 5,
-          non_retryable_error_types: [],
-        ),
+    options()
+      |> workflow.with_retry(
+        retry.policy(maximum_attempts: 5)
+        |> retry.with_initial_interval(duration.milliseconds(1))
+        |> retry.with_backoff_coefficient(1.0),
       ),
-    ),
   )
 }
 
@@ -180,12 +177,12 @@ fn queried() {
 }
 
 fn queried_workflow(ctx: Context, _: Nil) -> Result(Nil, Failure) {
-  workflow.set_query_handler(
+  query.set_handler(
     ctx,
     workflow.QueryDefinition("myq", codec.int(), codec.string()),
     fn(n) { "query yo " <> string.inspect(n) },
   )
-  Ok(workflow.receive_signal(ctx, finish()))
+  Ok(signal.receive(ctx, finish()))
 }
 
 /// The TypeScript SDK accepts anything here. With typed codecs a query whose argument or
@@ -279,11 +276,9 @@ fn closing() {
 /// Three activities caught by a worker shutdown: one finishes, one fails, one ignores it.
 fn closing_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   let once =
-    workflow.ActivityOptions(
-      ..options(),
-      schedule_to_close: Some(duration.seconds(30)),
-      retry: Some(workflow.retry_policy(maximum_attempts: 1)),
-    )
+    options()
+    |> workflow.with_schedule_to_close(duration.seconds(30))
+    |> workflow.with_retry(retry.policy(maximum_attempts: 1))
   let finishing = workflow.start_activity(ctx, until_shutdown(), True, once)
   let failing = workflow.start_activity(ctx, until_shutdown(), False, once)
   let ignoring =
@@ -367,17 +362,15 @@ pub fn schedule_backfill_test() {
     schedule.create(
       client,
       id,
-      schedule.Schedule(
-        ..schedule.new(
-          schedule.every(duration.minutes(1)),
-          schedule.action(
-            tick(),
-            "arg1",
-            client.start_options(workflow_id: id <> "-run", task_queue: id),
-          ),
+      schedule.new(
+        schedule.every(duration.minutes(1)),
+        schedule.action(
+          tick(),
+          "arg1",
+          client.start_options(workflow_id: id <> "-run", task_queue: id),
         ),
-        paused: True,
-      ),
+      )
+        |> schedule.with_paused(True),
     )
   let now = timestamp.system_time()
   let ago = fn(minutes) { timestamp.subtract(now, duration.minutes(minutes)) }

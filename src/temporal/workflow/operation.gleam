@@ -3,7 +3,10 @@
 //// which namespace and task queue handle the call. See `temporal/nexus` for serving them.
 ////
 //// ```gleam
-//// operation.execute(ctx, "orders-endpoint", place_order(), order, operation.options())
+//// let options =
+////   operation.options()
+////   |> operation.with_schedule_to_close(duration.minutes(5))
+//// operation.execute(ctx, "orders-endpoint", place_order(), order, options)
 //// ```
 
 import gleam/dict
@@ -30,11 +33,12 @@ pub type Cancellation {
   DoNotCancel
 }
 
-/// How an operation is run. Build with `options` and change what differs.
+/// How an operation is run. Build with `options` and the `with_` functions.
 pub type Options {
   Options(
     /// Longest the operation may take, retries included. `None` leaves it to the server.
     schedule_to_close: Option(Duration),
+    /// What cancelling the operation's scope does.
     cancellation: Cancellation,
   )
 }
@@ -42,6 +46,19 @@ pub type Options {
 /// No deadline of its own; cancellation waits for the operation to end.
 pub fn options() -> Options {
   Options(schedule_to_close: None, cancellation: WaitUntilCancelled)
+}
+
+/// The longest the operation may take, retries included.
+pub fn with_schedule_to_close(options: Options, timeout: Duration) -> Options {
+  Options(..options, schedule_to_close: Some(timeout))
+}
+
+/// What cancelling the operation's scope does.
+pub fn with_cancellation(
+  options: Options,
+  cancellation: Cancellation,
+) -> Options {
+  Options(..options, cancellation:)
 }
 
 /// An operation the workflow has asked for.

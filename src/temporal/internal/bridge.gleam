@@ -6,6 +6,7 @@
 //// still matched by hand, in `native/temporal_nif/src/convert.rs`.
 
 import gleam/dict.{type Dict}
+import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Pid}
 import gleam/option.{type Option}
 import temporal/codec.{type Payload}
@@ -578,11 +579,13 @@ pub fn activity_cancel_reason() -> Option(Int)
 @external(erlang, "temporal_ffi", "rescue_all")
 pub fn rescue_all(body: fn() -> a) -> Result(a, String)
 
+/// Log through Erlang's `logger`. Metadata values keep their types; when a key is given
+/// twice the later entry wins.
 @external(erlang, "temporal_ffi", "log")
 pub fn log(
   level: LogLevel,
   message: String,
-  metadata: Dict(String, String),
+  metadata: List(#(String, Dynamic)),
 ) -> Nil
 
 pub type LogLevel {

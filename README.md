@@ -44,6 +44,7 @@ import temporal/activity
 import temporal/client
 import temporal/codec
 import temporal/failure.{type Failure}
+import temporal/retry
 import temporal/worker
 import temporal/workflow
 
@@ -58,7 +59,9 @@ pub fn greet() {
 }
 
 fn greet_workflow(ctx: workflow.Context, name: String) -> Result(String, Failure) {
-  let options = workflow.activity_options(start_to_close: duration.seconds(10))
+  let options =
+    workflow.activity_options(start_to_close: duration.seconds(10))
+    |> workflow.with_retry(retry.policy(maximum_attempts: 3))
   workflow.execute_activity(ctx, say_hello(), name, options)
 }
 
@@ -78,13 +81,19 @@ pub fn main() {
 }
 ```
 
+Options are always built the same way: a constructor that takes what is required, then one
+`with_` function for each thing to change, as with `workflow.activity_options` and the
+worker above.
+
 The modules:
 
 | Module | For |
 |---|---|
-| `temporal/workflow` | Writing workflows: timers, activities, signals, queries, futures, cancellation scopes |
-| `temporal/workflow/child` | Child workflows |
+| `temporal/workflow` | Writing workflows: timers, activities, futures, cancellation scopes, logging |
+| `temporal/workflow/signal` | Receiving signals, and sending them to other workflows |
+| `temporal/workflow/query` | Answering queries |
 | `temporal/workflow/update` | Taking and answering updates |
+| `temporal/workflow/child` | Child workflows |
 | `temporal/workflow/local_activity` | Local activities |
 | `temporal/workflow/operation` | Calling Nexus operations |
 | `temporal/activity` | Writing activities |
@@ -92,7 +101,11 @@ The modules:
 | `temporal/worker` | Running workflows and activities |
 | `temporal/schedule` | Schedules |
 | `temporal/nexus` | Serving Nexus operations |
+| `temporal/retry` | Retry policies, for activities, child workflows, workflows and schedules |
 | `temporal/codec`, `temporal/encryption` | Value codecs and payload codecs |
+| `temporal/schema` | Describing a JSON object once, for both encoding and decoding |
+| `temporal/log` | Fields for structured log lines |
+| `temporal/telemetry` | Prometheus metrics |
 | `temporal/failure` | Failures |
 | `temporal/testing`, `temporal/replayer` | Test servers, activity contexts, history replay |
 
@@ -104,17 +117,17 @@ So is passing a bare number where a length of time is wanted: every timeout and 
 
 | Area | Supported |
 |---|---|
-| Workflows | Activities, local activities, durable timers, signals, queries, updates, child workflows, continue-as-new, patching and `deprecate_patch`, memo and search attribute changes, headers, deterministic `now` / `random_int` / `uuid4`, logging that is silent on replay |
+| Workflows | Activities, local activities, durable timers, signals, queries, updates, child workflows, continue-as-new, patching and `deprecate_patch`, memo and search attribute changes, headers, deterministic `now` / `random_int` / `uuid4`, logging with fields that is silent on replay |
 | Cancellation | Scopes carried by the `Context`: `with_scope`, `with_timeout`, `non_cancellable`, `cancel`; cancelling a scope cancels its timers, activities, local activities, child workflows, Nexus operations and pending signals |
-| Concurrency | `Future` values with `map`, `race`, `await`, `await_all`, `await_timeout`, `await_cancellable` |
-| Activities | Typed handlers, retry policies, all four timeouts, heartbeats with details, cancellation delivered to the activity, activity info, failure details, completion from outside by task token |
+| Concurrency | `Future` values with `map`, `race`, `await`, `await_all`, `try_await_all`, `await_timeout`, `await_cancellable` |
+| Activities | Typed handlers, retry policies, all four timeouts, heartbeats with details, cancellation delivered to the activity, activity info, logging with fields, failure details, completion from outside by task token |
 | Child workflows | Start and await separately, signal, parent close policy, id reuse policy, timeouts, retries, memo, cancellation type |
 | Other workflows | Signal and request cancellation of any workflow by id from workflow code |
 | Nexus | Call operations from workflows; serve operations from a worker, answered directly or backed by a workflow |
 | Client | Start with options (memo, search attributes, id reuse and conflict policies, timeouts, retries, start delay, cron), signal-with-start, update-with-start, execute, result, signal, query, update, cancel, terminate, describe, list, count, fetch history; typed errors |
 | Schedules | Create, describe, update, pause, unpause, trigger, backfill, delete, list; intervals with offsets, calendars, cron expressions, time zones, overlap policies |
 | Workers | Concurrency limits, activity rate limits, workflow-only and activity-only workers, workflow and activity middleware, outbound rewriting, worker deployment versioning with pinned and auto-upgrading workflows, graceful shutdown, Prometheus metrics |
-| Data | JSON and binary payloads (`json/plain`, `binary/plain`), compatible with the Temporal CLI and other SDKs; payload codecs, with an AES-256-GCM encryption codec included |
+| Data | JSON and binary payloads (`json/plain`, `binary/plain`), compatible with the Temporal CLI and other SDKs; JSON object schemas that give the encoder and the decoder from one description; payload codecs, with an AES-256-GCM encryption codec included |
 | Connection | Plaintext, TLS, mutual TLS, API keys |
 | Testing | `replayer.replay` for recorded histories; `temporal/testing` for a time-skipping server, a local dev server, and activity contexts that need no server |
 
@@ -166,12 +179,44 @@ pub fn transfer() {
 client.execute(client, transfer(), #("alice", "bob", 250), options)
 ```
 
+For a JSON object, describe it once with `temporal/schema` and get both directions:
+
+```gleam
+pub type Output {
+  Output(deleted_otps: Int, deleted_sessions: Int)
+}
+
+fn output_schema() {
+  schema.object2(
+    Output,
+    schema.field("deletedOtps", schema.int(), fn(o: Output) { o.deleted_otps }),
+    schema.field("deletedSessions", schema.int(), fn(o: Output) { o.deleted_sessions }),
+  )
+}
+
+pub fn cleanup() {
+  workflow.Definition("cleanup", codec.nil(), schema.codec(output_schema()))
+}
+```
+
+Schemas nest, with `schema.list`, `schema.optional` and `schema.dict` around them.
+`codec.json` takes a hand-written encoder and decoder for anything a schema cannot describe.
+
 Every client call returns `Result(_, client.Error)`: one type, whose variants say whether
 the workflow failed, was cancelled, timed out, was not found, and so on.
 
 `start` never waits. `workflow.start_activity` returns a future of the result;
 `child.start` and `operation.start` return a handle with a `started` future and a `result`
 future. The `execute` functions start and wait for the result.
+
+To wait for several things at once, start them all and then wait: `workflow.await_all` for
+every value, or `workflow.try_await_all` to stop at the first failure.
+
+```gleam
+let charges =
+  list.map(orders, workflow.start_activity(ctx, charge(), _, options))
+use receipts <- result.try(workflow.try_await_all(charges))
+```
 
 ## Cancellation
 
@@ -210,7 +255,7 @@ and returns `Error(failure.cancelled())` to accept; it is never killed.
 To wait for a signal with a deadline, the equivalent of TypeScript's `condition(fn, timeout)`:
 
 ```gleam
-case workflow.await_timeout(ctx, workflow.signal(ctx, approved()), duration.hours(24)) {
+case workflow.await_timeout(ctx, signal.next(ctx, approved()), duration.hours(24)) {
   Ok(approval) -> ...
   Error(_) -> ...  // timed out, or the workflow was cancelled
 }
@@ -284,14 +329,14 @@ that the service stores ciphertext:
 
 ```gleam
 let codec = encryption.codec(encryption.Key(id: "2026-01", secret: key), [])
-client.connect(client.Options(..client.local(), codec: Some(codec)))
+client.connect(client.local() |> client.with_codec(codec))
 ```
 
 The included codec is AES-256-GCM in the format of the encryption codec in Temporal's own
 samples, so a TypeScript, Go or Python worker with the same key reads the same data. Pass
 retired keys as the second argument for as long as histories written with them may be
 read. Search attributes are never encrypted. With a codec on, the Temporal UI and CLI show
-ciphertext, and `replayer.replay_with` needs the codec too. Write your own
+ciphertext, and `replayer.replay_with` needs the codec too, set with `replayer.with_codec`. Write your own
 `codec.PayloadCodec` for compression or a key service.
 
 ## Worker versioning
@@ -313,22 +358,32 @@ without `patched`. An auto-upgrading one moves to the current build at its next 
 build is current is set outside the SDK, with `temporal worker deployment
 set-current-version` or the UI; a versioned worker receives nothing until then.
 
-## Headers and metrics
+## Headers, logging and metrics
 
 Headers are context that travels beside the arguments: a trace id, a tenant. Set them when
 starting a workflow; the workflow passes them on to the activities and child workflows it
 starts unless outbound middleware changes them.
 
 ```gleam
-client.StartOptions(..options, headers: dict.from_list([#("trace", codec.encode(codec.string(), trace_id))]))
+client.start_options(workflow_id: "order-1", task_queue: "orders")
+|> client.with_headers(dict.from_list([#("trace", codec.encode(codec.string(), trace_id))]))
 
 workflow.headers(ctx)              // in the workflow
 activity.info(ctx).headers         // in an activity
 ```
 
+Workflows and activities log through Erlang's `logger`, with their identity as metadata and
+any fields you add. A workflow logs nothing on replay, so each line appears once.
+
+```gleam
+workflow.log_info(ctx, "order shipped", [log.string("carrier", carrier), log.int("parcels", 3)])
+activity.log_warning(ctx, "card declined", [log.string("reason", reason)])
+```
+
 `telemetry.serve_prometheus("0.0.0.0:9464")` serves the worker's and client's metrics, the
 same ones Temporal's other SDKs report, for Prometheus to scrape. Call it before the first
-`client.connect`.
+`client.connect`; its `telemetry.Error` says whether it was called too late, given a bad
+address, or could not bind.
 
 ## Middleware
 
@@ -361,7 +416,8 @@ worker.new(client, "main")
 })
 ```
 
-When replaying a history, pass the same outbound middleware to `replayer.replay_with`.
+When replaying a history, give `replayer.replay_with` the same outbound middleware, with
+`replayer.with_outbound_activity` and `replayer.with_outbound_child`.
 
 ## Testing workflows
 
@@ -454,9 +510,12 @@ order and identity; it does not compare payload contents or timing between the S
   scope lists what was started in it, nested scopes included, in order; cancelling one walks
   that list and emits the cancel commands in the order the TypeScript SDK would, which is
   what lets histories recorded there replay here.
-- **One module per kind of thing a workflow does.** Children, updates, local activities
-  and Nexus calls each have their own, so names read as `child.Abandon` and
-  `update.receive` with no suffixes to keep them apart.
+- **One module per kind of thing a workflow does.** Signals, queries, updates, children,
+  local activities and Nexus calls each have their own, with the same verbs where they
+  apply, so names read as `signal.receive`, `update.receive` and `child.Abandon` with no
+  suffixes to keep them apart.
+- **Options are a constructor and `with_` functions.** The constructor takes what is
+  required; each optional setting has one setter that takes the plain value.
 - **Updates are pulled, not pushed.** A workflow is one process running one function, so
   an update cannot run beside it. The runtime accepts or rejects each update as it
   arrives and queues the accepted ones for the workflow to take.

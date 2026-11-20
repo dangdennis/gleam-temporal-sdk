@@ -3,7 +3,6 @@
 
 import gleam/dict
 import gleam/erlang/process
-import gleam/option.{Some}
 import gleam/result
 import gleam/string
 import gleam/time/duration
@@ -14,6 +13,7 @@ import temporal/client
 import temporal/codec
 import temporal/failure.{type Failure}
 import temporal/nexus
+import temporal/retry
 import temporal/search_attributes
 import temporal/worker
 import temporal/workflow.{type Context}
@@ -56,10 +56,7 @@ fn overrunning() {
 /// An activity given two seconds in total that needs ten.
 fn overrunning_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   let limited =
-    workflow.ActivityOptions(
-      ..options(),
-      schedule_to_close: Some(duration.seconds(2)),
-    )
+    options() |> workflow.with_schedule_to_close(duration.seconds(2))
   case workflow.execute_activity(ctx, nap(), 10_000, limited) {
     Ok(Nil) -> Ok("finished")
     Error(failure) ->
@@ -77,15 +74,11 @@ fn nursery_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
     ctx,
     stamp(),
     Nil,
-    child.Options(
-      ..child.options(workflow_id: workflow.info(ctx).workflow_id <> "-child"),
-      retry: Some(
-        workflow.RetryPolicy(
-          ..workflow.retry_policy(maximum_attempts: 3),
-          initial_interval: duration.milliseconds(10),
-        ),
+    child.options(workflow_id: workflow.info(ctx).workflow_id <> "-child")
+      |> child.with_retry(
+        retry.policy(maximum_attempts: 3)
+        |> retry.with_initial_interval(duration.milliseconds(10)),
       ),
-    ),
   )
 }
 
@@ -152,14 +145,10 @@ fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
 pub fn a_workflow_retry_policy_starts_a_failed_workflow_again_test() {
   use env <- in_both_modes("retried")
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      retry: Some(
-        workflow.RetryPolicy(
-          ..workflow.retry_policy(maximum_attempts: 3),
-          initial_interval: duration.milliseconds(10),
-        ),
-      ),
+    start_options(env)
+    |> client.with_retry(
+      retry.policy(maximum_attempts: 3)
+      |> retry.with_initial_interval(duration.milliseconds(10)),
     )
   assert client.execute(env.client, stamp(), Nil, options) == Ok("attempt 2")
 }
@@ -167,11 +156,9 @@ pub fn a_workflow_retry_policy_starts_a_failed_workflow_again_test() {
 pub fn a_start_delay_holds_the_first_task_back_test() {
   use env <- in_both_modes("delayed")
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      retry: Some(workflow.retry_policy(maximum_attempts: 2)),
-      start_delay: Some(duration.seconds(2)),
-    )
+    start_options(env)
+    |> client.with_retry(retry.policy(maximum_attempts: 2))
+    |> client.with_start_delay(duration.seconds(2))
   let before = timestamp.system_time()
   let assert Ok(_) = client.execute(env.client, stamp(), Nil, options)
   let waited = timestamp.difference(before, timestamp.system_time())
@@ -181,10 +168,8 @@ pub fn a_start_delay_holds_the_first_task_back_test() {
 pub fn terminate_existing_replaces_the_running_workflow_test() {
   use env <- in_both_modes("replaced")
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      id_conflict_policy: client.TerminateExisting,
-    )
+    start_options(env)
+    |> client.with_id_conflict_policy(client.TerminateExisting)
   let assert Ok(first) = client.start(env.client, idle(), Nil, options)
   let assert Ok(second) = client.start(env.client, idle(), Nil, options)
   assert client.run_id(first) != client.run_id(second)
@@ -196,10 +181,7 @@ pub fn terminate_existing_replaces_the_running_workflow_test() {
 pub fn an_execution_timeout_ends_the_workflow_test() {
   use env <- in_both_modes("expiring")
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      execution_timeout: Some(duration.seconds(1)),
-    )
+    start_options(env) |> client.with_execution_timeout(duration.seconds(1))
   assert client.execute(env.client, idle(), Nil, options)
     == Error(client.WorkflowTimedOut)
 }

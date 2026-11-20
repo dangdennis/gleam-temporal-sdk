@@ -140,7 +140,7 @@ fn answer_query(query: #(String, String, List(Payload))) -> Command {
         <> query_type
         <> "\"; this workflow has "
         <> known(dict.keys(get().query_handlers))
-        <> ". Set one with workflow.set_query_handler.",
+        <> ". Set one with query.set_handler.",
       )
     Ok(handler) ->
       case bridge.rescue(fn() { handler(arguments) }) {

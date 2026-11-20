@@ -22,24 +22,21 @@ pub fn a_schedule_round_trips_and_can_be_changed_test() {
   let assert Ok(client) = client.connect(client.local())
   let id = "schedule-" <> unique()
   let options =
-    client.StartOptions(
-      ..client.start_options(workflow_id: id <> "-run", task_queue: id),
-      run_timeout: Some(duration.milliseconds(60_000)),
-      task_timeout: Some(duration.milliseconds(10_000)),
-      memo: dict.from_list([
-        #("origin", codec.encode(codec.string(), "schedule")),
-      ]),
+    client.start_options(workflow_id: id <> "-run", task_queue: id)
+    |> client.with_run_timeout(duration.milliseconds(60_000))
+    |> client.with_task_timeout(duration.milliseconds(10_000))
+    |> client.with_memo(
+      dict.from_list([#("origin", codec.encode(codec.string(), "schedule"))]),
     )
   let created =
-    schedule.Schedule(
-      ..schedule.new(
-        schedule.every_offset(duration.hours(1), offset: duration.minutes(7)),
-        schedule.action(tick(), "hourly", options),
-      ),
-      overlap: schedule.BufferOne,
-      paused: True,
-      note: "created paused",
+    schedule.new(
+      schedule.every(duration.hours(1))
+        |> schedule.with_offset(duration.minutes(7)),
+      schedule.action(tick(), "hourly", options),
     )
+    |> schedule.with_overlap(schedule.BufferOne)
+    |> schedule.with_paused(True)
+    |> schedule.with_note("created paused")
   let assert Ok(Nil) = schedule.create(client, id, created)
   let assert Error(client.AlreadyExists(_)) =
     schedule.create(client, id, created)
@@ -47,10 +44,7 @@ pub fn a_schedule_round_trips_and_can_be_changed_test() {
   let assert Ok(described) = schedule.describe(client, id)
   // The server fills in its default catch-up window of a year.
   assert described.schedule
-    == schedule.Schedule(
-      ..created,
-      catchup_window: Some(duration.hours(365 * 24)),
-    )
+    == schedule.with_catchup_window(created, duration.hours(365 * 24))
   assert described.action_count == 0
   // Every upcoming action is seven minutes past the hour, as the offset asks.
   assert described.next_action_times != []
@@ -62,18 +56,16 @@ pub fn a_schedule_round_trips_and_can_be_changed_test() {
   // An update keeps what it does not touch.
   let assert Ok(Nil) =
     schedule.update(client, id, fn(current) {
-      schedule.Schedule(
-        ..current,
-        spec: schedule.on(
-            schedule.Calendar(
-              ..schedule.daily(),
-              hour: schedule.exactly(9),
-              minute: schedule.stepping(0, 59, 30),
-              day_of_week: schedule.between(1, 5),
-              comment: "working hours",
-            ),
-          )
-          |> schedule.in_timezone("Europe/Lisbon"),
+      schedule.with_spec(
+        current,
+        schedule.on(
+          schedule.daily()
+          |> schedule.with_hour(schedule.exactly(9))
+          |> schedule.with_minute(schedule.stepping(0, 59, 30))
+          |> schedule.with_day_of_week(schedule.between(1, 5))
+          |> schedule.with_comment("working hours"),
+        )
+          |> schedule.with_timezone("Europe/Lisbon"),
       )
     })
   let assert Ok(described) = schedule.describe(client, id)
@@ -149,14 +141,12 @@ pub fn a_triggered_schedule_starts_its_workflow_test() {
     ])
     |> worker.start
   let options =
-    client.StartOptions(
-      ..client.start_options(workflow_id: id <> "-run", task_queue: id),
-      memo: dict.from_list([
-        #("origin", codec.encode(codec.string(), "schedule")),
-      ]),
-      search_attributes: dict.from_list([
-        #(attribute, search_attributes.Keyword(id)),
-      ]),
+    client.start_options(workflow_id: id <> "-run", task_queue: id)
+    |> client.with_memo(
+      dict.from_list([#("origin", codec.encode(codec.string(), "schedule"))]),
+    )
+    |> client.with_search_attributes(
+      dict.from_list([#(attribute, search_attributes.Keyword(id))]),
     )
   let assert Ok(Nil) =
     schedule.create(

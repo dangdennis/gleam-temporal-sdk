@@ -30,11 +30,13 @@ import temporal/encryption
 import temporal/failure.{type Failure}
 import temporal/nexus
 import temporal/replayer
+import temporal/retry
 import temporal/worker
 import temporal/workflow.{type Context}
 import temporal/workflow/child
 import temporal/workflow/local_activity
 import temporal/workflow/operation
+import temporal/workflow/signal
 import temporal/workflow/update
 
 // ---- activities ----
@@ -109,7 +111,7 @@ fn basics_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
       workflow.start_activity(ctx, double(), a, options()),
       workflow.start_activity(ctx, double(), a + 1, options()),
     ])
-  let signalled = workflow.receive_signal(ctx, added())
+  let signalled = signal.receive(ctx, added())
   let child =
     child.options(workflow_id: workflow.info(ctx).workflow_id <> "-child")
   use doubled <- result.try(child.execute(ctx, double_child(), c, child))
@@ -170,7 +172,7 @@ fn deadline_workflow(ctx: Context, n: Int) -> Result(String, Failure) {
   let wait = fn(ms) {
     workflow.await_timeout(
       ctx,
-      workflow.signal(ctx, nudge()),
+      signal.next(ctx, nudge()),
       duration.milliseconds(ms),
     )
     |> result.is_ok
@@ -211,7 +213,7 @@ fn updates_workflow(ctx: Context, total: Int) -> Result(Int, Failure) {
   let next =
     workflow.race([
       update.next(ctx, add()) |> workflow.map(Some),
-      workflow.signal(ctx, finish()) |> workflow.map(fn(_) { None }),
+      signal.next(ctx, finish()) |> workflow.map(fn(_) { None }),
     ])
   case workflow.await(next) {
     None -> Ok(total)
@@ -250,7 +252,7 @@ fn listener() {
 fn listener_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   use text <- result.map(workflow.await_cancellable(
     ctx,
-    workflow.signal(ctx, poke()),
+    signal.next(ctx, poke()),
   ))
   "poked: " <> text
 }
@@ -263,23 +265,13 @@ fn external() {
 /// child and signal it.
 fn external_workflow(ctx: Context, prefix: String) -> Result(String, Failure) {
   use _ <- result.try(
-    workflow.await(workflow.signal_external(
-      ctx,
-      prefix <> "-signalled",
-      poke(),
-      "hello",
-    )),
+    workflow.await(signal.send(ctx, prefix <> "-signalled", poke(), "hello")),
   )
   use _ <- result.try(
     workflow.await(workflow.cancel_external(ctx, prefix <> "-cancelled")),
   )
   let missing =
-    workflow.await(workflow.signal_external(
-      ctx,
-      prefix <> "-missing",
-      poke(),
-      "anyone?",
-    ))
+    workflow.await(signal.send(ctx, prefix <> "-missing", poke(), "anyone?"))
   let listening =
     child.start(
       ctx,
@@ -307,17 +299,13 @@ fn local() {
 fn local_workflow(ctx: Context, attempts: Int) -> Result(String, Failure) {
   let once = local_activity.options(start_to_close: duration.milliseconds(5000))
   let retrying =
-    local_activity.Options(
-      ..once,
-      retry: Some(
-        workflow.RetryPolicy(
-          ..workflow.retry_policy(maximum_attempts: 5),
-          initial_interval: duration.milliseconds(1500),
-          backoff_coefficient: 1.0,
-        ),
-      ),
-      local_retry_threshold: Some(duration.milliseconds(1000)),
+    once
+    |> local_activity.with_retry(
+      retry.policy(maximum_attempts: 5)
+      |> retry.with_initial_interval(duration.milliseconds(1500))
+      |> retry.with_backoff_coefficient(1.0),
     )
+    |> local_activity.with_local_retry_threshold(duration.milliseconds(1000))
   use doubled <- result.try(local_activity.execute(ctx, double(), 21, once))
   use outcome <- result.map(local_activity.execute(
     ctx,
@@ -491,7 +479,10 @@ fn fixture(name: String) -> client.History {
 }
 
 fn replay_options(codec: Option(codec.PayloadCodec)) -> replayer.Options {
-  replayer.Options(..replayer.options(), codec:)
+  case codec {
+    Some(codec) -> replayer.options() |> replayer.with_codec(codec)
+    None -> replayer.options()
+  }
 }
 
 /// Steps 1 and 2: the TypeScript SDK's history replays through the Gleam twin, and is
@@ -518,7 +509,10 @@ fn record_gleam_history(
   drive: fn(Env) -> client.Handle(output),
 ) -> Nil {
   let assert Ok(client) =
-    client.connect(client.Options(..client.local(), codec:))
+    client.connect(case codec {
+      Some(codec) -> client.local() |> client.with_codec(codec)
+      None -> client.local()
+    })
   list.each([1000, 0], fn(max_cached) {
     let task_queue =
       "conformance-"

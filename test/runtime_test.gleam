@@ -15,11 +15,14 @@ import temporal/failure
 import temporal/internal/bridge.{type Completion, Activation}
 import temporal/internal/runtime
 import temporal/internal/runtime/run_state
+import temporal/log
 import temporal/middleware
 import temporal/workflow
 import temporal/workflow/child
 import temporal/workflow/local_activity
 import temporal/workflow/operation
+import temporal/workflow/query
+import temporal/workflow/signal
 import temporal/workflow/update
 
 fn double() {
@@ -125,6 +128,70 @@ pub fn activities_are_scheduled_together_test() {
     == [bridge.CompleteWorkflow(int_payload(6))]
 }
 
+fn summing(name: String) -> #(Pid, Subject(Completion)) {
+  let options =
+    workflow.activity_options(start_to_close: duration.milliseconds(5000))
+  start(
+    int_workflow(name, fn(ctx, n) {
+      [n, n + 1, n + 2]
+      |> list.map(workflow.start_activity(ctx, double(), _, options))
+      |> workflow.try_await_all
+      |> result.map(int.sum)
+    }),
+  )
+}
+
+pub fn try_await_all_returns_every_value_in_order_test() {
+  let run = summing("all_or_nothing")
+  let assert [_, _, _] = activate(run, [init("all_or_nothing", 1)])
+  // Resolved out of order: the workflow waits for the last of them.
+  assert activate(run, [
+      bridge.ResolveActivity(3, bridge.Completed(int_payload(6))),
+      bridge.ResolveActivity(1, bridge.Completed(int_payload(2))),
+    ])
+    == []
+  assert activate(run, [
+      bridge.ResolveActivity(2, bridge.Completed(int_payload(4))),
+    ])
+    == [bridge.CompleteWorkflow(int_payload(12))]
+}
+
+pub fn try_await_all_fails_at_the_first_failure_test() {
+  let run = summing("fail_fast")
+  let _ = activate(run, [init("fail_fast", 1)])
+  assert activate(run, [
+      bridge.ResolveActivity(1, bridge.Completed(int_payload(2))),
+    ])
+    == []
+  // The second activity is still pending, and is not cancelled.
+  let boom = failure.new("boom")
+  assert activate(run, [bridge.ResolveActivity(3, bridge.Failed(boom))])
+    == [bridge.FailWorkflow(boom)]
+}
+
+pub fn try_await_all_reports_the_earliest_of_several_failures_test() {
+  let run = summing("two_failures")
+  let _ = activate(run, [init("two_failures", 1)])
+  let first = failure.new("first")
+  assert activate(run, [
+      bridge.ResolveActivity(3, bridge.Failed(failure.new("last"))),
+      bridge.ResolveActivity(1, bridge.Failed(first)),
+    ])
+    == [bridge.FailWorkflow(first)]
+}
+
+pub fn try_await_all_of_nothing_is_empty_test() {
+  let run =
+    start(
+      int_workflow("nothing", fn(_, n) {
+        workflow.try_await_all([])
+        |> result.map(fn(values) { n + int.sum(values) })
+      }),
+    )
+  assert activate(run, [init("nothing", 7)])
+    == [bridge.CompleteWorkflow(int_payload(7))]
+}
+
 pub fn activity_failure_reaches_the_workflow_test() {
   let run =
     start(
@@ -148,8 +215,8 @@ fn accumulator() -> workflow.Handler {
 }
 
 fn accumulate(ctx: workflow.Context, sum: Int) -> Result(Int, failure.Failure) {
-  workflow.set_query_handler(ctx, total(), fn(_) { sum })
-  case workflow.receive_signal(ctx, added()) {
+  query.set_handler(ctx, total(), fn(_) { sum })
+  case signal.receive(ctx, added()) {
     0 -> Ok(sum)
     n -> accumulate(ctx, sum + n)
   }
@@ -353,7 +420,7 @@ pub fn await_timeout_returns_the_signal_or_times_out_test() {
         case
           workflow.await_timeout(
             ctx,
-            workflow.signal(ctx, added()),
+            signal.next(ctx, added()),
             duration.milliseconds(5000),
           )
         {
@@ -420,12 +487,10 @@ pub fn child_is_started_before_its_result_is_awaited_test() {
     start(
       int_workflow("parent", fn(ctx, n) {
         let options =
-          child.Options(
-            ..child.options(workflow_id: "kid"),
-            parent_close_policy: child.Abandon,
-            id_reuse_policy: workflow.RejectDuplicate,
-            run_timeout: Some(duration.seconds(9)),
-          )
+          child.options(workflow_id: "kid")
+          |> child.with_parent_close_policy(child.Abandon)
+          |> child.with_id_reuse_policy(workflow.RejectDuplicate)
+          |> child.with_run_timeout(duration.seconds(9))
         let kid = child.start(ctx, definition, n, options)
         assert child.workflow_id(kid) == "kid"
         use run_id <- result.try(workflow.await(child.started(kid)))
@@ -566,12 +631,15 @@ pub fn outbound_middleware_rewrites_scheduled_activities_test() {
         runtime.run(
           dict.from_list([#(handler.name, handler.run)]),
           "queue",
-          middleware.Outbound(..middleware.none(), activity: fn(call) {
-            middleware.ActivityCall(
-              ..call,
-              activity_type: "legacy_" <> call.activity_type,
-            )
-          }),
+          middleware.Outbound(
+            activity: fn(call) {
+              middleware.ActivityCall(
+                ..call,
+                activity_type: "legacy_" <> call.activity_type,
+              )
+            },
+            child: fn(call) { call },
+          ),
           fn(completion) { process.send(completions, completion) },
         )
       })
@@ -763,13 +831,46 @@ pub fn invalid_input_fails_the_workflow_test() {
 @external(erlang, "temporal_test_ffi", "capture_logs")
 fn capture_logs(body: fn() -> Nil) -> List(#(bridge.LogLevel, String, String))
 
+/// Like `capture_logs`, but with the whole metadata of each line, rendered as Erlang
+/// prints it and sorted by key.
+@external(erlang, "temporal_test_ffi", "capture_log_metadata")
+fn capture_log_metadata(body: fn() -> Nil) -> List(#(String, List(String)))
+
+pub fn workflow_log_fields_reach_the_logger_with_their_types_test() {
+  assert capture_log_metadata(fn() {
+      let run =
+        start(
+          int_workflow("structured", fn(ctx, n) {
+            workflow.log_info(ctx, "charged", [
+              log.string("currency", "EUR"),
+              log.int("cents", 1250),
+              log.float("rate", 0.5),
+              log.bool("retried", False),
+              // A field cannot pass itself off as the workflow's identity.
+              log.string("workflow_id", "forged"),
+            ])
+            Ok(n)
+          }),
+        )
+      let _ = activate(run, [init("structured", 1)])
+      Nil
+    })
+    == [
+      #("charged", [
+        "cents=1250", "currency=<<\"EUR\">>", "rate=0.5", "retried=false",
+        "run_id=<<\"run\">>", "task_queue=<<\"queue\">>",
+        "workflow_id=<<\"wf\">>", "workflow_type=<<\"structured\">>",
+      ]),
+    ]
+}
+
 pub fn workflow_logs_once_and_not_on_replay_test() {
   let chatty = fn() {
     start(
       int_workflow("chatty", fn(ctx, n) {
-        workflow.log_info(ctx, "starting")
+        workflow.log_info(ctx, "starting", [])
         let assert Ok(Nil) = workflow.sleep(ctx, duration.milliseconds(10))
-        workflow.log_warning(ctx, "slept")
+        workflow.log_warning(ctx, "slept", [])
         Ok(n)
       }),
     )
@@ -957,7 +1058,7 @@ pub fn signals_to_other_workflows_are_numbered_apart_from_cancellations_test() {
   let run =
     start(
       int_workflow("talker", fn(ctx, n) {
-        let sent = workflow.signal_external(ctx, "other", poke, n)
+        let sent = signal.send(ctx, "other", poke, n)
         let stopped = workflow.cancel_external(ctx, "other")
         let assert Ok(Nil) = workflow.await(sent)
         let assert Error(_) = workflow.await(stopped)
@@ -985,9 +1086,7 @@ pub fn a_pending_signal_to_another_workflow_is_cancelled_with_its_scope_test() {
   let run =
     start(
       int_workflow("talker", fn(ctx, n) {
-        use _ <- result.map(
-          workflow.await(workflow.signal_external(ctx, "other", poke, n)),
-        )
+        use _ <- result.map(workflow.await(signal.send(ctx, "other", poke, n)))
         n
       }),
     )
@@ -1049,11 +1148,11 @@ pub fn a_future_keeps_the_value_it_resolved_with_test() {
   let run =
     start(
       int_workflow("twice", fn(ctx, _) {
-        let next = workflow.signal(ctx, added())
+        let next = signal.next(ctx, added())
         // Awaiting again must not take a second signal.
         let first = workflow.await(next)
         let again = workflow.await(next)
-        let other = workflow.receive_signal(ctx, added())
+        let other = signal.receive(ctx, added())
         Ok(first * 100 + again * 10 + other)
       }),
     )

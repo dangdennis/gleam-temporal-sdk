@@ -41,7 +41,7 @@ fn start(
     bridge.server_start(kind, executable)
     |> result.map_error(client.ConnectionFailed),
   )
-  case client.connect(client.Options(..client.local(), target:)) {
+  case client.connect(client.local() |> client.with_target(target)) {
     Ok(client) -> Ok(Env(server, client, kind == bridge.TimeSkipping))
     Error(reason) -> {
       bridge.server_stop(server)

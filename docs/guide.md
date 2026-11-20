@@ -26,11 +26,13 @@ receives. The code that implements one and the code that calls it share the defi
 a mismatch is a compile error. Definitions are functions because Gleam constants cannot
 call the codec functions.
 
+Values travel as JSON. A record is described once, with `temporal/schema`, and that one
+description both writes and reads it.
+
 ```gleam
-import gleam/dynamic/decode
-import gleam/json
 import temporal/activity
 import temporal/codec
+import temporal/schema
 import temporal/workflow
 
 pub type Order {
@@ -38,16 +40,11 @@ pub type Order {
 }
 
 fn order_codec() {
-  codec.json(
-    fn(order: Order) {
-      json.object([#("id", json.string(order.id)), #("amount", json.int(order.amount))])
-    },
-    {
-      use id <- decode.field("id", decode.string)
-      use amount <- decode.field("amount", decode.int)
-      decode.success(Order(id:, amount:))
-    },
-  )
+  schema.codec(schema.object2(
+    Order,
+    schema.field("id", schema.string(), fn(order: Order) { order.id }),
+    schema.field("amount", schema.int(), fn(order: Order) { order.amount }),
+  ))
 }
 
 pub fn process_order() {
@@ -94,16 +91,26 @@ its recorded history, whenever a worker needs to rebuild its state. So it must m
 same requests in the same order every time. Take time, randomness and waiting from
 `temporal/workflow`, and do everything else in activities.
 
+Options are built the same way everywhere: a constructor that takes what is required, then
+a `with_` function for each thing to change.
+
 ```gleam
 import gleam/result
 import gleam/time/duration
+import temporal/log
+import temporal/retry
+import temporal/workflow/signal
 
 fn process_order_workflow(ctx: workflow.Context, order: Order) -> Result(String, Failure) {
-  let options = workflow.activity_options(start_to_close: duration.seconds(30))
+  let options =
+    workflow.activity_options(start_to_close: duration.seconds(30))
+    |> workflow.with_retry(retry.policy(maximum_attempts: 5))
   use charge_id <- result.try(workflow.execute_activity(ctx, charge(), order, options))
+  // Logged once, however often the workflow is replayed.
+  workflow.log_info(ctx, "charged", [log.string("charge_id", charge_id)])
 
   // Wait up to a day for the warehouse to say it shipped.
-  case workflow.await_timeout(ctx, workflow.signal(ctx, shipped()), duration.hours(24)) {
+  case workflow.await_timeout(ctx, signal.next(ctx, shipped()), duration.hours(24)) {
     Ok(tracking) -> Ok(tracking)
     Error(_) -> {
       // Timed out, or the workflow was cancelled. Refund even if it was cancelled.

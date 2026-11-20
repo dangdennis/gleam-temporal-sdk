@@ -244,7 +244,7 @@ pub fn list(to_json: fn(a) -> Json, decoder: Decoder(a)) -> Codec(List(a)) {
 /// A transformation applied to every payload on its way to and from the Temporal service:
 /// workflow, activity, signal, query and update arguments and results, memo values,
 /// heartbeat details and failure details. Use one to encrypt or compress what the service
-/// stores. Set it in `client.Options`; workers use their client's.
+/// stores. Set it with `client.with_codec`; workers use their client's.
 ///
 /// Search attributes are not transformed, because the service has to index them.
 ///

@@ -13,6 +13,7 @@ import temporal/codec
 import temporal/failure.{type Failure}
 import temporal/worker
 import temporal/workflow.{type Context}
+import temporal/workflow/signal
 
 @external(erlang, "temporal_test_ffi", "linked")
 fn linked(pid: Pid) -> List(Pid)
@@ -41,7 +42,7 @@ fn waiter() {
 
 /// Waits for a signal, then doubles its input with an activity.
 fn waiter_workflow(ctx: Context, n: Int) -> Result(Int, Failure) {
-  workflow.receive_signal(ctx, nudge())
+  signal.receive(ctx, nudge())
   workflow.execute_activity(
     ctx,
     double(),
@@ -131,11 +132,9 @@ fn impatient() {
 /// Cancels an activity and waits for it to report that it stopped.
 fn impatient_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
   let options =
-    workflow.ActivityOptions(
-      ..workflow.activity_options(start_to_close: duration.milliseconds(120_000)),
-      heartbeat_timeout: Some(duration.milliseconds(1000)),
-      cancellation: workflow.WaitCancellationCompleted,
-    )
+    workflow.activity_options(start_to_close: duration.milliseconds(120_000))
+    |> workflow.with_heartbeat_timeout(duration.milliseconds(1000))
+    |> workflow.with_cancellation(workflow.WaitCancellationCompleted)
   let outcome =
     workflow.with_timeout(ctx, duration.milliseconds(300), fn(scope) {
       workflow.execute_activity(scope, deaf(), Nil, options)

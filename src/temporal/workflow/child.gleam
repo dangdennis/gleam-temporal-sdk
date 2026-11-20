@@ -1,7 +1,9 @@
 //// Child workflows: workflows started by a workflow, which the server ties to their parent.
 ////
 //// ```gleam
-//// let options = child.options(workflow_id: "order-" <> id <> "-shipping")
+//// let options =
+////   child.options(workflow_id: "order-" <> id <> "-shipping")
+////   |> child.with_task_queue("shipping")
 //// use tracking <- result.try(child.execute(ctx, ship(), order, options))
 //// ```
 
@@ -16,9 +18,10 @@ import temporal/internal/runtime/run_state
 import temporal/internal/runtime/scopes
 import temporal/internal/time
 import temporal/middleware
+import temporal/retry
 import temporal/workflow.{
   type Context, type Definition, type Future, type IdReusePolicy,
-  type RetryPolicy, type SignalDefinition,
+  type SignalDefinition,
 }
 
 /// What happens to a child when its parent closes.
@@ -43,14 +46,16 @@ pub type Cancellation {
   DoNotCancel
 }
 
-/// How a child workflow is run. Build with `options` and change what differs.
+/// How a child workflow is run. Build with `options` and the `with_` functions.
 pub type Options {
   Options(
     /// No two open workflows in a namespace share an id.
     workflow_id: String,
     /// `None` runs the child on the parent's task queue.
     task_queue: Option(String),
+    /// What happens to the child when the parent closes.
     parent_close_policy: ParentClosePolicy,
+    /// Whether the id may be used again after a run with it has closed.
     id_reuse_policy: IdReusePolicy,
     /// Longest the child may take across retries and continue-as-new.
     execution_timeout: Option(Duration),
@@ -59,8 +64,10 @@ pub type Options {
     /// Longest one workflow task may take. `None` is ten seconds.
     task_timeout: Option(Duration),
     /// `None` does not retry a failed child.
-    retry: Option(RetryPolicy),
+    retry: Option(retry.Policy),
+    /// Unindexed data the child can read with `workflow.memo`.
     memo: Dict(String, Payload),
+    /// What cancelling the child's scope does.
     cancellation: Cancellation,
   )
 }
@@ -89,6 +96,60 @@ pub fn options(workflow_id workflow_id: String) -> Options {
     memo: dict.new(),
     cancellation: WaitUntilCancelled,
   )
+}
+
+/// Run the child on this task queue instead of the parent's.
+pub fn with_task_queue(options: Options, task_queue: String) -> Options {
+  Options(..options, task_queue: Some(task_queue))
+}
+
+/// What happens to the child when the parent closes.
+pub fn with_parent_close_policy(
+  options: Options,
+  policy: ParentClosePolicy,
+) -> Options {
+  Options(..options, parent_close_policy: policy)
+}
+
+/// Whether the child's id may be used again after a run with it has closed.
+pub fn with_id_reuse_policy(
+  options: Options,
+  policy: IdReusePolicy,
+) -> Options {
+  Options(..options, id_reuse_policy: policy)
+}
+
+/// The longest the child may take across retries and continue-as-new.
+pub fn with_execution_timeout(options: Options, timeout: Duration) -> Options {
+  Options(..options, execution_timeout: Some(timeout))
+}
+
+/// The longest a single run of the child may take.
+pub fn with_run_timeout(options: Options, timeout: Duration) -> Options {
+  Options(..options, run_timeout: Some(timeout))
+}
+
+/// The longest one workflow task of the child may take, instead of ten seconds.
+pub fn with_task_timeout(options: Options, timeout: Duration) -> Options {
+  Options(..options, task_timeout: Some(timeout))
+}
+
+/// Retry the child by this policy when it fails. Without one it is not retried.
+pub fn with_retry(options: Options, policy: retry.Policy) -> Options {
+  Options(..options, retry: Some(policy))
+}
+
+/// Unindexed data the child can read with `workflow.memo`.
+pub fn with_memo(options: Options, memo: Dict(String, Payload)) -> Options {
+  Options(..options, memo:)
+}
+
+/// What cancelling the child's scope does.
+pub fn with_cancellation(
+  options: Options,
+  cancellation: Cancellation,
+) -> Options {
+  Options(..options, cancellation:)
 }
 
 /// Ask for a child workflow. Returns at once; the server starts the child when the
@@ -140,7 +201,7 @@ pub fn start(
             workflow.AllowDuplicateFailedOnly -> 2
             workflow.RejectDuplicate -> 3
           },
-          retry: option.map(options.retry, workflow.to_bridge_retry),
+          retry: option.map(options.retry, retry.to_bridge),
           memo: options.memo,
           search_attributes: dict.new(),
           cancellation_type: case options.cancellation {

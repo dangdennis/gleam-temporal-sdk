@@ -1,8 +1,11 @@
 //// The test helpers themselves: a time-skipping server and server-less activity contexts.
 
+import gleam/int
+import gleam/list
 import gleam/option.{Some}
 import gleam/order
 import gleam/result
+import gleam/string
 import gleam/time/duration
 import gleam/time/timestamp
 import support.{unique}
@@ -10,9 +13,11 @@ import temporal/activity
 import temporal/client
 import temporal/codec
 import temporal/failure.{type Failure}
+import temporal/log
 import temporal/testing
 import temporal/worker
 import temporal/workflow.{type Context}
+import temporal/workflow/signal
 
 @external(erlang, "temporal_test_ffi", "test_server_path")
 fn test_server_path() -> Result(String, Nil)
@@ -41,7 +46,7 @@ fn reminder() {
 }
 
 fn reminder_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
-  case workflow.await_timeout(ctx, workflow.signal(ctx, reminded()), week()) {
+  case workflow.await_timeout(ctx, signal.next(ctx, reminded()), week()) {
     Ok(Nil) -> Ok("reminded in time")
     Error(_) -> Ok("gave up after a week")
   }
@@ -136,4 +141,42 @@ pub fn an_activity_can_be_tested_without_a_server_test() {
   let assert Error(failure.Failure(kind: failure.Cancelled, ..)) =
     counting(testing.activity_context(env), 3)
   assert testing.heartbeat_count(env) == 0
+}
+
+@external(erlang, "temporal_test_ffi", "capture_log_metadata")
+fn capture_log_metadata(body: fn() -> Nil) -> List(#(String, List(String)))
+
+pub fn an_activity_logs_with_its_identity_and_fields_test() {
+  let info = testing.activity_info()
+  let ctx = testing.activity_context(testing.activity_env(info))
+  let expected = fn(message, fields) {
+    #(
+      message,
+      list.sort(
+        list.append(fields, [
+          "activity_id=<<\"" <> info.activity_id <> "\">>",
+          "activity_type=<<\"" <> info.activity_type <> "\">>",
+          "attempt=" <> int.to_string(info.attempt),
+          "run_id=<<\"" <> info.run_id <> "\">>",
+          "workflow_id=<<\"" <> info.workflow_id <> "\">>",
+        ]),
+        string.compare,
+      ),
+    )
+  }
+  assert capture_log_metadata(fn() {
+      activity.log_debug(ctx, "looking up", [])
+      activity.log_info(ctx, "charged", [
+        log.int("cents", 1250),
+        log.bool("retried", False),
+      ])
+      activity.log_warning(ctx, "slow", [log.float("seconds", 2.5)])
+      activity.log_error(ctx, "declined", [log.string("reason", "expired")])
+    })
+    == [
+      expected("looking up", []),
+      expected("charged", ["cents=1250", "retried=false"]),
+      expected("slow", ["seconds=2.5"]),
+      expected("declined", ["reason=<<\"expired\">>"]),
+    ]
 }

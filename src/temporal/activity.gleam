@@ -1,7 +1,23 @@
 //// Define and implement activities: the functions where a workflow's side effects happen.
 //// Activity code is ordinary Gleam and may do anything; the server retries it on failure.
+////
+//// ```gleam
+//// pub fn charge() {
+////   activity.Definition("charge", order_codec(), codec.string())
+//// }
+////
+//// pub fn charge_activity(ctx: activity.Context, order: Order) {
+////   activity.log_info(ctx, "charging", [log.int("cents", order.total_cents)])
+////   payments.charge(order)
+//// }
+//// ```
+////
+//// Register `activity.handler(charge(), charge_activity)` on a worker; workflows run it
+//// with `workflow.execute_activity`.
 
 import gleam/dict.{type Dict}
+import gleam/dynamic
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/time/duration.{type Duration}
@@ -9,6 +25,7 @@ import gleam/time/timestamp.{type Timestamp}
 import temporal/codec.{type Codec, type Payload}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
+import temporal/log
 
 /// An activity's name and the codecs for its argument and result. Shared by the code that
 /// implements the activity and the workflows that call it.
@@ -132,6 +149,64 @@ pub fn new_context(
 pub fn info(ctx: Context) -> Info {
   ctx.info
 }
+
+// ---- logging ----
+
+fn log(
+  ctx: Context,
+  level: bridge.LogLevel,
+  message: String,
+  fields: List(log.Field),
+) -> Nil {
+  let info = ctx.info
+  bridge.log(
+    level,
+    message,
+    list.append(log.metadata(fields), [
+      #("activity_id", dynamic.string(info.activity_id)),
+      #("activity_type", dynamic.string(info.activity_type)),
+      #("workflow_id", dynamic.string(info.workflow_id)),
+      #("run_id", dynamic.string(info.run_id)),
+      #("attempt", dynamic.int(info.attempt)),
+    ]),
+  )
+}
+
+/// Log through Erlang's `logger`. The activity's id and type, its workflow's id and run
+/// id, and the attempt number are attached as metadata, and so are `fields`: see
+/// `temporal/log`. Activities are not replayed, so every call logs, once per attempt.
+pub fn log_debug(
+  ctx: Context,
+  message: String,
+  fields: List(log.Field),
+) -> Nil {
+  log(ctx, bridge.Debug, message, fields)
+}
+
+/// Log at info level. See `log_debug`.
+pub fn log_info(ctx: Context, message: String, fields: List(log.Field)) -> Nil {
+  log(ctx, bridge.Info, message, fields)
+}
+
+/// Log at warning level. See `log_debug`.
+pub fn log_warning(
+  ctx: Context,
+  message: String,
+  fields: List(log.Field),
+) -> Nil {
+  log(ctx, bridge.Warning, message, fields)
+}
+
+/// Log at error level. See `log_debug`.
+pub fn log_error(
+  ctx: Context,
+  message: String,
+  fields: List(log.Field),
+) -> Nil {
+  log(ctx, bridge.Error, message, fields)
+}
+
+// ---- heartbeats and cancellation ----
 
 /// Tell the server the activity is still alive. Long activities with a heartbeat timeout
 /// must call this more often than the timeout. Heartbeating is also how an activity learns

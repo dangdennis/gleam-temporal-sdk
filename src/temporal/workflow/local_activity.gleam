@@ -5,6 +5,13 @@
 //// heartbeat, must be registered on the worker that runs the workflow, and is recorded
 //// only when it finishes: if its worker dies it runs again from the start on another, so
 //// it must be safe to repeat.
+////
+//// ```gleam
+//// let options =
+////   local_activity.options(start_to_close: duration.seconds(2))
+////   |> local_activity.with_retry(retry.policy(maximum_attempts: 3))
+//// use rate <- result.try(local_activity.execute(ctx, lookup_rate(), currency, options))
+//// ```
 
 import gleam/dict
 import gleam/int
@@ -20,11 +27,10 @@ import temporal/internal/runtime/run_state
 import temporal/internal/runtime/scopes
 import temporal/internal/time
 import temporal/middleware
-import temporal/workflow.{
-  type ActivityCancellation, type Context, type Future, type RetryPolicy,
-}
+import temporal/retry
+import temporal/workflow.{type ActivityCancellation, type Context, type Future}
 
-/// How a local activity is run. Build with `options` and change what differs.
+/// How a local activity is run. Build with `options` and the `with_` functions.
 pub type Options {
   Options(
     /// Longest a single attempt may run.
@@ -32,7 +38,7 @@ pub type Options {
     /// Longest the activity may take across all retries.
     schedule_to_close: Option(Duration),
     /// `None` retries without limit, one second apart at first and doubling.
-    retry: Option(RetryPolicy),
+    retry: Option(retry.Policy),
     /// A retry that would wait longer than this is not waited for inside the workflow
     /// task: the workflow starts a durable timer and tries again when it fires. `None`
     /// uses core's default of one minute.
@@ -51,6 +57,33 @@ pub fn options(start_to_close start_to_close: Duration) -> Options {
     local_retry_threshold: None,
     cancellation: workflow.TryCancel,
   )
+}
+
+/// The longest the activity may take across all retries.
+pub fn with_schedule_to_close(options: Options, timeout: Duration) -> Options {
+  Options(..options, schedule_to_close: Some(timeout))
+}
+
+/// Retry by this policy instead of without limit.
+pub fn with_retry(options: Options, policy: retry.Policy) -> Options {
+  Options(..options, retry: Some(policy))
+}
+
+/// Retries that would wait longer than this are handed to a durable timer instead of
+/// being waited for inside the workflow task. Unset, it is one minute.
+pub fn with_local_retry_threshold(
+  options: Options,
+  threshold: Duration,
+) -> Options {
+  Options(..options, local_retry_threshold: Some(threshold))
+}
+
+/// What cancelling the activity's scope does.
+pub fn with_cancellation(
+  options: Options,
+  cancellation: ActivityCancellation,
+) -> Options {
+  Options(..options, cancellation:)
 }
 
 /// Schedule a local activity. Returns at once with a future of its result.
@@ -87,7 +120,7 @@ pub fn start(
             schedule_to_close_ms: time.option_to_ms(options.schedule_to_close),
             schedule_to_start_ms: None,
             start_to_close_ms: Some(time.to_ms(options.start_to_close)),
-            retry: option.map(options.retry, workflow.to_bridge_retry),
+            retry: option.map(options.retry, retry.to_bridge),
             local_retry_threshold_ms: time.option_to_ms(
               options.local_retry_threshold,
             ),

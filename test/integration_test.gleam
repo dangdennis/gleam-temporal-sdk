@@ -19,9 +19,12 @@ import temporal/client
 import temporal/codec
 import temporal/failure.{type Failure}
 import temporal/replayer
+import temporal/retry
 import temporal/worker
 import temporal/workflow.{type Context}
 import temporal/workflow/child
+import temporal/workflow/query
+import temporal/workflow/signal
 
 // ---- activities ----
 
@@ -56,15 +59,11 @@ fn options() -> workflow.ActivityOptions {
 }
 
 fn quick_retry(maximum_attempts: Int) -> workflow.ActivityOptions {
-  workflow.ActivityOptions(
-    ..options(),
-    retry: Some(
-      workflow.RetryPolicy(
-        ..workflow.retry_policy(maximum_attempts:),
-        initial_interval: duration.milliseconds(10),
-        backoff_coefficient: 1.0,
-      ),
-    ),
+  options()
+  |> workflow.with_retry(
+    retry.policy(maximum_attempts:)
+    |> retry.with_initial_interval(duration.milliseconds(10))
+    |> retry.with_backoff_coefficient(1.0),
   )
 }
 
@@ -152,8 +151,8 @@ fn accumulator() {
 
 /// Sums signalled numbers until it is signalled a zero.
 fn accumulator_workflow(ctx: Context, sum: Int) -> Result(Int, Failure) {
-  workflow.set_query_handler(ctx, total(), fn(_) { sum })
-  case workflow.receive_signal(ctx, added()) {
+  query.set_handler(ctx, total(), fn(_) { sum })
+  case signal.receive(ctx, added()) {
     0 -> Ok(sum)
     n -> accumulator_workflow(ctx, sum + n)
   }

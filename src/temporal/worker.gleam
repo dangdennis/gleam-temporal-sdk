@@ -405,7 +405,7 @@ fn config_error(message: String) -> String {
 }
 
 fn report(message: String) -> Nil {
-  bridge.log(bridge.Error, message, dict.new())
+  bridge.log(bridge.Error, message, [])
 }
 
 fn worker_options(config: Config) -> bridge.WorkerOptions {

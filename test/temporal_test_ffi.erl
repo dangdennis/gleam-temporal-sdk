@@ -1,5 +1,5 @@
 -module(temporal_test_ffi).
--export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1, memory_mb/0, env_int/2]).
+-export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, capture_log_metadata/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1, memory_mb/0, env_int/2]).
 
 unique() ->
     integer_to_binary(erlang:system_time(microsecond)).
@@ -88,11 +88,20 @@ relay(Recv, Send, Owner) ->
 %% workflow id each carried. The default handler is silenced so the lines do not also reach
 %% the test output.
 capture_logs(Fun) ->
+    capture(Fun, workflow_id).
+
+%% Like capture_logs/1, but each line comes with all the metadata its caller gave it:
+%% {Text, ["key=value", ...]}, values printed as Erlang terms so that their types show,
+%% sorted by key. What logger adds by itself is left out.
+capture_log_metadata(Fun) ->
+    [{Text, Meta} || {_, Text, Meta} <- capture(Fun, everything)].
+
+capture(Fun, Detail) ->
     #{level := Level} = logger:get_primary_config(),
     {ok, #{level := DefaultLevel}} = logger:get_handler_config(default),
     ok = logger:set_primary_config(level, debug),
     ok = logger:set_handler_config(default, level, none),
-    ok = logger:add_handler(temporal_test, ?MODULE, #{config => self()}),
+    ok = logger:add_handler(temporal_test, ?MODULE, #{config => {self(), Detail}}),
     Fun(),
     ok = logger:remove_handler(temporal_test),
     ok = logger:set_handler_config(default, level, DefaultLevel),
@@ -106,12 +115,19 @@ drain_logs(Seen) ->
 
 %% logger handler callback.
 log(#{level := Level, msg := {Format, Args}, meta := #{domain := [temporal]} = Meta},
-    #{config := Pid}) ->
+    #{config := {Pid, Detail}}) ->
     Text = unicode:characters_to_binary(io_lib:format(Format, Args)),
-    Pid ! {temporal_log, {Level, Text, maps:get(workflow_id, Meta, <<>>)}},
+    Pid ! {temporal_log, {Level, Text, detail(Detail, Meta)}},
     ok;
 log(_, _) ->
     ok.
+
+detail(workflow_id, Meta) ->
+    maps:get(workflow_id, Meta, <<>>);
+detail(everything, Meta) ->
+    Given = maps:without([domain, pid, gl, time, mfa, file, line], Meta),
+    [unicode:characters_to_binary(io_lib:format("~ts=~0tp", [K, V]))
+     || {K, V} <- lists:sort(maps:to_list(Given))].
 
 write_file(Path, Bytes) ->
     ok = filelib:ensure_dir(Path),

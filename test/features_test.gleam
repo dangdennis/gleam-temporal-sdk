@@ -17,10 +17,12 @@ import temporal/codec
 import temporal/failure.{type Failure}
 import temporal/middleware
 import temporal/replayer
+import temporal/retry
 import temporal/search_attributes
 import temporal/worker
 import temporal/workflow.{type Context}
 import temporal/workflow/child
+import temporal/workflow/signal
 
 // ---- activities ----
 
@@ -123,11 +125,9 @@ fn options() {
 }
 
 fn heartbeating() {
-  workflow.ActivityOptions(
-    ..options(),
-    heartbeat_timeout: Some(duration.milliseconds(1000)),
-    cancellation: workflow.WaitCancellationCompleted,
-  )
+  options()
+  |> workflow.with_heartbeat_timeout(duration.milliseconds(1000))
+  |> workflow.with_cancellation(workflow.WaitCancellationCompleted)
 }
 
 // ---- workflows ----
@@ -201,7 +201,7 @@ fn waiting_workflow(ctx: Context, ms: Int) -> Result(String, Failure) {
   case
     workflow.await_timeout(
       ctx,
-      workflow.signal(ctx, nudge()),
+      signal.next(ctx, nudge()),
       duration.milliseconds(ms),
     )
   {
@@ -216,16 +216,14 @@ fn resuming() {
 }
 
 fn resuming_workflow(ctx: Context, _: Nil) -> Result(Int, Failure) {
-  let retry =
-    workflow.RetryPolicy(
-      ..workflow.retry_policy(maximum_attempts: 3),
-      initial_interval: duration.milliseconds(10),
-    )
+  let policy =
+    retry.policy(maximum_attempts: 3)
+    |> retry.with_initial_interval(duration.milliseconds(10))
   workflow.execute_activity(
     ctx,
     resumable(),
     Nil,
-    workflow.ActivityOptions(..options(), retry: Some(retry)),
+    options() |> workflow.with_retry(policy),
   )
 }
 
@@ -248,10 +246,8 @@ fn detaching_workflow(
   child_id: String,
 ) -> Result(String, Failure) {
   let options =
-    child.Options(
-      ..child.options(workflow_id: child_id),
-      parent_close_policy: child.Abandon,
-    )
+    child.options(workflow_id: child_id)
+    |> child.with_parent_close_policy(child.Abandon)
   // Waiting for the child to start is what makes sure it does.
   child.start(ctx, slow_child(), workflow.info(ctx).workflow_id, options)
   |> child.started
@@ -295,7 +291,7 @@ fn remembering() {
 }
 
 fn remembering_workflow(ctx: Context, _: Nil) -> Result(String, Failure) {
-  workflow.log_info(ctx, "reading the memo")
+  workflow.log_info(ctx, "reading the memo", [])
   let info = workflow.info(ctx)
   assert info.first_execution_run_id == info.run_id
   Ok(
@@ -387,16 +383,11 @@ fn workflows() -> List(workflow.Handler) {
 
 // ---- middleware ----
 
-fn outbound() -> middleware.Outbound {
-  middleware.Outbound(
-    ..middleware.none(),
-    activity: fn(call: middleware.ActivityCall) {
-      case call.activity_type {
-        "double" -> middleware.ActivityCall(..call, activity_type: "double_v2")
-        _ -> call
-      }
-    },
-  )
+fn rename_double(call: middleware.ActivityCall) -> middleware.ActivityCall {
+  case call.activity_type {
+    "double" -> middleware.ActivityCall(..call, activity_type: "double_v2")
+    _ -> call
+  }
 }
 
 /// Tags every workflow failure, and reports it once however often the run is replayed.
@@ -427,7 +418,7 @@ fn assert_replays(handle: client.Handle(output)) -> Nil {
   assert replayer.replay_with(
       wrapped,
       history,
-      replayer.Options(..replayer.options(), outbound: outbound()),
+      replayer.options() |> replayer.with_outbound_activity(rename_double),
     )
     == Ok(Nil)
 }
@@ -528,11 +519,9 @@ pub fn a_deadline_cancels_a_child_workflow_test() {
 pub fn memo_reaches_the_workflow_and_the_description_test() {
   use env <- in_both_modes("remembering")
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      memo: dict.from_list([
-        #("origin", codec.encode(codec.string(), "checkout")),
-      ]),
+    start_options(env)
+    |> client.with_memo(
+      dict.from_list([#("origin", codec.encode(codec.string(), "checkout"))]),
     )
   let assert Ok(handle) = client.start(env.client, remembering(), Nil, options)
   assert client.result(handle) == Ok("checkout")
@@ -579,10 +568,7 @@ pub fn signal_with_start_starts_once_and_signals_every_time_test() {
 pub fn use_existing_returns_the_running_workflow_test() {
   use env <- in_both_modes("use-existing")
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      id_conflict_policy: client.UseExisting,
-    )
+    start_options(env) |> client.with_id_conflict_policy(client.UseExisting)
   let assert Ok(first) = client.start(env.client, waiting(), 60_000, options)
   let assert Ok(second) = client.start(env.client, waiting(), 60_000, options)
   assert client.run_id(first) == client.run_id(second)
@@ -593,10 +579,7 @@ pub fn use_existing_returns_the_running_workflow_test() {
 pub fn a_closed_workflow_id_can_be_refused_test() {
   use env <- in_both_modes("reject-duplicate")
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      id_reuse_policy: workflow.RejectDuplicate,
-    )
+    start_options(env) |> client.with_id_reuse_policy(workflow.RejectDuplicate)
   let assert Ok(handle) = client.start(env.client, waiting(), 10, options)
   assert client.result(handle) == Ok("nobody nudged")
   let assert Error(client.AlreadyExists(_)) =
@@ -607,10 +590,7 @@ pub fn a_closed_workflow_id_can_be_refused_test() {
 pub fn a_run_timeout_ends_the_workflow_test() {
   use env <- in_both_modes("run-timeout")
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      run_timeout: Some(duration.milliseconds(1000)),
-    )
+    start_options(env) |> client.with_run_timeout(duration.milliseconds(1000))
   let assert Ok(handle) = client.start(env.client, waiting(), 60_000, options)
   assert client.result(handle) == Error(client.WorkflowTimedOut)
 }
@@ -641,15 +621,15 @@ pub fn workflows_can_be_listed_and_counted_test() {
           client,
           waiting(),
           10,
-          client.StartOptions(
-            ..client.start_options(
-              workflow_id: task_queue <> "-" <> int.to_string(n),
-              task_queue:,
+          client.start_options(
+            workflow_id: task_queue <> "-" <> int.to_string(n),
+            task_queue:,
+          )
+            |> client.with_search_attributes(
+              dict.from_list([
+                #(attribute, search_attributes.Keyword(task_queue)),
+              ]),
             ),
-            search_attributes: dict.from_list([
-              #(attribute, search_attributes.Keyword(task_queue)),
-            ]),
-          ),
         )
       handle
     })
@@ -721,17 +701,15 @@ fn in_both_modes(name: String, scenario: fn(Env) -> Nil) -> Nil {
   |> worker.with_max_activities_per_second(500.0)
   |> worker.with_workflow_middleware(tag_failures)
   |> worker.with_activity_middleware(count_activities)
-  |> worker.with_outbound_activity(outbound().activity)
+  |> worker.with_outbound_activity(rename_double)
 }
 
 pub fn headers_travel_from_the_client_to_the_workflow_and_its_activities_test() {
   use env <- in_both_modes("traced")
   let options =
-    client.StartOptions(
-      ..start_options(env),
-      headers: dict.from_list([
-        #("trace", codec.encode(codec.string(), "trace-42")),
-      ]),
+    start_options(env)
+    |> client.with_headers(
+      dict.from_list([#("trace", codec.encode(codec.string(), "trace-42"))]),
     )
   let assert Ok(handle) = client.start(env.client, traced(), Nil, options)
   assert client.result(handle) == Ok("trace-42 then trace-42")

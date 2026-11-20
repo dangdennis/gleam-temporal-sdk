@@ -140,8 +140,7 @@ pub fn workflow_run(
       }
       // A retry of this request must not fail because the first try already started the
       // workflow, so an already-running workflow with this id is taken to be ours.
-      let options =
-        client.StartOptions(..options, id_conflict_policy: client.UseExisting)
+      let options = client.with_id_conflict_policy(options, client.UseExisting)
       case
         client.start_for_nexus(
           ctx.client,

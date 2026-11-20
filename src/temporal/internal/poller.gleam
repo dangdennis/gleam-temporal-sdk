@@ -72,7 +72,7 @@ fn do_workflow_loop(
             bridge.log(
               bridge.Error,
               "temporal: workflow completion rejected: " <> reason,
-              dict.new(),
+              [],
             )
         }
       }
