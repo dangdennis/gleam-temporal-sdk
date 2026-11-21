@@ -7,6 +7,7 @@ import gleam/dict
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{Some}
+import gleam/order
 import gleam/result
 import gleam/string
 import gleam/time/duration
@@ -403,24 +404,36 @@ pub fn schedule_backfill_test() {
   // The server's scheduler does not always get through both backfills in one pass, and
   // its next pass may be a minute away, at the schedule's next tick. A request to the
   // schedule wakes it, so nudge it rather than wait: the whole test has sixty seconds.
+  // By the clock, not by a count of attempts: each look at the schedule is a query whose
+  // own duration varies a great deal between machines.
   let reached = fn(seconds) {
-    list.any(list.repeat(Nil, seconds * 5), fn(_) {
-      case action_count() >= 4 {
-        True -> True
-        False -> {
-          process.sleep(200)
-          False
-        }
-      }
-    })
+    until(
+      timestamp.add(timestamp.system_time(), duration.seconds(seconds)),
+      fn() { action_count() >= 4 },
+    )
   }
   let nudge = fn() {
     let assert Ok(Nil) = schedule.pause(client, id, note: "still paused")
     False
   }
-  let _ = reached(8) || nudge() || reached(15) || nudge() || reached(15)
+  let _ = reached(8) || nudge() || reached(12) || nudge() || reached(12)
   process.sleep(500)
   assert action_count() == 4
   let assert Ok(Nil) = schedule.delete(client, id)
   worker.stop(worker)
+}
+
+/// Ask `check` every 200 ms until it holds or the clock passes `deadline`.
+fn until(deadline: timestamp.Timestamp, check: fn() -> Bool) -> Bool {
+  case check() {
+    True -> True
+    False ->
+      case timestamp.compare(timestamp.system_time(), deadline) {
+        order.Lt -> {
+          process.sleep(200)
+          until(deadline, check)
+        }
+        _ -> False
+      }
+  }
 }
