@@ -400,10 +400,25 @@ pub fn schedule_backfill_test() {
     let assert Ok(described) = schedule.describe(client, id)
     described.action_count
   }
-  // The server works through a backfill a tick at a time, slowly on a busy machine.
-  let _ =
-    eventually(fn() { action_count() >= 4 })
-    || eventually(fn() { action_count() >= 4 })
+  // The server's scheduler does not always get through both backfills in one pass, and
+  // its next pass may be a minute away, at the schedule's next tick. A request to the
+  // schedule wakes it, so nudge it rather than wait: the whole test has sixty seconds.
+  let reached = fn(seconds) {
+    list.any(list.repeat(Nil, seconds * 5), fn(_) {
+      case action_count() >= 4 {
+        True -> True
+        False -> {
+          process.sleep(200)
+          False
+        }
+      }
+    })
+  }
+  let nudge = fn() {
+    let assert Ok(Nil) = schedule.pause(client, id, note: "still paused")
+    False
+  }
+  let _ = reached(8) || nudge() || reached(15) || nudge() || reached(15)
   process.sleep(500)
   assert action_count() == 4
   let assert Ok(Nil) = schedule.delete(client, id)
