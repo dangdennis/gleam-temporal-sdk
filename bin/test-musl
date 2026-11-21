@@ -22,6 +22,7 @@ docker run --rm --volume "$root:/src:ro" "$image" sh -c '
   mkdir -p /work/priv && cd /work
   tar -C /src --exclude=node_modules -cf - gleam.toml manifest.toml src test | tar -xf -
   cp /src/native/temporal_nif/target/musl/release/libtemporal_nif.so priv/
+  cp /src/priv/checksums.txt priv/
 
   temporal server start-dev --headless --log-level error \
     --dynamic-config-value system.enableNexus=true \
