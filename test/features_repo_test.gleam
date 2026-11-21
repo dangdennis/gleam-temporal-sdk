@@ -349,78 +349,88 @@ fn tick() {
   workflow.Definition("backfilled", codec.string(), codec.string())
 }
 
-pub fn schedule_backfill_test() {
-  let client = support.local_client()
-  let id = "backfill-" <> unique()
-  let assert Ok(worker) =
-    worker.new(client, id)
-    |> worker.with_workflows([
-      workflow.handler(tick(), fn(_, text) { Ok(text) }),
-    ])
-    |> worker.start
-  // Paused, so that the only actions are the backfilled ones.
-  let assert Ok(Nil) =
-    schedule.create(
-      client,
-      id,
-      schedule.new(
-        schedule.every(duration.minutes(1)),
-        schedule.action(
-          tick(),
-          "arg1",
-          client.start_options(workflow_id: id <> "-run", task_queue: id),
-        ),
+/// The time limit eunit gives a test, in units that the suite scales to ten seconds.
+pub type TimeLimit {
+  Timeout
+}
+
+/// Given three minutes instead of the usual fifty seconds: the server's scheduler may leave
+/// part of a backfill for its next pass, a minute later, and on a slow machine each look at
+/// the schedule takes a while too.
+pub fn schedule_backfill_test_() {
+  #(Timeout, 18, fn() {
+    let client = support.local_client()
+    let id = "backfill-" <> unique()
+    let assert Ok(worker) =
+      worker.new(client, id)
+      |> worker.with_workflows([
+        workflow.handler(tick(), fn(_, text) { Ok(text) }),
+      ])
+      |> worker.start
+    // Paused, so that the only actions are the backfilled ones.
+    let assert Ok(Nil) =
+      schedule.create(
+        client,
+        id,
+        schedule.new(
+          schedule.every(duration.minutes(1)),
+          schedule.action(
+            tick(),
+            "arg1",
+            client.start_options(workflow_id: id <> "-run", task_queue: id),
+          ),
+        )
+          |> schedule.with_paused(True),
       )
-        |> schedule.with_paused(True),
-    )
-  // Half past the current minute, so that each two-minute window below holds exactly two
-  // of the schedule's ticks whatever second the test runs at.
-  let #(seconds, _) =
-    timestamp.to_unix_seconds_and_nanoseconds(timestamp.system_time())
-  let now = timestamp.from_unix_seconds(seconds - seconds % 60 + 30)
-  let ago = fn(minutes) { timestamp.subtract(now, duration.minutes(minutes)) }
-  // Two minutes of a one-minute schedule, twice: three years ago and half an hour ago.
-  let three_years = 3 * 365 * 24 * 60
-  let assert Ok(Nil) =
-    schedule.backfill(
-      client,
-      id,
-      from: ago(three_years + 2),
-      to: ago(three_years),
-      overlap: schedule.AllowAll,
-    )
-  let assert Ok(Nil) =
-    schedule.backfill(
-      client,
-      id,
-      from: ago(32),
-      to: ago(30),
-      overlap: schedule.AllowAll,
-    )
-  let action_count = fn() {
-    let assert Ok(described) = schedule.describe(client, id)
-    described.action_count
-  }
-  // The server's scheduler does not always get through both backfills in one pass, and
-  // its next pass may be a minute away, at the schedule's next tick. A request to the
-  // schedule wakes it, so nudge it rather than wait: the whole test has sixty seconds.
-  // By the clock, not by a count of attempts: each look at the schedule is a query whose
-  // own duration varies a great deal between machines.
-  let reached = fn(seconds) {
-    until(
-      timestamp.add(timestamp.system_time(), duration.seconds(seconds)),
-      fn() { action_count() >= 4 },
-    )
-  }
-  let nudge = fn() {
-    let assert Ok(Nil) = schedule.pause(client, id, note: "still paused")
-    False
-  }
-  let _ = reached(8) || nudge() || reached(12) || nudge() || reached(12)
-  process.sleep(500)
-  assert action_count() == 4
-  let assert Ok(Nil) = schedule.delete(client, id)
-  worker.stop(worker)
+    // Half past the current minute, so that each two-minute window below holds exactly two
+    // of the schedule's ticks whatever second the test runs at.
+    let #(seconds, _) =
+      timestamp.to_unix_seconds_and_nanoseconds(timestamp.system_time())
+    let now = timestamp.from_unix_seconds(seconds - seconds % 60 + 30)
+    let ago = fn(minutes) { timestamp.subtract(now, duration.minutes(minutes)) }
+    // Two minutes of a one-minute schedule, twice: three years ago and half an hour ago.
+    let three_years = 3 * 365 * 24 * 60
+    let assert Ok(Nil) =
+      schedule.backfill(
+        client,
+        id,
+        from: ago(three_years + 2),
+        to: ago(three_years),
+        overlap: schedule.AllowAll,
+      )
+    let assert Ok(Nil) =
+      schedule.backfill(
+        client,
+        id,
+        from: ago(32),
+        to: ago(30),
+        overlap: schedule.AllowAll,
+      )
+    let action_count = fn() {
+      let assert Ok(described) = schedule.describe(client, id)
+      described.action_count
+    }
+    // The server's scheduler does not always get through both backfills in one pass, and
+    // its next pass may be a minute away, at the schedule's next tick. A request to the
+    // schedule wakes it, so nudge it, then wait out the tick if that was not enough.
+    // By the clock, not by a count of attempts: each look at the schedule is a query whose
+    // own duration varies a great deal between machines.
+    let reached = fn(seconds) {
+      until(
+        timestamp.add(timestamp.system_time(), duration.seconds(seconds)),
+        fn() { action_count() >= 4 },
+      )
+    }
+    let nudge = fn() {
+      let assert Ok(Nil) = schedule.pause(client, id, note: "still paused")
+      False
+    }
+    let _ = reached(8) || nudge() || reached(60) || nudge() || reached(75)
+    process.sleep(500)
+    assert action_count() == 4
+    let assert Ok(Nil) = schedule.delete(client, id)
+    worker.stop(worker)
+  })
 }
 
 /// Ask `check` every 200 ms until it holds or the clock passes `deadline`.
