@@ -6,7 +6,14 @@
 //// included codec is AES-256-GCM in the format of the codec in Temporal's own samples.
 ////
 //// Keys are 32 bytes and belong in a secret store, never in source code: `run` takes them
-//// as arguments.
+//// as arguments. `encryption.key` makes one, and refuses a secret of any other size.
+////
+//// A codec covers payloads. A failure's message is text beside them, so the client here
+//// also turns on `client.with_encoded_failure_attributes`, which sends failure messages
+//// and stack traces through the codec too. What stays readable on the service, with or
+//// without it: search attributes, ids, type names, task queues and headers. See
+//// `temporal/encryption` for the whole list, and for `encryption.strict`, which refuses
+//// unencrypted payloads once nothing older is left to read.
 
 import gleam/result
 import temporal/client
@@ -46,14 +53,16 @@ fn keep_secret_workflow(
 }
 
 /// Connect with a codec that encrypts with `current` and can still decrypt with any of
-/// `retired`.
+/// `retired`, and with failure messages encoded as well.
 fn connect(
   options: client.Options,
   current: encryption.Key,
   retired: List(encryption.Key),
 ) -> Result(client.Client, client.Error) {
   client.connect(
-    options |> client.with_codec(encryption.codec(current, retired)),
+    options
+    |> client.with_codec(encryption.codec(current, retired))
+    |> client.with_encoded_failure_attributes,
   )
 }
 

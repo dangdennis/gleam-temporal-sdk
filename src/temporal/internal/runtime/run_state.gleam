@@ -5,6 +5,7 @@
 //// module builds on this one.
 
 import gleam/dict.{type Dict}
+import gleam/dynamic
 import gleam/option.{type Option, None}
 import gleam/set.{type Set}
 import temporal/codec.{type Payload}
@@ -209,6 +210,27 @@ pub fn get() -> State
 
 @external(erlang, "temporal_ffi", "put_state")
 pub fn put(state: State) -> Nil
+
+/// A crash in this run's code as the failure to record. `what` names what crashed, such
+/// as "workflow code". The failure says what kind of error it was and where; the whole
+/// of it, with the values involved, is logged here and goes no further.
+pub fn crashed(what: String, crash: bridge.Crash) -> Failure {
+  let #(summary, stack_trace, detail) = crash
+  let state = get()
+  bridge.log(
+    bridge.Error,
+    "temporal: " <> what <> " crashed: " <> detail,
+    [
+      #("workflow_id", dynamic.string(state.workflow_id)),
+      #("run_id", dynamic.string(state.run_id)),
+      #("workflow_type", dynamic.string(state.workflow_type)),
+      #("task_queue", dynamic.string(state.task_queue)),
+    ],
+    [],
+  )
+  failure.new(what <> " crashed: " <> summary)
+  |> failure.with_stack_trace(stack_trace)
+}
 
 pub fn update(change: fn(State) -> State) -> Nil {
   put(change(get()))

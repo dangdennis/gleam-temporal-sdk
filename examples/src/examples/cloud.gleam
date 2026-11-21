@@ -25,7 +25,9 @@ fn variable(name: String) -> Result(String, String) {
 }
 
 /// Options for an API key: TLS with the system's root certificates, and the key sent
-/// with every request.
+/// with every request. `client.connect` refuses an API key without TLS, which
+/// `client.cloud` turns on; the options hold the key so that printing them does not
+/// show it.
 pub fn api_key_options() -> Result(client.Options, String) {
   use address <- result.try(variable("TEMPORAL_ADDRESS"))
   use namespace <- result.try(variable("TEMPORAL_NAMESPACE"))

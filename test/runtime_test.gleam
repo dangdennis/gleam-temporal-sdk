@@ -8,6 +8,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
+import gleam/string
 import gleam/time/duration
 import temporal/activity
 import temporal/codec
@@ -858,11 +859,26 @@ pub fn replay_without_the_patch_marker_takes_the_old_path_test() {
 
 pub fn a_crash_fails_the_task_not_the_workflow_test() {
   let run = start(int_workflow("crasher", fn(_, _) { panic as "bug" }))
-  bridge.send_activation(
-    run.0,
-    Activation("run", 1000, False, 3, [init("crasher", 0)], False),
-  )
-  let assert Ok(bridge.TaskFailure("run", _)) = process.receive(run.1, 1000)
+  let logged =
+    capture_logs(fn() {
+      bridge.send_activation(
+        run.0,
+        Activation("run", 1000, False, 3, [init("crasher", 0)], False),
+      )
+      let assert Ok(bridge.TaskFailure("run", failure)) =
+        process.receive(run.1, 1000)
+      // The failure says what crashed and where, and has the stack apart.
+      assert string.starts_with(
+        failure.message,
+        "workflow code crashed: panic in runtime_test.",
+      )
+      assert string.ends_with(failure.message, ": bug")
+      assert string.contains(failure.stack_trace, "runtime_test:")
+      assert string.contains(failure.stack_trace, "test/runtime_test.gleam:")
+    })
+  // And the crash is logged where it happened, under the workflow's id.
+  let assert [#(bridge.Error, line, "wf")] = logged
+  assert string.contains(line, "temporal: workflow code crashed: error: ")
   // Core evicts the run after a task failure; the process acknowledges and exits.
   assert activate(run, [bridge.RemoveFromCache("task failed", 4)]) == []
   process.sleep(50)
@@ -940,11 +956,46 @@ pub fn workflow_log_fields_reach_the_logger_with_their_types_test() {
     })
     == [
       #("charged", [
-        "cents=1250", "currency=<<\"EUR\">>", "rate=0.5", "retried=false",
+        "fields.cents=1250", "fields.currency=<<\"EUR\">>", "fields.rate=0.5",
+        "fields.retried=false", "fields.workflow_id=<<\"forged\">>",
         "run_id=<<\"run\">>", "task_queue=<<\"queue\">>",
         "workflow_id=<<\"wf\">>", "workflow_type=<<\"structured\">>",
       ]),
     ]
+}
+
+@external(erlang, "temporal_test_ffi", "unique")
+fn unique() -> String
+
+@external(erlang, "temporal_test_ffi", "atom_count")
+fn atom_count() -> Int
+
+pub fn log_field_keys_never_become_atoms_test() {
+  // The atom table is never collected: a key built from data must not grow it.
+  let prefix = "fresh_log_key_" <> unique() <> "_"
+  let key = fn(n) { prefix <> int.to_string(n) }
+  let before = atom_count()
+  let logged =
+    capture_log_metadata(fn() {
+      let run =
+        start(
+          int_workflow("keys", fn(ctx, n) {
+            workflow.log_info(
+              ctx,
+              "many keys",
+              list.index_map(list.repeat(Nil, 200), fn(_, n) {
+                log.int(key(n), n)
+              }),
+            )
+            Ok(n)
+          }),
+        )
+      let _ = activate(run, [init("keys", 1)])
+      Nil
+    })
+  let assert [#("many keys", metadata)] = logged
+  assert list.length(metadata) == 204
+  assert atom_count() - before < 50
 }
 
 pub fn workflow_logs_once_and_not_on_replay_test() {
@@ -1295,13 +1346,18 @@ pub fn fail_on_crash_turns_a_crash_into_a_workflow_failure_test() {
   let handler =
     int_workflow("brittle", fn(_, _) { panic as "a bug" })
     |> workflow.fail_on_crash
-  let assert [
-    bridge.FailWorkflow(failure.Failure(
-      error_type: Some("WorkflowCrashed"),
-      non_retryable: True,
-      ..,
-    )),
-  ] = activate(start(handler), [init("brittle", 1)])
+  let _ =
+    capture_logs(fn() {
+      let assert [
+        bridge.FailWorkflow(failure.Failure(
+          error_type: Some("WorkflowCrashed"),
+          non_retryable: True,
+          ..,
+        )),
+      ] = activate(start(handler), [init("brittle", 1)])
+      Nil
+    })
+  Nil
 }
 
 pub fn a_scope_forgets_operations_that_have_settled_test() {

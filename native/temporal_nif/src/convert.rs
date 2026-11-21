@@ -147,8 +147,14 @@ fn failure_summary(f: &Failure) -> (&'static str, Option<&str>, bool) {
     (kind, error_type, non_retryable)
 }
 
+/// What a failure's message reads once the message has moved into its encoded attributes,
+/// in every Temporal SDK.
+const ENCODED_FAILURE: &str = "Encoded failure";
+
 /// The last field, `original`, is the failure itself, encoded: `decode_failure` sends it
-/// back as it is when Gleam returns the failure unchanged.
+/// back as it is when Gleam returns the failure unchanged. The message and stack trace are
+/// as the failure carries them; if they are in `encoded_attributes`, Gleam restores them
+/// from there, because the payload codec is Gleam's.
 pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
     let (kind, error_type, non_retryable) = failure_summary(f);
     let details = match &f.failure_info {
@@ -172,6 +178,8 @@ pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
             non_retryable.to_term(env),
             f.cause.to_term(env),
             details.encode(env),
+            f.stack_trace.to_term(env),
+            f.encoded_attributes.to_term(env),
             Some(Bytes(f.encode_to_vec())).to_term(env),
         ],
     )
@@ -181,20 +189,40 @@ pub fn encode_failure<'a>(env: Env<'a>, f: &Failure) -> Term<'a> {
 /// everything `failure.Failure` does not model: whether what Gleam shows of it still matches
 /// its `original` tells. Any other failure is built from the fields, as an application
 /// failure or a cancellation, and its cause is read by the same rule.
+///
+/// Gleam always gives the message and stack trace in the clear, because the comparison
+/// with `original` needs them. When it also gives `encoded_attributes`, they are in there,
+/// encoded, and are not sent: the failure leaves with `Encoded failure` for a message and
+/// no stack trace, whether it is passed on or built.
 pub fn decode_failure(term: Term) -> DecodeResult<Failure> {
     let (_, f) = untag(term)?;
-    if f.len() != 7 {
+    if f.len() != 9 {
         return Err("expected a Failure".to_string());
     }
     let message: String = at(&f, 0, "Failure.message")?;
     let (kind, _) = untag(f[1])?;
     let error_type: Option<String> = at(&f, 2, "Failure.error_type")?;
     let non_retryable: bool = at(&f, 3, "Failure.non_retryable")?;
-    let original: Option<Bytes> = at(&f, 6, "Failure.original")?;
-    if let Some(original) = original.and_then(|bytes| Failure::decode(bytes.0.as_slice()).ok())
-        && original.message == message
-        && failure_summary(&original) == (kind.as_str(), error_type.as_deref(), non_retryable)
+    let stack_trace: String = at(&f, 6, "Failure.stack_trace")?;
+    let encoded_attributes: Option<Payload> = at(&f, 7, "Failure.encoded_attributes")?;
+    let original: Option<Bytes> = at(&f, 8, "Failure.original")?;
+    let unchanged = |original: &Failure| {
+        failure_summary(original) == (kind.as_str(), error_type.as_deref(), non_retryable)
+            // Shown as it arrived, or it arrived encoded and Gleam, which decoded it,
+            // found the message as it was and hands the same attributes back.
+            && ((original.message == message && original.stack_trace == stack_trace)
+                || (encoded_attributes.is_some()
+                    && original.encoded_attributes == encoded_attributes))
+    };
+    if let Some(mut original) = original
+        .and_then(|bytes| Failure::decode(bytes.0.as_slice()).ok())
+        .filter(unchanged)
     {
+        if encoded_attributes.is_some() {
+            original.message = ENCODED_FAILURE.to_string();
+            original.stack_trace = String::new();
+            original.encoded_attributes = encoded_attributes;
+        }
         return Ok(original);
     }
     let details: Vec<Payload> = at(&f, 5, "Failure.details")?;
@@ -212,13 +240,31 @@ pub fn decode_failure(term: Term) -> DecodeResult<Failure> {
             ..Default::default()
         })
     };
+    let (message, stack_trace) = match encoded_attributes {
+        Some(_) => (ENCODED_FAILURE.to_string(), String::new()),
+        None => (message, stack_trace),
+    };
     Ok(Failure {
         message,
+        stack_trace,
+        encoded_attributes,
         source: "GleamSDK".to_string(),
         cause: at(&f, 4, "Failure.cause")?,
         failure_info: Some(info),
-        ..Default::default()
     })
+}
+
+/// A failure that wraps `cause` and reads as it does: with its message, in the clear or
+/// encoded as the cause's is.
+fn wrapping(cause: Failure, info: FailureInfo) -> Failure {
+    Failure {
+        message: cause.message.clone(),
+        encoded_attributes: cause.encoded_attributes.clone(),
+        source: "GleamSDK".to_string(),
+        cause: Some(Box::new(cause)),
+        failure_info: Some(info),
+        ..Default::default()
+    }
 }
 
 // ---- core -> Gleam ----
@@ -870,13 +916,10 @@ fn application_failure(failure: Failure) -> Failure {
     if let Some(FailureInfo::ApplicationFailureInfo(_)) = failure.failure_info {
         return failure;
     }
-    Failure {
-        message: failure.message.clone(),
-        source: "GleamSDK".to_string(),
-        cause: Some(Box::new(failure)),
-        failure_info: Some(FailureInfo::ApplicationFailureInfo(Default::default())),
-        ..Default::default()
-    }
+    wrapping(
+        failure,
+        FailureInfo::ApplicationFailureInfo(Default::default()),
+    )
 }
 
 pub fn decode_activity_result(term: Term) -> DecodeResult<ActivityExecutionResult> {
@@ -940,18 +983,13 @@ pub fn decode_nexus_result(term: Term, task_token: Vec<u8>) -> DecodeResult<Nexu
         bridge::NexusResult::NexusHandlerFailed {
             error_type,
             failure: cause,
-        } => Status::Failure(Failure {
-            message: cause.message.clone(),
-            source: "GleamSDK".to_string(),
-            cause: Some(Box::new(cause)),
-            failure_info: Some(FailureInfo::NexusHandlerFailureInfo(
-                NexusHandlerFailureInfo {
-                    r#type: error_type,
-                    ..Default::default()
-                },
-            )),
-            ..Default::default()
-        }),
+        } => Status::Failure(wrapping(
+            cause,
+            FailureInfo::NexusHandlerFailureInfo(NexusHandlerFailureInfo {
+                r#type: error_type,
+                ..Default::default()
+            }),
+        )),
         bridge::NexusResult::NexusCancelAcknowledged => Status::Completed(Response {
             variant: Some(response::Variant::CancelOperation(
                 CancelOperationResponse {},

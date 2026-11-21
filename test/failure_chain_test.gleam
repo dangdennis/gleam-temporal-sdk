@@ -238,8 +238,8 @@ pub fn an_activity_may_fail_with_a_failure_it_received_test() {
 /// server. Passing the failure on must neither encrypt them again nor send them in the
 /// clear.
 pub fn details_of_a_failure_passed_on_stay_as_they_were_encoded_test() {
-  let key =
-    encryption.Key(id: "k1", secret: bit_array.concat(list.repeat(<<7>>, 32)))
+  let assert Ok(key) =
+    encryption.key(id: "k1", secret: bit_array.concat(list.repeat(<<7>>, 32)))
   let assert Ok(encrypting) =
     client.connect(
       client.local() |> client.with_codec(encryption.codec(key, [])),

@@ -223,8 +223,8 @@ pub fn an_activity_logs_with_its_identity_and_fields_test() {
     })
     == [
       expected("looking up", []),
-      expected("charged", ["cents=1250", "retried=false"]),
-      expected("slow", ["seconds=2.5"]),
-      expected("declined", ["reason=<<\"expired\">>"]),
+      expected("charged", ["fields.cents=1250", "fields.retried=false"]),
+      expected("slow", ["fields.seconds=2.5"]),
+      expected("declined", ["fields.reason=<<\"expired\">>"]),
     ]
 }

@@ -5,12 +5,12 @@
 -export([connect/1, schedule_create/4, schedule_update/5, update_with_start/4, complete_activity_async/3, defer_activity/0,
          activity_deferred/0, follow/1, new_cell/0, read_cell/1, write_cell/2, update_workflow/4, poll_update/4, poll_nexus/1, complete_nexus/3, aes_gcm_encrypt/2, aes_gcm_decrypt/2, schedule_describe/2, schedule_delete/2,
          schedule_patch/3, schedule_list/1, system_time_ms/0, server_start/2, server_stop/1, time_control/2, worker_new/3, replay_worker_new/2, poll_workflow/1, complete_workflow/2,
-         poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/3, log_notice/2, flush_logs/0, worker_shutdown/2, new_flag/0, raise_flag/1, flag_raised/1, new_tally/0, tally/2, tallied/1,
+         poll_activity/1, complete_activity/3, heartbeat/3, send_activity_cancel/2, activity_cancel_reason/0, rescue_all/1, log/4, log_notice/3, flush_logs/0, worker_shutdown/2, new_flag/0, raise_flag/1, flag_raised/1, new_tally/0, tally/2, tallied/1,
          start_workflow/3, describe_workflow/3, list_workflows/3, count_workflows/2, signal_workflow/5, query_workflow/5, cancel_workflow/3,
          terminate_workflow/4, workflow_result/3, fetch_history/3,
          start_activity/2, activity_result/3, describe_activity/3, cancel_activity/4,
          terminate_activity/4, list_activities/3, count_activities/2,
-         send_activation/2, receive_activation/0, get_state/0, put_state/1, rescue/1, is_musl/0,
+         send_activation/2, receive_activation/0, get_state/0, put_state/1, rescue/1, describe_exit/1, is_musl/0,
          exit_normal/0, kill/1, replace_lone_surrogates/1]).
 
 %% Start an asynchronous NIF call and wait for its reply. A NIF that rejects its arguments
@@ -119,21 +119,37 @@ activity_cancel_reason() ->
         Reason -> {some, Reason}
     end.
 
-%% Metadata is a list of {Key, Value}; a later entry replaces an earlier one with the same
-%% key. Keys are written in code, by this library or as log fields, so making atoms of them
-%% is safe.
+%% `Identity` and `Fields` are lists of {Key, Value} with binary keys; a later entry
+%% replaces an earlier one with the same key.
+%%
+%% Identity keys are the SDK's own and become top-level metadata atoms through
+%% identity_key/1, a fixed table. Field keys come from the caller's code and may be built
+%% from data, so no atom is ever made of one: the fields go, keyed by binary, in one map
+%% under `fields`. The atom table is never collected, and a VM that fills it stops.
 %%
 %% The event carries no `domain`: OTP's default handler drops every event whose domain is
 %% not `[otp]` or `[otp, sasl]`, so a domain of our own would hide the SDK's lines from
 %% anyone who has not reconfigured logger. `temporal => true` marks them instead.
-log(Level, Message, Metadata) ->
-    Meta = lists:foldl(fun({K, V}, Acc) -> Acc#{binary_to_atom(K) => V} end,
-                       #{}, Metadata),
-    logger:log(Level, "~ts", [Message], Meta#{temporal => true}),
+log(Level, Message, Identity, Fields) ->
+    Meta = maps:from_list([{identity_key(K), V} || {K, V} <- Identity]),
+    WithFields = case Fields of
+                     [] -> Meta;
+                     _ -> Meta#{fields => maps:from_list(Fields)}
+                 end,
+    logger:log(Level, "~ts", [Message], WithFields#{temporal => true}),
     nil.
 
-log_notice(Message, Metadata) ->
-    log(notice, Message, Metadata).
+identity_key(<<"workflow_id">>) -> workflow_id;
+identity_key(<<"run_id">>) -> run_id;
+identity_key(<<"workflow_type">>) -> workflow_type;
+identity_key(<<"task_queue">>) -> task_queue;
+identity_key(<<"activity_id">>) -> activity_id;
+identity_key(<<"activity_type">>) -> activity_type;
+identity_key(<<"activity_run_id">>) -> activity_run_id;
+identity_key(<<"attempt">>) -> attempt.
+
+log_notice(Message, Identity, Fields) ->
+    log(notice, Message, Identity, Fields).
 
 %% Wait until the lines logged so far have been written by logger's standard handlers,
 %% for a program that is about to halt: they write in processes of their own.
@@ -142,12 +158,11 @@ flush_logs() ->
      || #{id := Id, module := logger_std_h} <- logger:get_handler_config()],
     nil.
 
+%% Like rescue/1, and catches exits too.
 rescue_all(Fun) ->
     try {ok, Fun()}
     catch
-        Class:Reason:Stack ->
-            {error, unicode:characters_to_binary(
-                      io_lib:format("~p: ~0tp~n~0tp", [Class, Reason, Stack]))}
+        Class:Reason:Stack -> {error, crash(Class, Reason, Stack)}
     end.
 
 worker_shutdown(Worker, LimitMs) ->
@@ -276,18 +291,94 @@ put_state(State) ->
 rescue(Fun) ->
     try {ok, Fun()}
     catch
-        error:Reason:Stack ->
-            {error, unicode:characters_to_binary([describe(Reason), io_lib:format("~n~0tp", [Stack])])};
-        throw:Reason ->
-            {error, unicode:characters_to_binary(io_lib:format("throw: ~0tp", [Reason]))}
+        error:Reason:Stack -> {error, crash(error, Reason, Stack)};
+        throw:Reason:Stack -> {error, crash(throw, Reason, Stack)}
     end.
 
-%% A Gleam panic or failed assertion as a sentence; anything else as the Erlang term.
-describe(#{gleam_error := Kind, message := Message, module := Module, function := Function,
-           line := Line}) ->
+%% A crash three ways: {Summary, StackTrace, Detail}.
+%%
+%% Summary and StackTrace go into the failure Temporal records, which leaves the machine
+%% and is not covered by a payload codec, so they must hold no values: an Erlang error
+%% term such as `{badmatch, V}` or a stack frame's argument list carries the data the code
+%% was working on. Summary names the class and kind of error, and StackTrace the frames
+%% as module, function, arity, file and line.
+%%
+%% Detail is the whole term, for the local log only.
+crash(Class, Reason, Stack) ->
+    {unicode:characters_to_binary(describe(Class, Reason)),
+     unicode:characters_to_binary(stack_trace(Stack)),
+     unicode:characters_to_binary(io_lib:format("~p: ~0tp~n~0tp", [Class, Reason, Stack]))}.
+
+%% What a monitored process exited with, as {Summary, Detail}: see crash/3. A process
+%% that crashed exits with `{Reason, Stack}`.
+describe_exit({Reason, [Frame | _] = Stack}) when is_tuple(Frame), tuple_size(Frame) >= 3,
+                                                 is_atom(element(1, Frame)) ->
+    {unicode:characters_to_binary([describe(error, Reason), $\n, stack_trace(Stack)]),
+     unicode:characters_to_binary(io_lib:format("~0tp", [{Reason, Stack}]))};
+describe_exit(Reason) ->
+    {unicode:characters_to_binary(describe(exit, Reason)),
+     unicode:characters_to_binary(io_lib:format("~0tp", [Reason]))}.
+
+%% A Gleam panic or failed assertion as a sentence: the text is written in the code, and
+%% the values an assertion compared are left out. Anything else as its class and kind.
+describe(_, #{gleam_error := Kind, message := Message, module := Module, function := Function,
+              line := Line}) ->
     io_lib:format("~ts in ~ts.~ts, line ~b: ~ts", [Kind, Module, Function, Line, Message]);
-describe(Reason) ->
-    io_lib:format("~0tp", [Reason]).
+%% The SDK's own errors, which explain themselves.
+describe(Class, {temporal_not_in_workflow = Kind, Explanation}) ->
+    io_lib:format("~p: ~p: ~ts", [Class, Kind, Explanation]);
+describe(Class, {temporal_library_not_loaded = Kind, Explanation, Why}) ->
+    io_lib:format("~p: ~p: ~ts (~ts)", [Class, Kind, Explanation, Why]);
+describe(Class, Kind) when is_atom(Kind) ->
+    io_lib:format("~p: ~p", [Class, Kind]);
+describe(Class, {Kind, Value}) when Kind =:= badmatch; Kind =:= case_clause;
+                                    Kind =:= try_clause; Kind =:= badrecord ->
+    io_lib:format("~p: ~p: a value did not match (~ts)", [Class, Kind, type_of(Value)]);
+describe(Class, Reason) when is_tuple(Reason), tuple_size(Reason) >= 1,
+                             is_atom(element(1, Reason)) ->
+    [_ | Rest] = tuple_to_list(Reason),
+    io_lib:format("~p: ~p (with ~ts)",
+                  [Class, element(1, Reason), lists:join(", ", [type_of(V) || V <- Rest])]);
+describe(Class, Reason) ->
+    io_lib:format("~p: ~ts", [Class, type_of(Reason)]).
+
+%% The type of a value and its size, never the value.
+type_of(V) when is_integer(V) -> "an integer";
+type_of(V) when is_float(V) -> "a float";
+type_of(V) when is_atom(V) -> "an atom";
+type_of(V) when is_binary(V) -> io_lib:format("a binary of ~b bytes", [byte_size(V)]);
+type_of(V) when is_bitstring(V) -> "a bit string";
+type_of(V) when is_list(V) -> "a list";
+type_of(V) when is_tuple(V) -> io_lib:format("a tuple of ~b elements", [tuple_size(V)]);
+type_of(V) when is_map(V) -> io_lib:format("a map of ~b entries", [map_size(V)]);
+type_of(V) when is_function(V) -> "a function";
+type_of(V) when is_pid(V) -> "a pid";
+type_of(V) when is_reference(V) -> "a reference";
+type_of(V) when is_port(V) -> "a port";
+type_of(_) -> "a term".
+
+%% One line per frame: `module:function/arity (file:line)`. A frame of a function that
+%% matched no clause holds the arguments it was called with; only their number is kept.
+stack_trace(Stack) when is_list(Stack) ->
+    lists:join($\n, [frame(Frame) || Frame <- Stack]);
+stack_trace(_) ->
+    [].
+
+frame({Module, Function, Args, Location}) when is_list(Args) ->
+    frame({Module, Function, length(Args), Location});
+frame({Module, Function, Arity, Location}) when is_integer(Arity), is_list(Location) ->
+    Where = case {lists:keyfind(file, 1, Location), lists:keyfind(line, 1, Location)} of
+                {{file, File}, {line, Line}} when is_integer(Line) ->
+                    io_lib:format(" (~ts:~b)", [File, Line]);
+                {{file, File}, _} -> io_lib:format(" (~ts)", [File]);
+                _ -> ""
+            end,
+    io_lib:format("~ts:~ts/~b~ts", [atom_to_binary(Module), name(Function), Arity, Where]);
+frame(_) ->
+    "?".
+
+name(Function) when is_atom(Function) -> atom_to_binary(Function);
+name(_) -> <<"?">>.
 
 %% Whether this VM is linked against musl, as on Alpine Linux.
 is_musl() ->

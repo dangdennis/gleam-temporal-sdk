@@ -10,10 +10,22 @@
 //// ])
 //// ```
 ////
-//// Values keep their types: an int reaches the log handler as an integer, not as text.
-//// Keys become atoms, as `logger` metadata keys are, so use a fixed set of keys written in
-//// the code, never keys built from data. A field cannot replace the identity keys the SDK
-//// sets itself, such as `workflow_id`.
+//// The fields travel in one map under the metadata key `fields`, keyed by the field's
+//// name as a binary: `#{temporal => true, workflow_id => <<"order-1">>, ..., fields =>
+//// #{<<"carrier">> => <<"dhl">>, <<"parcels">> => 3}}`. Values keep their types: an int
+//// reaches the log handler as an integer, not as text. The names are never made into
+//// atoms, so a key built from data cannot fill the VM's atom table, and a field cannot
+//// replace the identity keys the SDK sets itself, such as `workflow_id`, which stay atoms
+//// at the top level. A formatter or filter reads a field from the map:
+////
+//// ```erlang
+//// parcels(#{meta := #{fields := #{<<"parcels">> := Parcels}}}) -> Parcels;
+//// parcels(_) -> undefined.
+//// ```
+////
+//// A line logged with no fields has no `fields` key. `logger_formatter`'s template takes
+//// atom keys only, so it can print the whole map with `fields` and the identity keys by
+//// name, but not one field.
 ////
 //// The lines reach `logger`'s default handler as it comes. `logger` starts at level
 //// `notice`, so info and debug lines show once the level is lowered, for instance with
@@ -56,7 +68,7 @@ pub fn bool(key: String, value: Bool) -> Field {
   Field(key, dynamic.bool(value))
 }
 
-/// The fields as the metadata entries the logger is given.
+/// The fields as the entries of the `fields` map the logger is given.
 @internal
 pub fn metadata(fields: List(Field)) -> List(#(String, Dynamic)) {
   list.map(fields, fn(field) { #(field.key, field.value) })

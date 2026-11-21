@@ -1,6 +1,21 @@
 -module(temporal_test_ffi).
 -export([unique/0, cmd/1, read_file/1, record/2, recorded/1, test_server_path/0, tls_proxy/2, capture_logs/1, capture_log_metadata/1, log/2, write_file/2, linked/1, monitored_by/1, quietly/1, shut_down/1, memory_mb/0, env_int/2, tcp_proxy/1, tcp_proxy_mode/2, silent_listener/0, run_only/1, await_log/2, record_self/1, recorded_pid/1, os_pid/0,
-         start_application/2, workers_drained_on_sigterm/0, signal_handlers/0, quiet_notices/0]).
+         start_application/2, workers_drained_on_sigterm/0, signal_handlers/0, quiet_notices/0, atom_count/0, crash/2]).
+
+%% Crash the way Erlang code does, with Value inside the error term or, for a function
+%% that matches no clause, in the stack trace's argument list.
+crash(<<"function_clause">>, Value) -> only_nil(Value, 1);
+crash(<<"badarg">>, Value) -> _ = binary_to_existing_atom(Value), nil;
+crash(<<"case_clause">>, Value) -> case Value of nil -> nil end;
+crash(<<"badmatch">>, Value) -> nil = Value;
+crash(<<"error">>, Value) -> erlang:error({order_rejected, Value, 7});
+crash(<<"throw">>, Value) -> throw({rejected, Value});
+crash(<<"exit">>, Value) -> exit({shutdown, Value}).
+
+only_nil(nil, _) -> nil.
+
+atom_count() ->
+    erlang:system_info(atom_count).
 
 unique() ->
     integer_to_binary(erlang:system_time(microsecond)).
@@ -93,7 +108,8 @@ capture_logs(Fun) ->
 
 %% Like capture_logs/1, but each line comes with all the metadata its caller gave it:
 %% {Text, ["key=value", ...]}, values printed as Erlang terms so that their types show,
-%% sorted by key. What logger adds by itself is left out.
+%% sorted. An entry of the `fields` map is "fields.key=value". What logger adds by itself
+%% is left out.
 capture_log_metadata(Fun) ->
     [{Text, Meta} || {_, Text, Meta} <- capture(Fun, everything)].
 
@@ -143,9 +159,10 @@ log(_, _) ->
 detail(workflow_id, Meta) ->
     maps:get(workflow_id, Meta, <<>>);
 detail(everything, Meta) ->
-    Given = maps:without([temporal, pid, gl, time, mfa, file, line], Meta),
-    [unicode:characters_to_binary(io_lib:format("~ts=~0tp", [K, V]))
-     || {K, V} <- lists:sort(maps:to_list(Given))].
+    Given = maps:without([temporal, pid, gl, time, mfa, file, line, fields], Meta),
+    Fields = [{[<<"fields.">>, K], V} || {K, V} <- maps:to_list(maps:get(fields, Meta, #{}))],
+    lists:sort([unicode:characters_to_binary(io_lib:format("~ts=~0tp", [K, V]))
+                || {K, V} <- maps:to_list(Given) ++ Fields]).
 
 write_file(Path, Bytes) ->
     ok = filelib:ensure_dir(Path),

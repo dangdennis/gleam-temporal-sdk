@@ -183,8 +183,8 @@ pub fn data_test() {
 
 pub fn encryption_test() {
   // Stand-ins for keys from a secret store.
-  let old_key = encryption.Key(id: "2025", secret: <<1:256>>)
-  let new_key = encryption.Key(id: "2026", secret: <<2:256>>)
+  let assert Ok(old_key) = encryption.key(id: "2025", secret: <<1:256>>)
+  let assert Ok(new_key) = encryption.key(id: "2026", secret: <<2:256>>)
   assert encryption_example.run(client.local(), old_key, new_key)
     == Ok(encryption_example.Outcome(
       result: "the vault code is 1234!",

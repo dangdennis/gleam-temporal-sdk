@@ -50,6 +50,8 @@ fn sample_failure(message: String) -> Failure {
     True,
     None,
     [],
+    "",
+    None,
     None,
   )
 }
@@ -552,6 +554,8 @@ pub fn a_received_failure_shows_its_kind_and_cause_test() {
       ..,
     )),
     details: [],
+    stack_trace: "",
+    encoded_attributes: None,
     original: Some(_),
   ) = sample_activity_failure()
 }

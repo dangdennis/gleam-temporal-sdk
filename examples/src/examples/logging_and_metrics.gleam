@@ -2,13 +2,16 @@
 //// SDK's metrics served for Prometheus.
 ////
 //// Logs go through Erlang's `logger` with the identity of the workflow or activity as
-//// metadata, plus the fields you add. A workflow logs nothing on replay, so each line
-//// appears once however often the workflow is replayed. Never log from workflow code
-//// with `io.println`: it would print again on every replay.
+//// metadata, plus the fields you add, in one map under the metadata key `fields`. A
+//// workflow logs nothing on replay, so each line appears once however often the workflow
+//// is replayed. Never log from workflow code with `io.println`: it would print again on
+//// every replay.
 ////
 //// Metrics have one constraint: `telemetry.serve_prometheus` must be called once, before
 //// the first `client.connect` in the VM. Call it first thing in `main`, as `main` here
-//// does; calling it later returns `Error(telemetry.AlreadyStarted)`.
+//// does; calling it later returns `Error(telemetry.AlreadyStarted)`. The endpoint has no
+//// authentication, so bind an address only the scraper can reach: loopback here; see
+//// `temporal/telemetry` for Kubernetes and virtual machines.
 
 import gleam/erlang/process
 import gleam/io
@@ -46,7 +49,8 @@ fn ship_order_workflow(
     order_id,
     options,
   ))
-  // Field values keep their types. Keys become atoms: use fixed keys, never data.
+  // Field values keep their types, and reach the log handler in the `fields` map, keyed
+  // by name: `fields => #{<<"order_id">> => <<"A-1">>, <<"parcels">> => 3, ...}`.
   workflow.log_info(ctx, "shipped", [
     log.string("order_id", order_id),
     log.int("parcels", parcels),

@@ -10,15 +10,18 @@
 //// ```
 
 import gleam/dict.{type Dict}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 import gleam/time/duration.{type Duration}
 import gleam/time/timestamp.{type Timestamp}
 import temporal/activity
 import temporal/codec.{type Codec, type Payload, type PayloadCodec}
 import temporal/failure.{type Failure}
 import temporal/internal/bridge
+import temporal/internal/secret.{type Secret}
 import temporal/internal/time
 import temporal/internal/transcode
 import temporal/retry
@@ -30,13 +33,18 @@ pub opaque type Client {
   Client(
     connection: bridge.Connection,
     codec: Option(PayloadCodec),
+    encode_failure_attributes: Bool,
     namespace: String,
   )
 }
 
 /// How to reach the service. Start from `local()` or `cloud(..)` and the `with_` functions
 /// that take one: `with_target`, `with_namespace`, `with_identity`, `with_api_key`,
-/// `with_tls`, `with_codec`, `with_keep_alive` and `with_connect_timeout`.
+/// `with_tls`, `with_codec`, `with_encoded_failure_attributes`, `with_keep_alive` and
+/// `with_connect_timeout`.
+///
+/// The API key and a TLS private key are held so that printing the options, with
+/// `string.inspect` or in a crash report, does not show them.
 pub type Options {
   Options(
     /// The frontend address, such as `http://localhost:7233`.
@@ -45,13 +53,17 @@ pub type Options {
     namespace: String,
     /// Recorded in history as the author of this client's requests.
     identity: String,
-    /// Sent with every request. Needs `tls`.
-    api_key: Option(String),
+    /// Sent with every request. `connect` refuses to send one without `tls`, except to
+    /// this machine. Set it with `with_api_key`.
+    api_key: Option(Secret(String)),
     /// `None` connects without TLS.
     tls: Option(Tls),
     /// Applied to every payload this client, and any worker started with it, sends or
     /// receives. See `codec.PayloadCodec` and `temporal/encryption`.
     codec: Option(PayloadCodec),
+    /// Whether failure messages and stack traces go through the codec too. See
+    /// `with_encoded_failure_attributes`.
+    encode_failure_attributes: Bool,
     /// The pings that tell a dead connection from a quiet one. `None` sends none.
     keep_alive: Option(KeepAlive),
     /// The longest `connect` waits for the service.
@@ -72,8 +84,9 @@ pub type Tls {
     server_root_ca: Option(BitArray),
     /// Name to verify the server's certificate against, if not the target's host.
     domain: Option(String),
-    /// PEM certificate and private key, for mutual TLS.
-    client_certificate: Option(#(BitArray, BitArray)),
+    /// PEM certificate and private key, for mutual TLS. Set it with
+    /// `with_client_certificate`.
+    client_certificate: Option(#(BitArray, Secret(BitArray))),
   )
 }
 
@@ -219,6 +232,7 @@ pub fn local() -> Options {
     api_key: None,
     tls: None,
     codec: None,
+    encode_failure_attributes: False,
     keep_alive: Some(default_keep_alive()),
     connect_timeout: duration.seconds(10),
   )
@@ -240,9 +254,10 @@ pub fn cloud(
     target: "https://" <> address,
     namespace:,
     identity: "temporal-gleam",
-    api_key: Some(api_key),
+    api_key: Some(secret.new(api_key)),
     tls: Some(tls()),
     codec: None,
+    encode_failure_attributes: False,
     keep_alive: Some(default_keep_alive()),
     connect_timeout: duration.seconds(10),
   )
@@ -263,9 +278,11 @@ pub fn with_identity(options: Options, identity: String) -> Options {
   Options(..options, identity:)
 }
 
-/// Send this API key with every request. Needs TLS: see `with_tls`.
+/// Send this API key with every request. An API key is only sent over TLS: without
+/// `with_tls`, `connect` fails unless the target is this machine (`localhost`,
+/// `127.0.0.0/8` or `::1`).
 pub fn with_api_key(options: Options, api_key: String) -> Options {
-  Options(..options, api_key: Some(api_key))
+  Options(..options, api_key: Some(secret.new(api_key)))
 }
 
 /// Connect over TLS with these settings.
@@ -277,6 +294,24 @@ pub fn with_tls(options: Options, tls: Tls) -> Options {
 /// sends or receives. See `codec.PayloadCodec` and `temporal/encryption`.
 pub fn with_codec(options: Options, codec: PayloadCodec) -> Options {
   Options(..options, codec: Some(codec))
+}
+
+/// Send the message and stack trace of every failure through the payload codec instead
+/// of in the clear. Applies to this client and to any worker started with it.
+///
+/// A payload codec covers payloads; a failure's message is plain text beside them, and
+/// when workflow or activity code fails, the message is whatever that code wrote. With
+/// this on, the message and stack trace of each failure, and of each of its causes, move
+/// into the failure's `encoded_attributes` payload, which the codec then encodes, and the
+/// Temporal UI and CLI show `Encoded failure` in their place. It is the
+/// `encodeCommonAttributes` option of Temporal's TypeScript SDK and
+/// `EncodeCommonAttributes` of the Go SDK, in the same format.
+///
+/// Reading needs no option: a failure that arrives with encoded attributes is decoded
+/// with the client's codec, whichever SDK wrote it. Turn it on together with an
+/// encrypting codec; without a codec the attributes are moved but not hidden.
+pub fn with_encoded_failure_attributes(options: Options) -> Options {
+  Options(..options, encode_failure_attributes: True)
 }
 
 /// Ping the service every `interval` and reconnect when a ping is not answered within
@@ -327,33 +362,125 @@ pub fn with_client_certificate(
   certificate certificate: BitArray,
   private_key private_key: BitArray,
 ) -> Tls {
-  Tls(..tls, client_certificate: Some(#(certificate, private_key)))
+  Tls(..tls, client_certificate: Some(#(certificate, secret.new(private_key))))
 }
 
 /// Connect to the service. Fails with `ConnectionFailed` if it cannot be reached within
-/// the connect timeout or refuses the credentials.
+/// the connect timeout or refuses the credentials, or if the options would send an API
+/// key without TLS to anything but this machine.
 pub fn connect(options: Options) -> Result(Client, Error) {
+  use Nil <- result.try(
+    check_api_key_transport(options) |> result.map_error(ConnectionFailed),
+  )
   bridge.connect(bridge.ConnectOptions(
     target: options.target,
     namespace: options.namespace,
     identity: options.identity,
-    api_key: options.api_key,
+    api_key: option.map(options.api_key, secret.reveal),
     tls: option.map(options.tls, fn(tls) {
-      bridge.Tls(tls.server_root_ca, tls.domain, tls.client_certificate)
+      bridge.Tls(
+        tls.server_root_ca,
+        tls.domain,
+        option.map(tls.client_certificate, fn(pair) {
+          #(pair.0, secret.reveal(pair.1))
+        }),
+      )
     }),
     keep_alive: option.map(options.keep_alive, fn(keep_alive) {
       #(time.to_ms(keep_alive.interval), time.to_ms(keep_alive.timeout))
     }),
     connect_timeout_ms: time.to_ms(options.connect_timeout),
   ))
-  |> result.map(Client(_, options.codec, options.namespace))
+  |> result.map(Client(
+    _,
+    options.codec,
+    options.encode_failure_attributes,
+    options.namespace,
+  ))
   |> result.map_error(ConnectionFailed)
+}
+
+/// Whether the options may be connected with: an API key travels in a request header, so
+/// without TLS anyone on the path reads it. Only a target on this machine is exempt, for
+/// development servers.
+@internal
+pub fn check_api_key_transport(options: Options) -> Result(Nil, String) {
+  case options.api_key, options.tls {
+    None, _ | Some(_), Some(_) -> Ok(Nil)
+    Some(_), None ->
+      case is_loopback(host(options.target)) {
+        True -> Ok(Nil)
+        False ->
+          Error(
+            "refusing to send an API key to "
+            <> options.target
+            <> " without TLS: it would cross the network in the clear. Add "
+            <> "client.with_tls(client.tls()) to the options, or start from "
+            <> "client.cloud. Only a target on this machine (localhost, 127.0.0.0/8 "
+            <> "or ::1) may be given an API key without TLS",
+          )
+      }
+  }
+}
+
+/// The host of a target such as `http://[::1]:7233`, lowercased, without the scheme,
+/// user, port, path or an IPv6 address's brackets.
+fn host(target: String) -> String {
+  let authority = case string.split_once(target, "://") {
+    Ok(#(_, rest)) -> rest
+    Error(Nil) -> target
+  }
+  let authority = case
+    string.split_once(authority, "/"),
+    string.split_once(authority, "?")
+  {
+    Ok(#(before, _)), _ -> before
+    _, Ok(#(before, _)) -> before
+    _, _ -> authority
+  }
+  let authority = case string.split_once(authority, "@") {
+    Ok(#(_, rest)) -> rest
+    Error(Nil) -> authority
+  }
+  string.lowercase(case authority {
+    "[" <> bracketed ->
+      case string.split_once(bracketed, "]") {
+        Ok(#(address, _)) -> address
+        Error(Nil) -> bracketed
+      }
+    _ ->
+      case string.split_once(authority, ":") {
+        Ok(#(name, _)) -> name
+        Error(Nil) -> authority
+      }
+  })
+}
+
+/// Whether a host is this machine: `localhost`, an address in `127.0.0.0/8`, or `::1`.
+fn is_loopback(host: String) -> Bool {
+  case host, string.split(host, ".") {
+    "localhost", _ | "::1", _ | "0:0:0:0:0:0:0:1", _ -> True
+    _, ["127", _, _, _] as parts ->
+      list.all(parts, fn(part) {
+        case int.parse(part) {
+          Ok(n) -> n >= 0 && n <= 255
+          Error(Nil) -> False
+        }
+      })
+    _, _ -> False
+  }
 }
 
 /// The codec workers started with this client apply.
 @internal
 pub fn payload_codec(client: Client) -> Option(PayloadCodec) {
   client.codec
+}
+
+/// Whether workers started with this client send failure messages through the codec.
+@internal
+pub fn encodes_failure_attributes(client: Client) -> Bool {
+  client.encode_failure_attributes
 }
 
 /// The namespace the client is connected to.
@@ -1042,7 +1169,11 @@ pub fn fail_activity(
   bridge.complete_activity_async(
     client.connection,
     task_token,
-    bridge.ActivityFailed(transcode.encode_failure(client.codec, failure)),
+    bridge.ActivityFailed(transcode.encode_failure(
+      client.codec,
+      client.encode_failure_attributes,
+      failure,
+    )),
   )
   |> result.map_error(request_error)
 }

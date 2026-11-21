@@ -5,9 +5,25 @@
 ////
 //// ```gleam
 //// let assert Ok(Nil) = telemetry.set_core_log_level(telemetry.CoreInfo)
-//// let assert Ok(address) = telemetry.serve_prometheus("0.0.0.0:9464")
+//// let assert Ok(address) = telemetry.serve_prometheus("127.0.0.1:9464")
 //// let assert Ok(client) = client.connect(client.local())
 //// ```
+////
+//// ## Keeping the metrics endpoint private
+////
+//// The endpoint has no authentication and no TLS: whoever can reach the port can read
+//// the metrics, which name your task queues, workflow types and activity types and show
+//// how busy they are. Choose the address by who must reach it.
+////
+//// - **Scraper on the same host, or a sidecar in the same pod:** bind loopback,
+////   `127.0.0.1:9464`. Nothing off the machine can connect.
+//// - **Kubernetes, scraped by Prometheus in the cluster:** binding all interfaces,
+////   `0.0.0.0:9464`, is normal there, because the pod's address is internal to the
+////   cluster. Do not put the port behind a Service or Ingress that is reachable from
+////   outside, and use a NetworkPolicy to let only the scraper's pods connect.
+//// - **A virtual machine:** bind the private interface's address, not `0.0.0.0`, and
+////   keep the port closed in the firewall or security group to everything but the
+////   scraper.
 
 import temporal/internal/bridge
 
@@ -17,7 +33,7 @@ pub type Error {
   /// test server was made, or `serve_prometheus` was called. Telemetry can only be set up
   /// first.
   AlreadyStarted
-  /// The address is not an IP address and port, such as `0.0.0.0:9464`. Host names are
+  /// The address is not an IP address and port, such as `127.0.0.1:9464`. Host names are
   /// not accepted.
   InvalidAddress(message: String)
   /// The address could not be listened on: the port is taken, or the process may not
@@ -26,8 +42,11 @@ pub type Error {
 }
 
 /// Serve metrics in Prometheus format at `http://<address>/metrics`, where `address` is an
-/// IP address and port such as `0.0.0.0:9464`. Port 0 picks a free one. Returns the
+/// IP address and port such as `127.0.0.1:9464`. Port 0 picks a free one. Returns the
 /// address being served.
+///
+/// The endpoint is unauthenticated: bind an address only the scraper can reach. See the
+/// module documentation for which to bind where.
 ///
 /// Call it once, before the first `client.connect`: the SDK's runtime starts then and
 /// reads this setting as it does. Later calls fail with `AlreadyStarted`.

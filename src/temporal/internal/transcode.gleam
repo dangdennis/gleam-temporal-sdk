@@ -1,7 +1,17 @@
 //// Applies a payload codec to everything crossing the boundary with core: every payload in
 //// an activation, completion, activity task or activity result, wherever it is nested.
+////
+//// A failure's message and stack trace are text, not payloads, and so are outside the
+//// codec unless they are moved into the failure's `encoded_attributes` payload, as the
+//// option `client.with_encoded_failure_attributes` has done here and
+//// `encodeCommonAttributes` in Temporal's other SDKs. That payload is a JSON object,
+//// `{"message": ..., "stack_trace": ...}`, sent through the codec like any other.
+//// Headers are not transcoded: see `temporal/encryption`.
 
+import gleam/bit_array
 import gleam/dict.{type Dict}
+import gleam/dynamic/decode
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -53,6 +63,10 @@ pub fn decode_map(
   |> result.map(dict.from_list)
 }
 
+/// Decode a failure's details and, if its message and stack trace arrived encoded,
+/// restore them, whichever SDK encoded them. `encoded_attributes` stays as it arrived:
+/// `encode_failure` tells by it that the failure came encoded.
+///
 /// The failure's `original` is left alone, here and in `encode_failure`: the details inside
 /// it stay as the service sent them, which is how they go back if the failure is returned.
 pub fn decode_failure(
@@ -60,11 +74,40 @@ pub fn decode_failure(
   failure: Failure,
 ) -> Result(Failure, String) {
   use details <- result.try(decode_list(codec, failure.details))
-  use cause <- result.map(case failure.cause {
+  use cause <- result.try(case failure.cause {
     None -> Ok(None)
     Some(cause) -> result.map(decode_failure(codec, cause), Some)
   })
-  Failure(..failure, details:, cause:)
+  use #(message, stack_trace) <- result.map(case failure.encoded_attributes {
+    None -> Ok(#(failure.message, failure.stack_trace))
+    Some(encoded) ->
+      result.map(decode_one(codec, encoded), restored(_, failure))
+  })
+  Failure(..failure, message:, stack_trace:, details:, cause:)
+}
+
+/// The message and stack trace in a failure's decoded attributes. Whatever is missing or
+/// is not text is left as the failure has it, as the TypeScript SDK does.
+fn restored(attributes: Payload, failure: Failure) -> #(String, String) {
+  let text = fn(name, otherwise) {
+    decode.optional_field(
+      name,
+      otherwise,
+      decode.one_of(decode.string, [decode.success(otherwise)]),
+      decode.success,
+    )
+  }
+  let decoder = {
+    use message <- decode.then(text("message", failure.message))
+    use stack_trace <- decode.then(text("stack_trace", failure.stack_trace))
+    decode.success(#(message, stack_trace))
+  }
+  case dict.get(attributes.metadata, "encoding") {
+    Ok(<<"json/plain":utf8>>) ->
+      json.parse_bits(attributes.data, decoder)
+      |> result.unwrap(#(failure.message, failure.stack_trace))
+    _ -> #(failure.message, failure.stack_trace)
+  }
 }
 
 fn decode_resolution(
@@ -142,16 +185,14 @@ fn decode_job(
   }
 }
 
+/// Jobs are walked with or without a codec: a failure's attributes can be encoded as plain
+/// JSON, by an SDK with the option on and no codec.
 pub fn decode_activation(
   codec: Option(PayloadCodec),
   activation: bridge.Activation,
 ) -> Result(bridge.Activation, String) {
-  case codec {
-    None -> Ok(activation)
-    Some(_) ->
-      list.try_map(activation.jobs, decode_job(codec, _))
-      |> result.map(fn(jobs) { bridge.Activation(..activation, jobs:) })
-  }
+  list.try_map(activation.jobs, decode_job(codec, _))
+  |> result.map(fn(jobs) { bridge.Activation(..activation, jobs:) })
 }
 
 pub fn decode_activity_task(
@@ -198,19 +239,79 @@ pub fn encode_map(
   }
 }
 
+/// What a failure's message reads, in every Temporal SDK, when the real one is in its
+/// encoded attributes.
+const encoded_failure = "Encoded failure"
+
+/// Encode a failure's details and, with `encode_attributes`, its message and stack trace,
+/// and the same for its causes.
+///
+/// The message and stack trace stay in the failure given to the NIF, which needs them to
+/// tell whether a received failure is returned unchanged; it sends `Encoded failure` and
+/// no stack trace in their place whenever `encoded_attributes` is set.
+///
+/// A failure that arrived encoded and still reads as it did keeps the attributes it came
+/// with, with or without the option: what arrived hidden is never sent in the clear. One
+/// whose message was changed since is encoded afresh, or not, as the option says.
 pub fn encode_failure(
   codec: Option(PayloadCodec),
+  encode_attributes: Bool,
   failure: Failure,
 ) -> Failure {
+  let fresh = fn() {
+    case encode_attributes {
+      True ->
+        Some(encode_one(codec, attributes(failure.message, failure.stack_trace)))
+      False -> None
+    }
+  }
+  let encoded_attributes = case failure.encoded_attributes {
+    None -> fresh()
+    Some(arrived) ->
+      case reads_as_it_arrived(codec, arrived, failure) {
+        True -> Some(arrived)
+        False -> fresh()
+      }
+  }
   Failure(
     ..failure,
     details: encode_list(codec, failure.details),
-    cause: option.map(failure.cause, encode_failure(codec, _)),
+    cause: option.map(failure.cause, encode_failure(codec, encode_attributes, _)),
+    encoded_attributes:,
   )
+}
+
+/// The payload the TypeScript SDK's `DefaultFailureConverter` and the Go SDK's make of a
+/// message and stack trace, before the codec.
+fn attributes(message: String, stack_trace: String) -> Payload {
+  codec.Payload(
+    metadata: dict.from_list([#("encoding", <<"json/plain":utf8>>)]),
+    data: json.object([
+      #("message", json.string(message)),
+      #("stack_trace", json.string(stack_trace)),
+    ])
+      |> json.to_string
+      |> bit_array.from_string,
+  )
+}
+
+/// Whether a failure that arrived with encoded attributes still has the message and stack
+/// trace they hold. Attributes this codec cannot read were never restored.
+fn reads_as_it_arrived(
+  codec: Option(PayloadCodec),
+  arrived: Payload,
+  failure: Failure,
+) -> Bool {
+  case decode_one(codec, arrived) {
+    Ok(decoded) ->
+      restored(decoded, failure) == #(failure.message, failure.stack_trace)
+    Error(_) -> failure.message == encoded_failure
+  }
 }
 
 fn encode_command(
   codec: Option(PayloadCodec),
+  encode_attributes: Bool,
   command: bridge.Command,
 ) -> bridge.Command {
   case command {
@@ -227,11 +328,14 @@ fn encode_command(
     bridge.RespondToQuery(query_id, Ok(payload)) ->
       bridge.RespondToQuery(query_id, Ok(encode_one(codec, payload)))
     bridge.RespondToQuery(query_id, Error(failure)) ->
-      bridge.RespondToQuery(query_id, Error(encode_failure(codec, failure)))
+      bridge.RespondToQuery(
+        query_id,
+        Error(encode_failure(codec, encode_attributes, failure)),
+      )
     bridge.CompleteWorkflow(payload) ->
       bridge.CompleteWorkflow(option.map(payload, encode_one(codec, _)))
     bridge.FailWorkflow(failure) ->
-      bridge.FailWorkflow(encode_failure(codec, failure))
+      bridge.FailWorkflow(encode_failure(codec, encode_attributes, failure))
     bridge.ContinueAsNew(arguments:, options:, ..) ->
       bridge.ContinueAsNew(
         ..command,
@@ -255,38 +359,48 @@ fn encode_command(
     bridge.UpdateCompleted(id, payload) ->
       bridge.UpdateCompleted(id, encode_one(codec, payload))
     bridge.UpdateRejected(id, failure) ->
-      bridge.UpdateRejected(id, encode_failure(codec, failure))
+      bridge.UpdateRejected(
+        id,
+        encode_failure(codec, encode_attributes, failure),
+      )
     bridge.ScheduleNexusOperation(input:, ..) ->
       bridge.ScheduleNexusOperation(..command, input: encode_one(codec, input))
     _ -> command
   }
 }
 
+/// A completion is walked with or without a codec, for the failures in it.
 pub fn encode_completion(
   codec: Option(PayloadCodec),
+  encode_attributes: Bool,
   completion: bridge.Completion,
 ) -> bridge.Completion {
-  case codec, completion {
-    Some(_), bridge.Success(commands:, ..) ->
+  case completion {
+    bridge.Success(commands:, ..) ->
       bridge.Success(
         ..completion,
-        commands: list.map(commands, encode_command(codec, _)),
+        commands: list.map(commands, encode_command(codec, encode_attributes, _)),
       )
-    _, _ -> completion
+    bridge.TaskFailure(run_id, failure) ->
+      bridge.TaskFailure(
+        run_id,
+        encode_failure(codec, encode_attributes, failure),
+      )
   }
 }
 
 pub fn encode_activity_result(
   codec: Option(PayloadCodec),
+  encode_attributes: Bool,
   result: bridge.ActivityResult,
 ) -> bridge.ActivityResult {
   case result {
     bridge.ActivityCompleted(payload) ->
       bridge.ActivityCompleted(option.map(payload, encode_one(codec, _)))
     bridge.ActivityFailed(failure) ->
-      bridge.ActivityFailed(encode_failure(codec, failure))
+      bridge.ActivityFailed(encode_failure(codec, encode_attributes, failure))
     bridge.ActivityCancelled(failure) ->
-      bridge.ActivityCancelled(encode_failure(codec, failure))
+      bridge.ActivityCancelled(encode_failure(codec, encode_attributes, failure))
     bridge.ActivityWillCompleteAsync -> result
   }
 }

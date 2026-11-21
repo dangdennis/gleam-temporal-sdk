@@ -634,21 +634,42 @@ pub fn activity_cancel_reason() -> Option(Int)
 
 /// Like `rescue`, but also catches exits, for code whose process must report its outcome.
 @external(erlang, "temporal_ffi", "rescue_all")
-pub fn rescue_all(body: fn() -> a) -> Result(a, String)
+pub fn rescue_all(body: fn() -> a) -> Result(a, Crash)
 
-/// Log through Erlang's `logger`. Metadata values keep their types; when a key is given
-/// twice the later entry wins.
+/// A crash in user code: `#(summary, stack_trace, detail)`.
+///
+/// The summary and stack trace are for the failure Temporal records. They name the kind
+/// of error and where it happened and hold none of the values involved, because a
+/// failure's text leaves the machine and no payload codec covers it. The detail is the
+/// whole Erlang term, values and all, and is for the local log only.
+pub type Crash =
+  #(String, String, String)
+
+/// What a process exited with: `#(summary, detail)`, split as a `Crash` is.
+@external(erlang, "temporal_ffi", "describe_exit")
+pub fn describe_exit(reason: Dynamic) -> #(String, String)
+
+/// Log through Erlang's `logger`. `identity` is the SDK's own metadata, under the fixed
+/// keys `temporal_ffi:identity_key/1` knows; `fields` are the caller's and travel in one
+/// map under the metadata key `fields`, keyed by binary, so that no atom is made of a
+/// caller's string. Values keep their types; when a key is given twice the later entry
+/// wins.
 @external(erlang, "temporal_ffi", "log")
 pub fn log(
   level: LogLevel,
   message: String,
-  metadata: List(#(String, Dynamic)),
+  identity: List(#(String, Dynamic)),
+  fields: List(#(String, Dynamic)),
 ) -> Nil
 
 /// Log at `notice`, the lowest level `logger` shows as it comes: for what an operator
 /// should see without configuring anything.
 @external(erlang, "temporal_ffi", "log_notice")
-pub fn log_notice(message: String, metadata: List(#(String, Dynamic))) -> Nil
+pub fn log_notice(
+  message: String,
+  identity: List(#(String, Dynamic)),
+  fields: List(#(String, Dynamic)),
+) -> Nil
 
 /// Wait until what has been logged is written, before the program halts.
 @external(erlang, "temporal_ffi", "flush_logs")
@@ -962,7 +983,7 @@ pub fn receive_activation() -> Activation
 
 /// Run `body`, returning a description of the crash if it panics.
 @external(erlang, "temporal_ffi", "rescue")
-pub fn rescue(body: fn() -> a) -> Result(a, String)
+pub fn rescue(body: fn() -> a) -> Result(a, Crash)
 
 /// A slot in the calling process that holds at most one value.
 pub type Cell(a)

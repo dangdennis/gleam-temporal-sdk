@@ -360,7 +360,9 @@ pub fn a_workflow_can_change_its_memo_test() {
 // ---- payload codec ----
 
 fn key(id: String, byte: Int) -> encryption.Key {
-  encryption.Key(id:, secret: bit_array.concat(list.repeat(<<byte>>, 32)))
+  let assert Ok(key) =
+    encryption.key(id:, secret: bit_array.concat(list.repeat(<<byte>>, 32)))
+  key
 }
 
 fn encrypted_client(current: encryption.Key, retired) -> Client {

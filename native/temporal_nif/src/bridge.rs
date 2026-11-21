@@ -1677,11 +1677,24 @@ impl Wire for CoreLogLevel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Tls {
     pub server_root_ca: Option<Bytes>,
     pub domain: Option<String>,
     pub client_certificate: Option<(Bytes, Bytes)>,
+}
+
+impl std::fmt::Debug for Tls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tls")
+            .field("server_root_ca", &self.server_root_ca)
+            .field("domain", &self.domain)
+            .field(
+                "client_certificate",
+                &self.client_certificate.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Wire for Tls {
@@ -1916,7 +1929,7 @@ impl Wire for Outcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ConnectOptions {
     pub target: String,
     pub namespace: String,
@@ -1925,6 +1938,20 @@ pub struct ConnectOptions {
     pub tls: Option<Tls>,
     pub keep_alive: Option<(i64, i64)>,
     pub connect_timeout_ms: i64,
+}
+
+impl std::fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field("target", &self.target)
+            .field("namespace", &self.namespace)
+            .field("identity", &self.identity)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("tls", &self.tls)
+            .field("keep_alive", &self.keep_alive)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .finish()
+    }
 }
 
 impl Wire for ConnectOptions {

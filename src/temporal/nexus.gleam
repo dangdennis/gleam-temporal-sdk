@@ -158,27 +158,59 @@ pub fn workflow_run(
               client.workflow_id(handle),
             )),
           )
-        Error(client.AlreadyExists(message)) ->
-          Error(handler_error("BAD_REQUEST", message))
-        Error(error) -> Error(handler_error("INTERNAL", string.inspect(error)))
+        // The caller is another team's workflow, possibly in another namespace: it is
+        // told what kind of error this was, and the service's own words stay in this
+        // worker's log.
+        Error(error) -> {
+          let #(error_type, message) = case error {
+            client.AlreadyExists(_) -> #(
+              "BAD_REQUEST",
+              "a workflow for this operation already exists and cannot be started again",
+            )
+            _ -> #(
+              "INTERNAL",
+              "could not start the workflow for this operation",
+            )
+          }
+          report(ctx, message, error)
+          Error(handler_error(error_type, message))
+        }
       }
     },
     cancel: fn(ctx, token) {
-      use workflow_id <- result.try(
-        workflow_id_from_token(token)
-        |> result.replace_error(handler_error(
-          "BAD_REQUEST",
-          "not a workflow operation token",
-        )),
-      )
+      use workflow_id <- result.try(workflow_id_from_token(
+        token,
+        client.namespace(ctx.client),
+      ))
       client.cancel(client.handle(ctx.client, definition, workflow_id))
       |> result.map_error(fn(error) {
-        case error {
-          client.NotFound(message) -> handler_error("NOT_FOUND", message)
-          _ -> handler_error("INTERNAL", "could not cancel the workflow")
+        let #(error_type, message) = case error {
+          client.NotFound(_) -> #("NOT_FOUND", operation_not_found)
+          _ -> #("INTERNAL", "could not cancel the workflow")
         }
+        report(ctx, message, error)
+        handler_error(error_type, message)
       })
     },
+  )
+}
+
+const operation_not_found = "operation not found"
+
+/// Log what went wrong with a request, in full, where only this worker's operator reads it.
+fn report(ctx: Context, answered: String, error: client.Error) -> Nil {
+  bridge.log(
+    bridge.Error,
+    "temporal: nexus operation "
+      <> ctx.service
+      <> "/"
+      <> ctx.operation
+      <> ": "
+      <> answered
+      <> ": "
+      <> string.inspect(error),
+    [],
+    [],
   )
 }
 
@@ -197,16 +229,48 @@ fn workflow_token(namespace: String, workflow_id: String) -> String {
   |> bit_array.base64_url_encode(False)
 }
 
-fn workflow_id_from_token(token: String) -> Result(String, Nil) {
-  use bytes <- result.try(bit_array.base64_url_decode(token))
+/// The workflow a token names, if the token is one of ours for this handler's namespace.
+///
+/// The token comes from the caller, who can send any. One that is not a workflow token is
+/// a `BAD_REQUEST`, as in the TypeScript SDK. One made for another namespace is answered
+/// like a token for a workflow that does not exist: the workflow id in it is not looked up
+/// here, where a workflow that happens to share the id would be cancelled in its place.
+fn workflow_id_from_token(
+  token: String,
+  namespace: String,
+) -> Result(String, Failure) {
   let decoder = {
     use kind <- decode.field("t", decode.int)
+    use token_namespace <- decode.field("ns", decode.string)
     use workflow_id <- decode.field("wid", decode.string)
-    decode.success(#(kind, workflow_id))
+    decode.success(#(kind, token_namespace, workflow_id))
   }
-  case json.parse_bits(bytes, decoder) {
-    Ok(#(kind, workflow_id)) if kind == workflow_token_type -> Ok(workflow_id)
-    _ -> Error(Nil)
+  let parsed =
+    bit_array.base64_url_decode(token)
+    |> result.try(fn(bytes) {
+      json.parse_bits(bytes, decoder) |> result.replace_error(Nil)
+    })
+  case parsed {
+    Ok(#(kind, token_namespace, workflow_id))
+      if kind == workflow_token_type && workflow_id != ""
+    ->
+      case token_namespace == namespace {
+        True -> Ok(workflow_id)
+        False -> {
+          bridge.log(
+            bridge.Warning,
+            "temporal: refused to cancel a nexus operation whose token is for namespace \""
+              <> token_namespace
+              <> "\", not \""
+              <> namespace
+              <> "\"",
+            [],
+            [],
+          )
+          Error(handler_error("NOT_FOUND", operation_not_found))
+        }
+      }
+    _ -> Error(handler_error("BAD_REQUEST", "invalid operation token"))
   }
 }
 
@@ -229,8 +293,19 @@ fn find_handler(
 fn guard(body: fn() -> Result(a, Failure)) -> Result(a, Failure) {
   case bridge.rescue_all(body) {
     Ok(outcome) -> outcome
-    Error(crash) ->
-      Error(handler_error("INTERNAL", "nexus handler crashed: " <> crash))
+    // The caller is told what kind of error it was; the values involved stay here.
+    Error(#(summary, stack_trace, detail)) -> {
+      bridge.log(
+        bridge.Error,
+        "temporal: nexus handler crashed: " <> detail,
+        [],
+        [],
+      )
+      Error(
+        handler_error("INTERNAL", "nexus handler crashed: " <> summary)
+        |> failure.with_stack_trace(stack_trace),
+      )
+    }
   }
 }
 
@@ -248,7 +323,12 @@ pub fn dispatcher(
     )
   let codec = client.payload_codec(client)
   let failed = fn(failure: Failure) {
-    let failure = transcode.encode_failure(codec, failure)
+    let failure =
+      transcode.encode_failure(
+        codec,
+        client.encodes_failure_attributes(client),
+        failure,
+      )
     case failure.kind {
       failure.NexusHandler ->
         bridge.NexusHandlerFailed(

@@ -89,7 +89,9 @@ fn charge_activity(_ctx: activity.Context, order: Order) -> Result(String, Failu
 A workflow is a function that the server can replay: it runs again from the start, against
 its recorded history, whenever a worker needs to rebuild its state. So it must make the
 same requests in the same order every time. Take time, randomness and waiting from
-`temporal/workflow`, and do everything else in activities.
+`temporal/workflow`, and do everything else in activities. That randomness is reproducible,
+which makes it predictable: use it for ids and jitter, and generate anything secret, a
+token or a key, in an activity.
 
 Options are built the same way everywhere: a constructor that takes what is required, then
 a `with_` function for each thing to change.

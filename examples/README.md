@@ -24,7 +24,7 @@ returns what happened.
 | [`standalone_activities.gleam`](src/examples/standalone_activities.gleam) | An activity started from a client with no workflow: execute, retries, describe, cancel |
 | [`schedules.gleam`](src/examples/schedules.gleam) | Creating, describing, pausing, triggering, backfilling and deleting a schedule |
 | [`data.gleam`](src/examples/data.gleam) | `temporal/schema` objects with nested and optional fields, several arguments, no arguments, a hand-written codec |
-| [`encryption.gleam`](src/examples/encryption.gleam) | The encryption payload codec, and rotating its key |
+| [`encryption.gleam`](src/examples/encryption.gleam) | The encryption payload codec with failure messages encoded too, and rotating its key |
 | [`middleware.gleam`](src/examples/middleware.gleam) | Workflow and activity middleware, rewriting what a workflow schedules, headers |
 | [`logging_and_metrics.gleam`](src/examples/logging_and_metrics.gleam) | Log lines with fields from workflows and activities, Prometheus metrics |
 | [`search_attributes.gleam`](src/examples/search_attributes.gleam) | Search attributes and memo, `client.list`, `client.count`, `client.describe` |

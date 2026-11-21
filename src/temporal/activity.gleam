@@ -17,7 +17,6 @@
 
 import gleam/dict.{type Dict}
 import gleam/dynamic
-import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/time/duration.{type Duration}
@@ -214,21 +213,21 @@ fn log(
   bridge.log(
     level,
     message,
-    list.flatten([
-      log.metadata(fields),
-      [
-        #("activity_id", dynamic.string(info.activity_id)),
-        #("activity_type", dynamic.string(info.activity_type)),
-      ],
-      owner,
-      [#("attempt", dynamic.int(info.attempt))],
-    ]),
+    [
+      #("activity_id", dynamic.string(info.activity_id)),
+      #("activity_type", dynamic.string(info.activity_type)),
+      #("attempt", dynamic.int(info.attempt)),
+      ..owner
+    ],
+    log.metadata(fields),
   )
 }
 
 /// Log through Erlang's `logger`. The activity's id and type, its workflow's id and run
 /// id (for a standalone activity, its own run id as `activity_run_id` instead), and the
-/// attempt number are attached as metadata, and so are `fields`: see `temporal/log`. Activities are not replayed, so every call logs, once per attempt.
+/// attempt number are attached as metadata, and `fields` in a map under the metadata key
+/// `fields`: see `temporal/log`. Activities are not replayed, so every call logs, once per
+/// attempt.
 pub fn log_debug(
   ctx: Context,
   message: String,

@@ -15,6 +15,7 @@
 import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/set
 import gleam/string
 import temporal/codec.{type Payload}
@@ -71,7 +72,8 @@ pub fn run(
           push(terminal_command(result))
           serve()
         }
-        Error(crash) -> fail_task("workflow code crashed: " <> crash)
+        Error(crash) ->
+          fail_task_with(run_state.crashed("workflow code", crash))
       }
   }
 }
@@ -94,8 +96,12 @@ fn terminal_command(result: Result(Option(Payload), Failure)) -> Command {
 /// Fail the current workflow task. The workflow stays open and the server retries the task,
 /// so a bug fixed by a deploy lets the workflow carry on.
 fn fail_task(message: String) -> a {
+  fail_task_with(failure.new(message))
+}
+
+fn fail_task_with(failure: Failure) -> a {
   let state = get()
-  state.complete(bridge.TaskFailure(state.run_id, failure.new(message)))
+  state.complete(bridge.TaskFailure(state.run_id, failure))
   apply(bridge.receive_activation())
   serve()
 }
@@ -135,23 +141,20 @@ fn answer_query(query: #(String, String, List(Payload))) -> Command {
   let #(query_id, query_type, arguments) = query
   let result = case dict.get(get().query_handlers, query_type) {
     Error(Nil) ->
-      Error(
+      Error(failure.new(
         "no handler for query \""
         <> query_type
         <> "\"; this workflow has "
         <> known(dict.keys(get().query_handlers))
         <> ". Set one with query.set_handler.",
-      )
+      ))
     Ok(handler) ->
       case bridge.rescue(fn() { handler(arguments) }) {
-        Ok(result) -> result
-        Error(crash) -> Error("query handler crashed: " <> crash)
+        Ok(result) -> result.map_error(result, failure.new)
+        Error(crash) -> Error(run_state.crashed("query handler", crash))
       }
   }
-  bridge.RespondToQuery(query_id, case result {
-    Ok(payload) -> Ok(payload)
-    Error(message) -> Error(failure.new(message))
-  })
+  bridge.RespondToQuery(query_id, result)
 }
 
 fn apply(activation: Activation) -> Nil {

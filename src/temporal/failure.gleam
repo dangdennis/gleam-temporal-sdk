@@ -45,6 +45,15 @@ pub type Failure {
     cause: Option(Failure),
     /// Extra data attached by the code that raised an application failure.
     details: List(Payload),
+    /// Where the failure was raised, as text, in the form of the SDK that recorded it.
+    /// Empty when it recorded none.
+    stack_trace: String,
+    /// The message and stack trace as an encoded payload, when the failure arrived with
+    /// them encoded (see `client.with_encoded_failure_attributes`): `message` and
+    /// `stack_trace` above are then what was decoded from it. Not for callers to build or
+    /// read: like `original`, it is how such a failure returned unchanged goes back as it
+    /// came. `None` on a failure built here.
+    encoded_attributes: Option(Payload),
     /// The failure exactly as Temporal sent it, encoded. Not for callers to build or read:
     /// it is how a failure received from Temporal and returned unchanged reaches the server
     /// unchanged, with everything this type does not model. `None` on a failure built here,
@@ -55,7 +64,7 @@ pub type Failure {
 
 /// A retryable application failure.
 pub fn new(message: String) -> Failure {
-  Failure(message, Application, None, False, None, [], None)
+  Failure(message, Application, None, False, None, [], "", None, None)
 }
 
 /// Set the failure's category. Retry policies can name categories that should not be
@@ -71,7 +80,7 @@ pub fn non_retryable(failure: Failure) -> Failure {
 
 /// What a workflow returns to acknowledge a cancellation request.
 pub fn cancelled() -> Failure {
-  Failure("cancelled", Cancelled, None, False, None, [], None)
+  Failure("cancelled", Cancelled, None, False, None, [], "", None, None)
 }
 
 /// The innermost failure: the original error beneath activity and child workflow wrappers.
@@ -87,9 +96,14 @@ pub fn with_details(failure: Failure, details: List(Payload)) -> Failure {
   Failure(..failure, details:, original: None)
 }
 
+/// Say where the failure was raised. The Temporal UI shows it beside the message.
+pub fn with_stack_trace(failure: Failure, stack_trace: String) -> Failure {
+  Failure(..failure, stack_trace:, original: None)
+}
+
 /// A failure of kind `Timeout`.
 pub fn timeout(message: String) -> Failure {
-  Failure(message, Timeout, None, False, None, [], None)
+  Failure(message, Timeout, None, False, None, [], "", None, None)
 }
 
 /// Whether the failure is a cancellation, directly or as the cause of an activity or child

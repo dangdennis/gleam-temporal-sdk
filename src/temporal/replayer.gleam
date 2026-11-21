@@ -112,6 +112,8 @@ pub fn replay_with(
           "replay",
           options.outbound,
           options.codec,
+          // What a replay answers is compared with history and sent nowhere.
+          False,
           True,
         )
       {

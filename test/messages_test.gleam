@@ -23,6 +23,6 @@ pub fn json_decode_error_names_the_field_test() {
 }
 
 pub fn workflow_function_outside_a_workflow_says_so_test() {
-  let assert Error(crash) = bridge.rescue(fn() { run_state.get() })
-  assert string.contains(crash, "works only in workflow code")
+  let assert Error(#(summary, _, _)) = bridge.rescue(fn() { run_state.get() })
+  assert string.contains(summary, "works only in workflow code")
 }

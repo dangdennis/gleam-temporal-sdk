@@ -76,8 +76,8 @@ fn run(name: String, client: Client) -> String {
     "data" -> string.inspect(data.run(client))
     "encryption" -> {
       // Stand-ins for keys from a secret store.
-      let old_key = encryption.Key(id: "old", secret: <<1:256>>)
-      let new_key = encryption.Key(id: "new", secret: <<2:256>>)
+      let assert Ok(old_key) = encryption.key(id: "old", secret: <<1:256>>)
+      let assert Ok(new_key) = encryption.key(id: "new", secret: <<2:256>>)
       string.inspect(encryption_example.run(client.local(), old_key, new_key))
     }
     "middleware" -> string.inspect(middleware.run(client))

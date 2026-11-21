@@ -86,7 +86,7 @@ fn bit_array_to_string(bytes: BitArray) -> Result(String, Nil)
 pub fn log_lines() -> Nil {
   let ctx =
     testing.activity_context(testing.activity_env(testing.activity_info()))
-  bridge.log(bridge.Error, "temporal worker: polling failed", [])
+  bridge.log(bridge.Error, "temporal worker: polling failed", [], [])
   activity.log_warning(ctx, "card declined", [log.string("reason", "expired")])
   activity.log_error(ctx, "charge failed", [])
   // Below the level `logger` starts with, like any other info line.
@@ -212,6 +212,7 @@ fn start_bereaved(task_queue: String, first: String) -> client.Handle(String) {
 }
 
 pub fn a_killed_activity_process_fails_the_activity_and_frees_its_slot_test() {
+  use <- quietly
   let task_queue = "killed-" <> unique()
   let worker = one_slot_worker(task_queue)
   let handle = start_bereaved(task_queue, "victim")
@@ -661,9 +662,9 @@ pub fn a_worker_logs_its_drain_budget_and_how_its_stop_went_test() {
     == "temporal: worker on task queue "
     <> task_queue
     <> " drains on SIGTERM, for up to 2.5s"
-  assert list.contains(budget, "shutdown_grace_ms=2000")
-  assert list.contains(budget, "activity_cancellation_grace_ms=500")
-  assert list.contains(budget, "drain_ms=2500")
+  assert list.contains(budget, "fields.shutdown_grace_ms=2000")
+  assert list.contains(budget, "fields.activity_cancellation_grace_ms=500")
+  assert list.contains(budget, "fields.drain_ms=2500")
   assert string.starts_with(
     stopped,
     "temporal: worker on task queue " <> task_queue <> " stopped in ",
@@ -672,11 +673,11 @@ pub fn a_worker_logs_its_drain_budget_and_how_its_stop_went_test() {
     stopped,
     "activities: 0 in flight, 0 finished, 0 accepted cancellation, 0 killed",
   )
-  assert list.contains(summary, "activities_in_flight=0")
-  assert list.contains(summary, "activities_finished=0")
-  assert list.contains(summary, "activities_cancelled=0")
-  assert list.contains(summary, "activities_killed=0")
-  assert list.any(summary, string.starts_with(_, "duration_ms="))
+  assert list.contains(summary, "fields.activities_in_flight=0")
+  assert list.contains(summary, "fields.activities_finished=0")
+  assert list.contains(summary, "fields.activities_cancelled=0")
+  assert list.contains(summary, "fields.activities_killed=0")
+  assert list.any(summary, string.starts_with(_, "fields.duration_ms="))
 
   // A worker that leaves the signal alone has no budget to announce.
   let quiet = "no-budget-" <> unique()

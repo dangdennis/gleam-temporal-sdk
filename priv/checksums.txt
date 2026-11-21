@@ -1,0 +1,1 @@
+# Filled in by the Release workflow with the SHA-256 of each native library of the release, which `gleam run -m temporal/install` verifies its download against: a first line `# v<version> <commit>`, then one `sha256sum` line per library. Without them this copy is not a release, and the installer refuses to download anything.

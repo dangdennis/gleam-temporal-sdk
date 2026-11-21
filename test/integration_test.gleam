@@ -384,6 +384,8 @@ pub fn starting_a_running_workflow_id_again_is_rejected_test() {
 }
 
 pub fn a_workflow_crash_does_not_fail_the_workflow_or_the_worker_test() {
+  // The worker logs each crash, as it should; not into the test output.
+  use <- quietly
   use env <- in_both_modes("crashing")
   let assert Ok(handle) =
     client.start(env.client, crashing(), Nil, start_options(env))
@@ -532,6 +534,9 @@ pub fn an_activity_knows_its_workflows_run_and_its_retry_policy_test() {
 }
 
 // ---- a completion the NIF will not take ----
+
+@external(erlang, "temporal_test_ffi", "quietly")
+fn quietly(body: fn() -> Nil) -> Nil
 
 @external(erlang, "temporal_test_ffi", "capture_log_metadata")
 fn capture_log_metadata(body: fn() -> Nil) -> List(#(String, List(String)))

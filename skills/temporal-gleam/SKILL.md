@@ -134,7 +134,7 @@ the same order every time. Nothing enforces this; replay tests find the mistakes
 |---|---|
 | `process.sleep`, `timer` modules | `workflow.sleep(ctx, duration)`, `workflow.timer` |
 | System time (`timestamp.system_time`) | `workflow.now(ctx)` |
-| Randomness, generated ids | `workflow.random_int(ctx, max)`, `workflow.uuid4(ctx)` |
+| Randomness, generated ids | `workflow.random_int(ctx, max)`, `workflow.uuid4(ctx)`. Both are predictable from the run's history: for ids and jitter, never for secrets, tokens or keys, which an activity must generate (`crypto:strong_rand_bytes`) |
 | IO, HTTP, databases, files, `io.println` | An activity; `workflow.log_info` for logging |
 | Sending or receiving process messages, spawning | Signals, activities, child workflows |
 | Reading mutable global state (ETS, `persistent_term`, env vars, config) | Pass it in the input, or read it in an activity |
@@ -316,6 +316,16 @@ Everything else has an example: see the table in
 continue-as-new, local activities, schedules, middleware, supervised workers, other SDKs'
 activities, Nexus, encryption, Temporal Cloud).
 
+**Secrets and what the service can read.** `client.cloud(..)` and `client.with_api_key`
+hold the key so that `string.inspect` of the options does not show it, and
+`client.connect` refuses an API key without TLS unless the target is this machine. Make
+encryption keys with `encryption.key(id:, secret:)`, which returns an `Error` unless the
+secret is 32 bytes. A payload codec encrypts payloads, memo values and failure details;
+add `client.with_encoded_failure_attributes` to encrypt failure messages and stack
+traces. Search attributes, ids, type names, task queues and headers are never encrypted:
+put nothing private in them. `telemetry.serve_prometheus` is unauthenticated: bind
+`127.0.0.1` unless the scraper is elsewhere.
+
 ## Failures
 
 Workflows and activities fail by returning `Error(Failure)`. From
@@ -405,7 +415,7 @@ replays every workflow task.
 | Activity failure `the activity process exited before reporting a result: killed` (type `ActivityProcessExited`, retried) | The activity's process was killed, or died with a process it had linked to (`process.spawn`, a port, a pool). Use `process.spawn_unlinked` and monitors, or trap exits |
 | Log warning `temporal: killed an activity that was still running after its cancellation grace` | An activity ignored a cancellation, a timeout or the worker's shutdown for the whole `worker.with_activity_cancellation_grace`. Heartbeat and check `activity.is_cancelled(ctx)` in long activities |
 | Every deploy makes activities time out and run again | The platform kills the program before the worker has drained: set its kill timeout (Kubernetes `terminationGracePeriodSeconds`, `docker stop --time`) above the shutdown grace plus the activity cancellation grace, which the worker logs at start. Or the activities run longer than the graces: heartbeat and check `activity.is_worker_shutting_down(ctx)`. Or the worker was configured with `worker.without_shutdown_signal_handling` |
-| `workflow.log_info` lines do not show | Erlang's `logger` starts at level `notice`. Lower it: `logger:set_primary_config(level, info)`, or the `logging` package's `configure`. Warnings and errors show as they are; SDK lines carry the metadata `temporal => true` |
+| `workflow.log_info` lines do not show | Erlang's `logger` starts at level `notice`. Lower it: `logger:set_primary_config(level, info)`, or the `logging` package's `configure`. Warnings and errors show as they are; SDK lines carry the metadata `temporal => true`, and the fields given to `log_info` are in one map under the metadata key `fields`, keyed by name as a binary |
 | `client.DecodeFailed(..)` from `client.result` or `client.query` | The handle's definition has the wrong output codec, or the client lacks the payload codec the worker uses |
 | Crash `temporal_not_in_workflow`: `This function works only in workflow code, in the process the worker runs the workflow in. Activities, tests and processes a workflow spawns cannot call it.` | A `workflow.*` function called from an activity, a test or a spawned process |
 | `replayer.Nondeterminism(..)`, or workflow tasks failing with a nondeterminism error after a deploy | The code issues different commands than the history records. Guard the change with `workflow.patched` |
@@ -413,7 +423,13 @@ replays every workflow task.
 | Log warning `signal "x" dropped: could not decode it: ...` | The sender's value does not match the signal definition's codec |
 | `client.RequestFailed(_, "Standalone activity is disabled")` | The server has standalone activities off. Start the dev server with `--dynamic-config-value activity.enableStandalone=true`, with Temporal CLI 1.10 or later |
 | `client.AlreadyExists(..)` on start | A workflow with that id is running. Use `client.with_id_conflict_policy(client.UseExisting)` or another id |
-| Crash `temporal_library_not_loaded`: ``The Temporal native library could not be loaded. Run `gleam run -m temporal/install` to download it, or compile it with bin/build-nif in the package directory.`` | The native library is missing, typically after `gleam clean` or in CI; or it was installed for another C library, by running the installer on a glibc host for an Alpine (musl) image or the reverse. Run the installer inside the image that runs the application |
+| Crash `temporal_library_not_loaded`: ``The Temporal native library could not be loaded. Run `gleam run -m temporal/install` to download the one built for this release, which is verified against the release's checksums, or compile it with bin/build-nif in the package directory.`` | The native library is missing, typically after `gleam clean` or in CI; or it was installed for another C library, by running the installer on a glibc host for an Alpine (musl) image or the reverse. Run the installer inside the image that runs the application |
+| `gleam run -m temporal/install` prints `this copy of temporal_gleam is not a release, so there is no prebuilt library that is known to match it: it is version ... and its priv/checksums.txt names no release. Compile the library with bin/build-nif in the package directory` | The dependency's `ref` is a branch or a commit between releases, which carries no checksums to verify a download against. Pin `ref` to a release tag, or compile the library as it says. There is no way to install another version's library |
+| `gleam run -m temporal/install` prints `the downloaded library is not the one this release was made with, and was not installed.` with two SHA-256 digests | The download was cut short or altered. Run it again; if the digests still differ, do not use the file: compile with `bin/build-nif` |
+| `client.ConnectionFailed("refusing to send an API key to http://... without TLS: it would cross the network in the clear. Add client.with_tls(client.tls()) to the options, or start from client.cloud. Only a target on this machine (localhost, 127.0.0.0/8 or ::1) may be given an API key without TLS")` | `client.with_api_key` on options without TLS. Use `client.cloud(..)`, or add `client.with_tls(client.tls())` |
+| A failure's message is `Encoded failure` | The failure was written with `client.with_encoded_failure_attributes` (or another SDK's `encodeCommonAttributes`) and this client has no payload codec, or not the key. Connect with the codec the workers use |
+| Activity failure `activity crashed: error: case_clause: a value did not match (a binary of 25 bytes)`, or `workflow code crashed: let_assert in my/module.function, line 12: Pattern match failed, no pattern matched the value.` | The code crashed. The failure names the kind of error and where, with the stack in its `stack_trace`; the values involved are left out on purpose, since failure text is stored unencrypted. The worker's log has the whole error, at error level: `temporal: activity crashed: ...` |
+| Decoding fails with `refusing a payload that is not encrypted: the encryption codec is strict, ...` | The codec was wrapped in `encryption.strict` and met a payload written without encryption, such as a workflow started before encryption was on. Drop `strict` until those histories are gone |
 | `Error(telemetry.AlreadyStarted)` | `telemetry.serve_prometheus` or `telemetry.set_core_log_level` was called after the first `client.connect`. Call them first in `main`, the log level before the metrics |
 | `client.ConnectionFailed("could not connect to http://localhost:7233 within 10s: timed out")` | The service did not answer in time: a wrong address, a firewall, or TLS on one side only. `client.with_connect_timeout` changes the wait |
 | Workflow task failure `the workflow task's completion was rejected: ...`, logged as `temporal: workflow task completion rejected, failing the task: ...` | The workflow asked for something that cannot be sent, such as a negative timeout. Fix the value; the task is retried |

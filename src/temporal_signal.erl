@@ -89,7 +89,7 @@ handle_event(sigterm, #{signalled := true} = State) ->
 handle_event(sigterm, #{waiters := Waiters, workers := Workers} = State) ->
     Drains = maps:values(alive(Workers)),
     temporal_ffi:log(notice, <<"temporal: SIGTERM received, stopping gracefully">>,
-                     [{<<"workers">>, length(Drains)}]),
+                     [], [{<<"workers">>, length(Drains)}]),
     [Pid ! {temporal_shutdown_signal, Ref} || {Pid, Ref} <- Waiters],
     spawn(fun() ->
                   drain(Drains),

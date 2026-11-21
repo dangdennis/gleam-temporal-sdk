@@ -10,7 +10,6 @@
 // Recording needs a Temporal service on localhost:7233 and the `temporal` CLI.
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { execSync } = require('child_process');
 const { Worker, DefaultLogger, Runtime } = require('@temporalio/worker');
 const { Client, Connection } = require('@temporalio/client');
@@ -23,34 +22,7 @@ Runtime.install({ logger: new DefaultLogger('ERROR') });
 const workflowsPath = require.resolve('./workflows');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// The shared test key and the codec of Temporal's encryption sample: AES-256-GCM over the
-// protobuf-encoded payload, nonce first.
-const keyId = 'conformance';
-const key = Buffer.alloc(32, 7);
-const encryptionCodec = {
-  async encode(payloads) {
-    return payloads.map((payload) => {
-      const nonce = crypto.randomBytes(12);
-      const cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
-      const plain = temporal.api.common.v1.Payload.encode(payload).finish();
-      const data = Buffer.concat([nonce, cipher.update(plain), cipher.final(), cipher.getAuthTag()]);
-      return {
-        metadata: { encoding: Buffer.from('binary/encrypted'), 'encryption-key-id': Buffer.from(keyId) },
-        data,
-      };
-    });
-  },
-  async decode(payloads) {
-    return payloads.map((payload) => {
-      if (Buffer.from(payload.metadata?.encoding ?? []).toString() !== 'binary/encrypted') return payload;
-      const data = Buffer.from(payload.data);
-      const decipher = crypto.createDecipheriv('aes-256-gcm', key, data.subarray(0, 12));
-      decipher.setAuthTag(data.subarray(data.length - 16));
-      const plain = Buffer.concat([decipher.update(data.subarray(12, data.length - 16)), decipher.final()]);
-      return temporal.api.common.v1.Payload.decode(plain);
-    });
-  },
-};
+const { encryptionCodec } = require('./encryption-codec');
 const encrypted = { payloadCodecs: [encryptionCodec] };
 
 const activities = {

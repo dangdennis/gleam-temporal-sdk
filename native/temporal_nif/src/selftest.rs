@@ -109,6 +109,16 @@ fn debug_completion<'a>(env: Env<'a>, completion: Term<'a>, namespace: String) -
     }
 }
 
+/// The debug form of connection options, as any `{:?}` of them would print it: the API key
+/// and the client's private key must not be in it.
+#[rustler::nif]
+fn debug_connect_options<'a>(env: Env<'a>, options: Term<'a>) -> Term<'a> {
+    match bridge::ConnectOptions::from_term(options) {
+        Ok(decoded) => ok(env, format!("{decoded:?}").encode(env)),
+        Err(e) => err(env, e),
+    }
+}
+
 #[rustler::nif]
 fn debug_activity_result<'a>(env: Env<'a>, result: Term<'a>) -> Term<'a> {
     match decode_activity_result(result) {

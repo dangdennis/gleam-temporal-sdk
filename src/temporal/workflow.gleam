@@ -253,7 +253,7 @@ pub fn fail_on_crash(handler: Handler) -> Handler {
       Ok(outcome) -> outcome
       Error(crash) ->
         Error(
-          failure.new("workflow code crashed: " <> crash)
+          run_state.crashed("workflow code", crash)
           |> failure.with_type("WorkflowCrashed")
           |> failure.non_retryable,
         )
@@ -310,11 +310,23 @@ pub fn now(_ctx: Context) -> Timestamp {
 }
 
 /// A deterministic random integer in `0..max` (exclusive). `max` must be positive.
+///
+/// Deterministic means predictable: the numbers come from a seed the server gives the
+/// run and records in its history, so that a replay draws the same ones. Anyone who can
+/// read the history can work out every number the workflow drew and will draw. That is
+/// fine for jitter, sampling and picking a shard, and wrong for anything an attacker
+/// must not guess: never make a secret, a token, a password, a key or a one-time code
+/// from it. Generate those in an activity, from the operating system's randomness
+/// (`crypto:strong_rand_bytes/1` in Erlang), and hand the workflow the result.
 pub fn random_int(_ctx: Context, max: Int) -> Int {
   determinism.random_bits() % max
 }
 
-/// A deterministic random version 4 UUID.
+/// A deterministic random version 4 UUID, drawn as `random_int` draws its numbers: the
+/// same on replay, and so predictable from the run's history. Use it for ids, such as an
+/// idempotency key or a child workflow's id. It is not a secret and must not serve as
+/// one: never use it as a token, a session id, a password-reset code or a key. Generate
+/// those in an activity; see `random_int`.
 pub fn uuid4(_ctx: Context) -> String {
   let high = determinism.random_bits()
   let low = determinism.random_bits()
@@ -366,18 +378,20 @@ fn log(
       bridge.log(
         level,
         message,
-        list.append(log.metadata(fields), [
+        [
           #("workflow_id", dynamic.string(state.workflow_id)),
           #("run_id", dynamic.string(state.run_id)),
           #("workflow_type", dynamic.string(state.workflow_type)),
           #("task_queue", dynamic.string(state.task_queue)),
-        ]),
+        ],
+        log.metadata(fields),
       )
   }
 }
 
 /// Log through Erlang's `logger`. The workflow's id, run id, type and task queue are
-/// attached as metadata, and so are `fields`: see `temporal/log`. Nothing is logged on
+/// attached as metadata, and `fields` in a map under the metadata key `fields`: see
+/// `temporal/log`. Nothing is logged on
 /// replay, so each line appears once however often the workflow is replayed.
 pub fn log_debug(
   _ctx: Context,

@@ -3,7 +3,7 @@
 %% calling these directly.
 -module(temporal_nif).
 
--export([connect/3, start_metrics/1, set_core_log_level/1, update_with_start/6, complete_activity_async/5, debug_completion/2, debug_activity_result/1, debug_nexus_result/1,
+-export([connect/3, start_metrics/1, set_core_log_level/1, update_with_start/6, complete_activity_async/5, debug_completion/2, debug_activity_result/1, debug_nexus_result/1, debug_connect_options/1,
          sample_activation/0, sample_activity_task/0, sample_activity_failure/0, sample_stored_schedule/0, debug_schedule_update/3, update_workflow/6, poll_update/6, worker_poll_nexus/3,
          worker_complete_nexus/5, schedule_create/6, schedule_update/7, schedule_describe/4, schedule_delete/4,
          schedule_patch/5, schedule_list/3, server_start/4, server_stop/3, time_control/4, describe_workflow/5, list_workflows/5, count_workflows/4, worker_new/5, replay_worker_new/2, worker_poll_workflow/3,
@@ -34,8 +34,9 @@ not_loaded() ->
     Reason = persistent_term:get({?MODULE, load_error}, <<"unknown">>),
     erlang:nif_error({temporal_library_not_loaded,
                       <<"The Temporal native library could not be loaded. Run "
-                        "`gleam run -m temporal/install` to download it, or compile it with "
-                        "bin/build-nif in the package directory.">>,
+                        "`gleam run -m temporal/install` to download the one built for this "
+                        "release, which is verified against the release's checksums, or "
+                        "compile it with bin/build-nif in the package directory.">>,
                       Reason}).
 
 connect(_, _, _) -> not_loaded().
@@ -73,6 +74,7 @@ worker_complete_nexus(_, _, _, _, _) -> not_loaded().
 debug_completion(_, _) -> not_loaded().
 debug_activity_result(_) -> not_loaded().
 debug_nexus_result(_) -> not_loaded().
+debug_connect_options(_) -> not_loaded().
 sample_activation() -> not_loaded().
 sample_activity_task() -> not_loaded().
 sample_activity_failure() -> not_loaded().

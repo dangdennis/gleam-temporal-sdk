@@ -4,6 +4,7 @@
 import gleam/dict
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/set
 import gleam/string
 import temporal/codec.{type Payload}
@@ -46,11 +47,13 @@ pub fn settle(update: PendingUpdate) -> Nil {
     False, _ -> Ok(Nil)
     True, Ok(check) ->
       case bridge.rescue(fn() { check(update.input) }) {
-        Ok(verdict) -> verdict
-        Error(crash) -> Error("update validator crashed: " <> crash)
+        Ok(verdict) -> result.map_error(verdict, failure.new)
+        Error(crash) -> Error(run_state.crashed("update validator", crash))
       }
     True, Error(Nil) ->
-      Error("no handler registered for update \"" <> update.name <> "\"")
+      Error(failure.new(
+        "no handler registered for update \"" <> update.name <> "\"",
+      ))
   }
   case verdict {
     Ok(Nil) -> {
@@ -78,7 +81,7 @@ pub fn settle(update: PendingUpdate) -> Nil {
       )
       push(bridge.UpdateRejected(
         update.protocol_instance_id,
-        failure.new(reason) |> failure.with_type("UpdateRejected"),
+        reason |> failure.with_type("UpdateRejected"),
       ))
     }
   }

@@ -341,8 +341,8 @@ pub fn standalone_activities_are_listed_and_counted_test() {
 }
 
 pub fn a_payload_codec_covers_a_standalone_activity_test() {
-  let key =
-    encryption.Key(id: "2026", secret: bit_array.concat(list.repeat(<<9>>, 32)))
+  let assert Ok(key) =
+    encryption.key(id: "2026", secret: bit_array.concat(list.repeat(<<9>>, 32)))
   let assert Ok(encrypted) =
     client.connect(
       client.local() |> client.with_codec(encryption.codec(key, [])),

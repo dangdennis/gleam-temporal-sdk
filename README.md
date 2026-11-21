@@ -36,7 +36,18 @@ gleam run -m temporal/install
 
 The second command fetches a prebuilt library, so no Rust toolchain is needed. The library
 lives under `build/`, so run the command again after `gleam clean` or after changing the
-version, and as a step in CI and in a Dockerfile. Libraries are published for:
+version, and as a step in CI and in a Dockerfile.
+
+The download is verified before it is used. Each release carries the SHA-256 of its
+libraries in the repository, in `priv/checksums.txt` at the tagged commit, which is the
+commit your `ref` pins. The installer downloads the library of that version for your
+machine, compares its SHA-256 with the one in the package, and puts it in place only if
+they are equal; otherwise it deletes the download and stops, showing both digests. It
+always installs the library of the package's own version: there is no option to choose
+another. A checkout that is not a release, such as a `ref` to a branch, has no checksums
+and the installer refuses it; compile the library with `bin/build-nif` there.
+
+Libraries are published for:
 
 | System | x86-64 | ARM64 |
 |---|---|---|
@@ -138,7 +149,7 @@ So is passing a bare number where a length of time is wanted: every timeout and 
 
 | Area | Supported |
 |---|---|
-| Workflows | Activities, local activities, durable timers, signals, queries, updates, child workflows, continue-as-new with or without options, patching and `deprecate_patch`, memo and search attribute changes, headers, deterministic `now` / `random_int` / `uuid4`, logging with fields that is silent on replay |
+| Workflows | Activities, local activities, durable timers, signals, queries, updates, child workflows, continue-as-new with or without options, patching and `deprecate_patch`, memo and search attribute changes, headers, deterministic `now` / `random_int` / `uuid4` (reproducible on replay, so predictable: for ids and jitter, never for secrets), logging with fields that is silent on replay |
 | Cancellation | Scopes carried by the `Context`: `with_scope`, `with_timeout`, `non_cancellable`, `cancel`; cancelling a scope cancels its timers, activities, local activities, child workflows, Nexus operations and pending signals |
 | Concurrency | `Future` values with `map`, `race`, `await`, `await_all`, `try_await_all`, `await_timeout`, `await_cancellable` |
 | Activities | Typed handlers, retry policies, all four timeouts, heartbeats with details, cancellation delivered to the activity, notice that the worker is shutting down, a failure in place of an activity whose process dies, activity info with the retry policy and `is_final_attempt`, logging with fields, failure details, completion from outside by task token |
@@ -410,16 +421,46 @@ A payload codec transforms everything the client and its workers send to the ser
 that the service stores ciphertext:
 
 ```gleam
-let codec = encryption.codec(encryption.Key(id: "2026-01", secret: key), [])
-client.connect(client.local() |> client.with_codec(codec))
+let assert Ok(key) = encryption.key(id: "2026-01", secret: key_bytes)
+client.connect(
+  client.local()
+  |> client.with_codec(encryption.codec(key, []))
+  |> client.with_encoded_failure_attributes,
+)
 ```
 
 The included codec is AES-256-GCM in the format of the encryption codec in Temporal's own
-samples, so a TypeScript, Go or Python worker with the same key reads the same data. Pass
-retired keys as the second argument for as long as histories written with them may be
-read. Search attributes are never encrypted. With a codec on, the Temporal UI and CLI show
-ciphertext, and `replayer.replay_with` needs the codec too, set with `replayer.with_codec`. Write your own
-`codec.PayloadCodec` for compression or a key service.
+samples, so a TypeScript, Go or Python worker with the same key reads the same data.
+`encryption.key` takes the 32-byte secret and fails for any other size; a key does not
+show its secret when printed. Pass retired keys as the second argument for as long as
+histories written with them may be read. With a codec on, the Temporal UI and CLI show
+ciphertext, and `replayer.replay_with` needs the codec too, set with
+`replayer.with_codec`. Write your own `codec.PayloadCodec` for compression or a key
+service.
+
+What the codec covers, and what it does not:
+
+| Encrypted | Stored in the clear |
+|---|---|
+| Arguments and results of workflows, activities, child workflows and Nexus operations | Search attributes, always: the server indexes them |
+| Signal, query and update arguments and results | Workflow and activity type names; signal, query and update names |
+| Memo values, heartbeat details, continue-as-new arguments | Workflow, run, activity and update ids; task queues; the namespace |
+| The details attached to a failure | Headers |
+| A failure's message and stack trace, with `client.with_encoded_failure_attributes` | A failure's message and stack trace, without it; a failure's type and retry flag |
+
+`client.with_encoded_failure_attributes` is the `encodeCommonAttributes` option of the
+TypeScript SDK and `EncodeCommonAttributes` of the Go SDK, in the same format: the message
+and stack trace of every failure move into the failure's `encoded_attributes` payload,
+which goes through the codec, and the service shows `Encoded failure`. Reading needs no
+option, so turn it on in each client and worker when you are ready. Without it, remember
+that a message you write with `failure.new` is stored as written. When workflow or
+activity code crashes, the failure the SDK records names the kind of error and where it
+happened, never the values involved: those are logged at error level on the worker.
+
+Headers are not encrypted, as in the TypeScript SDK by default, so that the two read each
+other's: use them for context such as a trace id. Unencrypted payloads pass through
+decoding, so that histories written before encryption stay readable; once none are left,
+`encryption.codec(key, []) |> encryption.strict` refuses them.
 
 ## Worker versioning
 
@@ -454,8 +495,12 @@ workflow.headers(ctx)              // in the workflow
 activity.info(ctx).headers         // in an activity
 ```
 
-Workflows and activities log through Erlang's `logger`, with their identity as metadata and
-any fields you add. A workflow logs nothing on replay, so each line appears once.
+Workflows and activities log through Erlang's `logger`, with their identity as metadata
+(`workflow_id`, `run_id`, `activity_id` and so on) and any fields you add in one map under
+the metadata key `fields`, keyed by name as a binary:
+`fields => #{<<"carrier">> => <<"dhl">>, <<"parcels">> => 3}`. Field names never become
+atoms, so they may be built from data. A workflow logs nothing on replay, so each line
+appears once.
 
 ```gleam
 workflow.log_info(ctx, "order shipped", [log.string("carrier", carrier), log.int("parcels", 3)])
@@ -468,10 +513,15 @@ default handler as it comes. `logger` starts at level `notice`, so `log_info` an
 `logger:set_primary_config(level, info)` or the `logging` package's `configure`. Every
 line the SDK logs carries the metadata `temporal => true`, for a filter to match on.
 
-`telemetry.serve_prometheus("0.0.0.0:9464")` serves the worker's and client's metrics, the
-same ones Temporal's other SDKs report, for Prometheus to scrape. Call it before the first
-`client.connect`; its `telemetry.Error` says whether it was called too late, given a bad
-address, or could not bind.
+`telemetry.serve_prometheus("127.0.0.1:9464")` serves the worker's and client's metrics,
+the same ones Temporal's other SDKs report, for Prometheus to scrape. Call it before the
+first `client.connect`; its `telemetry.Error` says whether it was called too late, given a
+bad address, or could not bind. The endpoint has no authentication, so bind an address
+only the scraper reaches: loopback when the scraper is on the same host or is a sidecar;
+in Kubernetes all interfaces (`0.0.0.0`), the pod's address being internal to the cluster,
+with no public Service or Ingress in front of the port and a NetworkPolicy that admits
+only the scraper; on a virtual machine the private interface, with the port closed in the
+firewall or security group.
 
 Temporal's core library, beneath this SDK, logs on its own: retries that keep failing,
 workflow tasks failed back to the server, requests the server refused. Its warnings and
@@ -484,6 +534,12 @@ A client pings the service every 30 seconds and reconnects when a ping goes unan
 15, so a worker outlives a connection that dies without being closed.
 `client.with_keep_alive` changes the two, and `client.with_connect_timeout` how long
 `connect` waits, ten seconds by default.
+
+An API key is sent with every request, so `client.connect` refuses one without TLS,
+failing with `ConnectionFailed`, unless the target is this machine (`localhost`,
+`127.0.0.0/8` or `::1`). `client.cloud` sets both. The options hold the API key and a TLS
+private key inside functions, so `string.inspect`, a crash report or a log line that
+prints the options does not print them.
 
 A worker keeps ten polls open for workflow tasks and ten for activity tasks. If tasks wait
 in the queue while the worker has slots free, raise them with
@@ -674,6 +730,9 @@ bin/codegen     # regenerate the Rust boundary types after changing bridge.gleam
 | Temporal's features repository | The scenarios the suite did not already cover, and the Go and Java SDKs' recorded histories replayed | `test/features_repo_test.gleam` |
 | Load with faults | Thousands of workflows across several workers while workers are killed and replaced: every result correct, no processes left behind | `bin/load` |
 | TLS | Workflows run through a proxy that requires mutual TLS; untrusted and certificate-less connections are refused | `test/tls_test.gleam` |
+| What the service is told | A crash is recorded by its kind and place and never with the values involved, which go to the local log; with `client.with_encoded_failure_attributes` no failure message or stack trace is stored in the clear; failures encoded this way are read and written by the TypeScript SDK in both directions; headers stay outside the codec, as in TypeScript | `test/failure_privacy_test.gleam` |
+| Refusals | An API key without TLS, a printed secret, a key that is not 32 bytes, a plaintext payload under strict encryption, a Nexus cancel with a token for another namespace, service error text in a Nexus answer | `test/security_test.gleam` |
+| The installer | Which library a machine gets; a download is installed only with the SHA-256 the release recorded, and nothing is downloaded when the checksums are not for the package's version | `test/install_test.gleam` |
 
 ### The conformance harness
 

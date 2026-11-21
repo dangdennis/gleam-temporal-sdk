@@ -5,7 +5,6 @@ import gleam/dynamic
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import gleam/string
 import temporal/activity
 import temporal/codec.{type PayloadCodec}
 import temporal/failure
@@ -33,6 +32,7 @@ pub fn workflow_loop(
   task_queue: String,
   outbound: Outbound,
   codec: Option(PayloadCodec),
+  encode_failure_attributes: Bool,
   record_evictions: Bool,
 ) -> Result(List(Eviction), String) {
   do_workflow_loop(
@@ -41,6 +41,7 @@ pub fn workflow_loop(
     task_queue,
     outbound,
     codec,
+    encode_failure_attributes,
     record_evictions,
     dict.new(),
     [],
@@ -53,6 +54,7 @@ fn do_workflow_loop(
   task_queue: String,
   outbound: Outbound,
   codec: Option(PayloadCodec),
+  encode_failure_attributes: Bool,
   record_evictions: Bool,
   runs: Dict(String, Pid),
   evictions: List(Eviction),
@@ -70,7 +72,12 @@ fn do_workflow_loop(
             _ -> Error(Nil)
           }
         })
-      let complete = complete_workflow(worker, codec, _)
+      let complete = complete_workflow(
+        worker,
+        codec,
+        encode_failure_attributes,
+        _,
+      )
       let existing = case dict.get(runs, activation.run_id) {
         Ok(pid) ->
           case process.is_alive(pid) {
@@ -109,6 +116,7 @@ fn do_workflow_loop(
         task_queue,
         outbound,
         codec,
+        encode_failure_attributes,
         record_evictions,
         runs,
         evictions,
@@ -124,13 +132,15 @@ fn do_workflow_loop(
 fn complete_workflow(
   worker: NifWorker,
   codec: Option(PayloadCodec),
+  encode_failure_attributes: Bool,
   completion: bridge.Completion,
 ) -> Nil {
   let run_id = completion.run_id
   let report = fn(message) {
-    bridge.log(bridge.Error, message, [#("run_id", dynamic.string(run_id))])
+    bridge.log(bridge.Error, message, [#("run_id", dynamic.string(run_id))], [])
   }
-  let encoded = transcode.encode_completion(codec, completion)
+  let encoded =
+    transcode.encode_completion(codec, encode_failure_attributes, completion)
   case bridge.complete_workflow(worker, encoded), completion {
     Ok(Nil), _ -> Nil
     Error(reason), bridge.Success(..) -> {
@@ -195,6 +205,7 @@ pub fn activity_loop(
   activities: Dict(String, activity.Handler),
   task_queue: String,
   codec: Option(PayloadCodec),
+  encode_failure_attributes: Bool,
   cancellation_grace_ms: Option(Int),
   shutting_down: fn() -> Bool,
   tally: bridge.Tally,
@@ -205,6 +216,7 @@ pub fn activity_loop(
       activities:,
       task_queue:,
       codec:,
+      encode_failure_attributes:,
       cancellation_grace_ms:,
       shutting_down:,
       tally:,
@@ -219,6 +231,7 @@ type ActivityLoop {
     activities: Dict(String, activity.Handler),
     task_queue: String,
     codec: Option(PayloadCodec),
+    encode_failure_attributes: Bool,
     cancellation_grace_ms: Option(Int),
     shutting_down: fn() -> Bool,
     /// Where the activities that end while the worker is shutting down are counted.
@@ -281,9 +294,12 @@ fn complete_activity(
   result: bridge.ActivityResult,
 ) -> Nil {
   let report = fn(message) {
-    bridge.log(bridge.Error, message, [
-      #("activity_id", dynamic.string(activity_id)),
-    ])
+    bridge.log(
+      bridge.Error,
+      message,
+      [#("activity_id", dynamic.string(activity_id))],
+      [],
+    )
   }
   case bridge.complete_activity(worker, task_token, result) {
     Ok(Nil) -> Nil
@@ -346,7 +362,11 @@ fn start_activity(
         loop.worker,
         task_token,
         activity_id,
-        transcode.encode_activity_result(loop.codec, result),
+        transcode.encode_activity_result(
+          loop.codec,
+          loop.encode_failure_attributes,
+          result,
+        ),
       )
     }
     // The activity's process hands over its outcome as the last thing it does. Waiting
@@ -395,10 +415,17 @@ fn watch_activity(watcher: Watcher, grace_running: Bool) -> Nil {
     // retryable: the server runs the activity again by its retry policy.
     Exited(down) -> {
       tally(loop, 1)
+      let #(summary, detail) = exit_reason(down)
+      bridge.log(
+        bridge.Error,
+        "temporal: an activity's process exited before reporting a result: "
+          <> detail,
+        [#("activity_id", dynamic.string(activity_id))],
+        [],
+      )
       report(bridge.ActivityFailed(
         failure.new(
-          "the activity process exited before reporting a result: "
-          <> exit_reason(down),
+          "the activity process exited before reporting a result: " <> summary,
         )
         |> failure.with_type("ActivityProcessExited"),
       ))
@@ -421,6 +448,7 @@ fn watch_activity(watcher: Watcher, grace_running: Bool) -> Nil {
         bridge.Warning,
         "temporal: killed an activity that was still running after its cancellation grace",
         [#("activity_id", dynamic.string(activity_id))],
+        [],
       )
       tally(loop, 3)
       report(bridge.ActivityCancelled(failure.cancelled()))
@@ -436,13 +464,15 @@ fn tally(loop: ActivityLoop, index: Int) -> Nil {
   }
 }
 
-fn exit_reason(down: process.Down) -> String {
+/// Why an activity's process went down, for the failure and for the local log. An exit
+/// reason can hold any value the process was working on, so only its kind is reported.
+fn exit_reason(down: process.Down) -> #(String, String) {
   case down {
-    process.ProcessDown(reason: process.Killed, ..) -> "killed"
-    process.ProcessDown(reason: process.Normal, ..) -> "normal"
+    process.ProcessDown(reason: process.Killed, ..) -> #("killed", "killed")
+    process.ProcessDown(reason: process.Normal, ..) -> #("normal", "normal")
     process.ProcessDown(reason: process.Abnormal(reason), ..) ->
-      string.inspect(reason)
-    process.PortDown(..) -> "unknown"
+      bridge.describe_exit(reason)
+    process.PortDown(..) -> #("unknown", "unknown")
   }
 }
 
@@ -543,8 +573,15 @@ fn run_activity(
           False
         -> bridge.ActivityCancelled(failure)
         Ok(Error(failure)), False -> bridge.ActivityFailed(failure)
-        Error(crash), _ ->
-          bridge.ActivityFailed(failure.new("activity crashed: " <> crash))
+        // The failure says what kind of error it was and where. The values involved
+        // stay in the local log: a failure's text is stored by the server in the clear.
+        Error(#(summary, stack_trace, detail)), _ -> {
+          activity.log_error(ctx, "temporal: activity crashed: " <> detail, [])
+          bridge.ActivityFailed(
+            failure.new("activity crashed: " <> summary)
+            |> failure.with_stack_trace(stack_trace),
+          )
+        }
       }
   }
 }
@@ -593,6 +630,7 @@ fn complete_nexus(
         bridge.Error,
         "temporal: Nexus task result rejected, failing the task: " <> reason,
         [],
+        [],
       )
       let failed =
         bridge.NexusHandlerFailed(
@@ -605,6 +643,7 @@ fn complete_nexus(
           bridge.log(
             bridge.Error,
             "temporal: could not fail the Nexus task: " <> reason,
+            [],
             [],
           )
       }

@@ -756,8 +756,8 @@ fn announce(config: Config) -> Nil {
       Some(ms) -> "for up to " <> seconds(shutdown_ms + ms)
       None -> "for as long as its activities take"
     },
+    [#("task_queue", dynamic.string(config.task_queue))],
     [
-      #("task_queue", dynamic.string(config.task_queue)),
       #("shutdown_grace_ms", dynamic.int(shutdown_ms)),
       ..case cancellation_ms {
         Some(ms) -> [
@@ -788,8 +788,8 @@ fn summarise(manager: Manager, took_ms: Int) -> Nil {
       <> " accepted cancellation, "
       <> int.to_string(killed)
       <> " killed",
+    [#("task_queue", dynamic.string(manager.config.task_queue))],
     [
-      #("task_queue", dynamic.string(manager.config.task_queue)),
       #("activities_in_flight", dynamic.int(in_flight)),
       #("activities_finished", dynamic.int(finished)),
       #("activities_cancelled", dynamic.int(cancelled)),
@@ -857,6 +857,7 @@ fn register_again(manager: Manager, wait_ms: Int) -> Nil {
           <> "\"",
         ),
         [],
+        [],
       )
       let manager =
         Manager(..manager, nif:, registration: manager.registration + 1)
@@ -902,7 +903,7 @@ fn config_error(message: String) -> String {
 }
 
 fn report(message: String) -> Nil {
-  bridge.log(bridge.Error, message, [])
+  bridge.log(bridge.Error, message, [], [])
 }
 
 fn worker_options(config: Config) -> bridge.WorkerOptions {
@@ -942,6 +943,8 @@ fn loops(
   tally: bridge.Tally,
 ) -> List(Loop) {
   let codec = client.payload_codec(config.client)
+  let encode_failure_attributes =
+    client.encodes_failure_attributes(config.client)
   let workflows =
     dict.from_list(
       list.map(config.workflows, fn(handler) {
@@ -966,6 +969,7 @@ fn loops(
         config.task_queue,
         config.outbound,
         codec,
+        encode_failure_attributes,
         False,
       )
       |> result.replace(Nil)
@@ -979,6 +983,7 @@ fn loops(
         activities,
         config.task_queue,
         codec,
+        encode_failure_attributes,
         option.map(config.activity_cancellation_grace, duration.to_milliseconds),
         fn() { bridge.flag_raised(shutting_down) },
         tally,

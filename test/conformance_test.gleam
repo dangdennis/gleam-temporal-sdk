@@ -572,13 +572,12 @@ fn diverging_workflows() -> List(workflow.Handler) {
 
 /// The key the TypeScript harness encrypts with.
 fn shared_codec() -> codec.PayloadCodec {
-  encryption.codec(
-    encryption.Key(
+  let assert Ok(key) =
+    encryption.key(
       id: "conformance",
       secret: bit_array.concat(list.repeat(<<7>>, 32)),
-    ),
-    [],
-  )
+    )
+  encryption.codec(key, [])
 }
 
 fn fixture(name: String) -> client.History {

@@ -63,10 +63,42 @@ CI also checks `gleam format` (here and in `examples/`), `cargo fmt` and `cargo 
   `skills/temporal-gleam/SKILL.md`, `README.md` and `docs/guide.md`. The skill's snippets
   are copied verbatim from the examples and it quotes error messages from the source:
   copy again when either changes, do not retype.
+- **Secrets are held in functions.** `string.inspect`, crash reports and log lines print
+  whatever a record holds, opaque or not, but never the inside of a function. An API key,
+  a private key or an encryption key is stored as a `temporal/internal/secret.Secret` and
+  revealed only where it is used; setters still take the plain value. A bridge type that
+  carries one to Rust is listed in `secret` in `codegen/src/codegen.gleam`, which gives it
+  a `Debug` that prints `<redacted>`.
+- **Failure text leaves the machine unencrypted.** A payload codec does not cover a
+  failure's message or stack trace, so never build one from a value the user's code was
+  handling: no `string.inspect` of an error or an exit reason in a message. A crash is
+  described by `temporal_ffi:crash/3` (kind, location, arities) and logged in full
+  locally with `bridge.log`. What a Nexus handler answers goes to another team: generic
+  text to the caller, the detail to the log. `client.with_encoded_failure_attributes`
+  must keep the TypeScript SDK's `encodeCommonAttributes` format, and headers must stay
+  outside the codec while TypeScript leaves them there; `test/failure_privacy_test.gleam`
+  checks both against the TypeScript SDK.
+- **Log fields are never atoms.** `bridge.log` takes the SDK's own identity keys, which
+  `temporal_ffi:identity_key/1` maps to atoms from a fixed table, apart from the caller's
+  fields, which stay binaries in one map under `fields`. Do not `binary_to_atom` a string
+  that did not come from this repository's source.
 - **Releasing.** Set the version in `gleam.toml`, run `gleam deps update temporal_gleam`
   in `examples/` so its lock file follows, and update the `ref = "v..."` lines in the
-  docs. Once CI is green, run the Release workflow: it tags the version and attaches the
-  native libraries that `gleam run -m temporal/install` downloads, one per target:
-  `x86_64` and `aarch64` for each of `unknown-linux-gnu`, `unknown-linux-musl` and
-  `apple-darwin`. A new target needs an entry in the workflow's matrix and a case in
-  `install.target`, with its architecture strings in `test/install_test.gleam`.
+  docs. Once CI is green on main, run the Prepare release workflow: it builds the native
+  library for every target, holds the files in a draft release, and opens a pull request
+  that writes their SHA-256 sums to `priv/checksums.txt`. Merge it, wait for CI, and push
+  the tag `v<version>` on the merge commit: the Release workflow checks that the tagged
+  commit is the built one plus its checksums and publishes the draft.
+- **The installer installs only what the tagged commit vouches for.**
+  `gleam run -m temporal/install` reads `priv/checksums.txt` from the package it runs in
+  and refuses a download whose SHA-256 is not there, and refuses to download at all when
+  the file is not for the package's own version. The file is a first line
+  `# v<version> <commit the libraries were built from>` and then `sha256sum` lines,
+  `<64 hex>  libtemporal_nif-<rust target>.so`; between releases it is a single comment,
+  which is why the installer does nothing in a checkout (`bin/build-nif` is how the
+  library gets there). Never write the file by hand, never add a way to skip the check
+  or to install another version's library, and keep the reader in `install.gleam` and
+  the writer in the workflow in step. The targets are `x86_64` and `aarch64` for each of
+  `unknown-linux-gnu`, `unknown-linux-musl` and `apple-darwin`; a new one needs an entry
+  in the workflow's matrix and a case in `install.target`, with its architecture strings
+  in `test/install_test.gleam`.
