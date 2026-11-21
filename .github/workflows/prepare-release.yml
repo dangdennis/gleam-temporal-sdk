@@ -1,0 +1,133 @@
+name: Prepare release
+
+# Step one of a release, run by hand on main once gleam.toml has the new version. Builds
+# the NIF for every supported machine, holds the files in a draft release, and opens a pull
+# request that records their SHA-256 sums in priv/checksums.txt. Merging that and pushing
+# the tag (see release.yml) publishes the draft.
+#
+# The sums live in the repository so that the installer can verify a download against the
+# commit a consumer pinned: replacing a release file is then not enough to be installed.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Read the package version
+        id: version
+        run: echo "tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' gleam.toml)" >> "$GITHUB_OUTPUT"
+      - name: Check the version is not released yet
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}"; then
+            echo "${{ steps.version.outputs.tag }} is already tagged: set the next version in gleam.toml first"
+            exit 1
+          fi
+      - name: Check CI passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          passed="$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length)"
+          test "$passed" -gt 0 || { echo "no successful CI run for $GITHUB_SHA"; exit 1; }
+
+  # No write access and no cache: what is built here is what gets published.
+  build:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            built: release/libtemporal_nif.so
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            built: release/libtemporal_nif.so
+          - os: macos-15
+            target: aarch64-apple-darwin
+            built: release/libtemporal_nif.dylib
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            built: release/libtemporal_nif.dylib
+          # For Alpine. Built in an Alpine container by bin/build-nif-musl, which also
+          # checks that an Alpine Erlang loads the result.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            built: musl/release/libtemporal_nif.so
+            musl: true
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            built: musl/release/libtemporal_nif.so
+            musl: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        if: ${{ !matrix.musl }}
+        with:
+          toolchain: stable
+      - name: Build
+        if: ${{ !matrix.musl }}
+        run: cargo build --release --locked --manifest-path native/temporal_nif/Cargo.toml
+      - name: Build and load in Alpine
+        if: ${{ matrix.musl }}
+        run: bin/build-nif-musl
+      - name: Name the library after its target
+        run: cp "native/temporal_nif/target/${{ matrix.built }}" "libtemporal_nif-${{ matrix.target }}.so"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: libtemporal_nif-${{ matrix.target }}
+          path: libtemporal_nif-${{ matrix.target }}.so
+          if-no-files-found: error
+
+  draft:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: libraries
+          merge-multiple: true
+      - name: Record the checksums
+        run: |
+          test "$(ls libraries | wc -l)" -eq 6
+          {
+            echo "# $TAG $GITHUB_SHA"
+            (cd libraries && sha256sum libtemporal_nif-*.so)
+          } > priv/checksums.txt
+          cat priv/checksums.txt
+      - name: Hold the libraries in a draft release
+        run: |
+          # Only ever replaces a draft: a published release is never touched.
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)" = "true" ]; then
+            gh release delete "$TAG" --yes
+          fi
+          gh release create "$TAG" --draft --target "$GITHUB_SHA" --generate-notes libraries/libtemporal_nif-*.so
+      - name: Open the pull request that records the checksums
+        run: |
+          branch="release/$TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add priv/checksums.txt
+          git commit -m "Record the checksums of the $TAG libraries"
+          git push --force origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Release $TAG: record library checksums" \
+            --body "Built from $GITHUB_SHA by the Prepare release workflow. Merge this, wait for CI on main, then push the tag $TAG on the merge commit to publish the draft release." \
+            || echo "::warning::Could not open the pull request (allow Actions to create pull requests in the repository settings, or open one from the branch $branch by hand)."

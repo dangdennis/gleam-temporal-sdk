@@ -1,91 +1,50 @@
 name: Release
 
-# Builds the NIF for each supported machine and attaches the files to a GitHub release, where
-# `gleam run -m temporal/install` finds them. Runs when a version tag is pushed, or by hand,
-# which tags the chosen commit with the version in gleam.toml.
+# Step two of a release: pushing the tag v<version> publishes the draft release that the
+# Prepare release workflow built, after checking that the tagged commit is the one that was
+# built plus its checksums, and that the draft's files match those checksums.
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: read
+  contents: read
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.version.outputs.tag }}
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Read the package version
-        id: version
-        run: echo "tag=v$(sed -n 's/^version = "\(.*\)"/\1/p' gleam.toml)" >> "$GITHUB_OUTPUT"
-      - name: Check a pushed tag matches the package version
-        if: github.ref_type == 'tag'
-        run: test "${{ steps.version.outputs.tag }}" = "$GITHUB_REF_NAME"
-      # A release is cut only from a commit whose CI run passed.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Check the tag matches the package version
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' gleam.toml)" = "$TAG"
       - name: Check CI passed on this commit
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           passed="$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length)"
           test "$passed" -gt 0 || { echo "no successful CI run for $GITHUB_SHA"; exit 1; }
-      - name: Create the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-        run: gh release view "$TAG" || gh release create "$TAG" --target "$GITHUB_SHA" --generate-notes
-
-  nif:
-    needs: release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            built: release/libtemporal_nif.so
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            built: release/libtemporal_nif.so
-          - os: macos-15
-            target: aarch64-apple-darwin
-            built: release/libtemporal_nif.dylib
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            built: release/libtemporal_nif.dylib
-          # For Alpine. Built in an Alpine container by bin/build-nif-musl, which also
-          # checks that an Alpine Erlang loads the result. The container is started by
-          # the script rather than by `container:`, whose actions do not run on ARM
-          # Alpine, so checkout and the upload stay on the runner.
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-musl
-            built: musl/release/libtemporal_nif.so
-            musl: true
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-musl
-            built: musl/release/libtemporal_nif.so
-            musl: true
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        if: ${{ !matrix.musl }}
-      - uses: Swatinem/rust-cache@v2
-        if: ${{ !matrix.musl }}
-        with:
-          workspaces: native/temporal_nif
-      - name: Build
-        if: ${{ !matrix.musl }}
-        run: cargo build --release --manifest-path native/temporal_nif/Cargo.toml
-      - name: Build and load in Alpine
-        if: ${{ matrix.musl }}
-        run: bin/build-nif-musl
-      - name: Attach to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Check the tagged commit is the built one plus its checksums
         run: |
-          cp "native/temporal_nif/target/${{ matrix.built }}" "libtemporal_nif-${{ matrix.target }}.so"
-          gh release upload "${{ needs.release.outputs.tag }}" "libtemporal_nif-${{ matrix.target }}.so" --clobber
+          read -r _ version built < priv/checksums.txt
+          test "$version" = "$TAG" || { echo "priv/checksums.txt is for $version, not $TAG"; exit 1; }
+          changed="$(git diff --name-only "$built" HEAD)"
+          test "$changed" = "priv/checksums.txt" || {
+            echo "the tag differs from the commit the libraries were built from ($built) in more than priv/checksums.txt:"
+            echo "$changed"
+            exit 1
+          }
+      - name: Check the draft's libraries against the checksums
+        run: |
+          test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = "true"
+          mkdir libraries && cd libraries
+          gh release download "$TAG"
+          test "$(ls | wc -l)" -eq 6
+          grep -v '^#' ../priv/checksums.txt | sha256sum --check --strict
+      - name: Publish
+        run: gh release edit "$TAG" --draft=false --verify-tag
